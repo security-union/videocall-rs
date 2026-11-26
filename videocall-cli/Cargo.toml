@@ -51,9 +51,6 @@ subtle = "2.6"
 getrandom = "0.3"
 # Ed25519 device key and device JWTs, pure Rust: no OpenSSL on the Pi build.
 ed25519-dalek = { version = "2.2", features = ["std", "zeroize", "pkcs8", "alloc"] }
-# Only to switch on `zeroize`, which wipes the key in ed25519's PKCS#8
-# scratch buffers; ed25519-dalek's own `zeroize` feature doesn't forward it.
-ed25519 = { version = "2.2", default-features = false, features = ["zeroize"] }
 webbrowser = { version = "1", features = ["hardened"] }
 
 # geteuid() for the key file's ownership check.

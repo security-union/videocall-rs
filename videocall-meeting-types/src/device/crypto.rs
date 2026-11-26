@@ -16,9 +16,8 @@
 //! = device id) and the self-signed registration JWS (no `kid`). Both are
 //! `{"typ":"JWT","alg":"EdDSA"}` over JSON claims. The verifiers pin EdDSA
 //! and never read the algorithm from the header, so HS256 session and room
-//! tokens can never pass as device tokens. The verifiers do not bound the
-//! token length; callers do that first (meeting-api: 2048 bytes). Behind the
-//! `device-crypto` feature so the browser build stays free of signing code.
+//! tokens can never pass as device tokens. Behind the `device-crypto`
+//! feature so the browser build stays free of signing code.
 
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -31,6 +30,9 @@ use super::{
     RegistrationClaims, CLI_ISSUER, DEVICE_TOKEN_LEEWAY_SECS, DEVICE_TOKEN_MAX_LIFETIME_SECS,
     DEVICE_TOKEN_TTL_SECS,
 };
+
+/// Longest device token or registration JWS read at all.
+pub const MAX_DEVICE_TOKEN_LEN: usize = 2048;
 
 /// The jsonwebtoken key for `signing`. jsonwebtoken takes PKCS#8 DER; the
 /// intermediate document zeroizes itself on drop.
@@ -142,6 +144,9 @@ pub fn check_token_times(iat: i64, exp: i64, now: i64) -> Result<(), &'static st
 /// The well-formed `kid` of an unverified EdDSA header. Proves nothing; it
 /// only selects the key [`verify_device_token`] uses. The reason is for logs.
 pub fn device_token_kid(token: &str) -> Result<String, &'static str> {
+    if token.len() > MAX_DEVICE_TOKEN_LEN {
+        return Err("token too long");
+    }
     let header = decode_header(token).map_err(|_| "header")?;
     if header.alg != Algorithm::EdDSA {
         return Err("not EdDSA");
@@ -178,16 +183,6 @@ pub fn verify_device_token(
     Ok(claims)
 }
 
-/// Why a registration JWS was rejected (logged only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrationError {
-    Malformed,
-    PublicKey,
-    Signature,
-    Times,
-    Name,
-}
-
 #[derive(Deserialize)]
 struct PublicKeyOnly {
     public_key: String,
@@ -195,33 +190,30 @@ struct PublicKeyOnly {
 
 /// Verify the self-signed registration JWS: read `public_key` unverified,
 /// validate it, then verify the token with that key. Returns the claims
-/// (name normalized) and the raw key.
+/// (name normalized) and the raw key; `None` for any rejection.
 pub fn verify_registration(
     token: &str,
     audience: &str,
     now: i64,
-) -> Result<(RegistrationClaims, [u8; 32]), RegistrationError> {
-    let header = decode_header(token).map_err(|_| RegistrationError::Malformed)?;
-    if header.alg != Algorithm::EdDSA {
-        return Err(RegistrationError::Malformed);
+) -> Option<(RegistrationClaims, [u8; 32])> {
+    if token.len() > MAX_DEVICE_TOKEN_LEN || decode_header(token).ok()?.alg != Algorithm::EdDSA {
+        return None;
     }
-    let unverified = jsonwebtoken::dangerous::insecure_decode::<PublicKeyOnly>(token)
-        .map_err(|_| RegistrationError::Malformed)?;
-    let raw =
-        validate_public_key(&unverified.claims.public_key).ok_or(RegistrationError::PublicKey)?;
+    let unverified = jsonwebtoken::dangerous::insecure_decode::<PublicKeyOnly>(token).ok()?;
+    let raw = validate_public_key(&unverified.claims.public_key)?;
     let mut claims = decode::<RegistrationClaims>(
         token,
         &DecodingKey::from_ed_der(&raw),
         &validation(audience, false),
     )
-    .map_err(|_| RegistrationError::Signature)?
+    .ok()?
     .claims;
     if claims.public_key != unverified.claims.public_key {
-        return Err(RegistrationError::Signature);
+        return None;
     }
-    check_token_times(claims.iat, claims.exp, now).map_err(|_| RegistrationError::Times)?;
-    claims.name = normalize_device_name(&claims.name).ok_or(RegistrationError::Name)?;
-    Ok((claims, raw))
+    check_token_times(claims.iat, claims.exp, now).ok()?;
+    claims.name = normalize_device_name(&claims.name)?;
+    Some((claims, raw))
 }
 
 #[cfg(test)]
@@ -267,14 +259,14 @@ mod tests {
 
         let now = IAT + 30;
         assert_eq!(device_token_kid(DEVICE_TOKEN).unwrap(), DEVICE_ID);
+        // Only the header is read, so the bound is what rejects this.
+        let padded = format!("{DEVICE_TOKEN}{}", "A".repeat(MAX_DEVICE_TOKEN_LEN));
+        assert_eq!(device_token_kid(&padded), Err("token too long"));
         let claims = verify_device_token(DEVICE_TOKEN, DEVICE_ID, PUBLIC_KEY, AUD, now).unwrap();
         assert_eq!((claims.exp, claims.jti), (IAT + 120, jti));
         let (claims, raw_back) = verify_registration(REGISTRATION, AUD, now).unwrap();
         assert_eq!((claims.public_key.as_str(), raw_back), (PUBLIC_KEY, raw));
-        assert_eq!(
-            verify_registration(REGISTRATION, "https://other.example.com", now).unwrap_err(),
-            RegistrationError::Signature
-        );
+        assert!(verify_registration(REGISTRATION, "https://other.example.com", now).is_none());
     }
 
     #[test]

@@ -17,16 +17,10 @@
 //! [`videocall_meeting_types::device::crypto`].
 
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{decode_header, Algorithm};
-use videocall_meeting_types::device::{crypto, RegistrationClaims};
-
-pub use videocall_meeting_types::device::crypto::{validate_public_key, RegistrationError};
+use videocall_meeting_types::device::crypto;
 
 use crate::db::devices::{self as db_devices, DeviceRow};
 use crate::db::DbPool;
-
-/// Longest token accepted before any parsing.
-const MAX_DEVICE_TOKEN_LEN: usize = 2048;
 
 /// Which device states a caller accepts. A revoked device is never accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,21 +46,6 @@ impl std::fmt::Display for DeviceAuthError {
     }
 }
 
-/// True if the unverified header says `alg: EdDSA`. Routes a bearer token to
-/// the device path; proves nothing.
-pub fn is_device_token(token: &str) -> bool {
-    token.len() <= MAX_DEVICE_TOKEN_LEN
-        && decode_header(token).is_ok_and(|header| header.alg == Algorithm::EdDSA)
-}
-
-/// The well-formed `kid` of an unverified EdDSA header, length-limited.
-pub fn device_token_kid(token: &str) -> Result<String, DeviceAuthError> {
-    if token.len() > MAX_DEVICE_TOKEN_LEN {
-        return Err(DeviceAuthError::Invalid("token too long"));
-    }
-    crypto::device_token_kid(token).map_err(DeviceAuthError::Invalid)
-}
-
 /// Verify a device JWT and return its row, checked against `allowed`.
 pub async fn verify_device_jwt(
     db: &DbPool,
@@ -75,7 +54,7 @@ pub async fn verify_device_jwt(
     now: DateTime<Utc>,
     allowed: AllowedStates,
 ) -> Result<DeviceRow, DeviceAuthError> {
-    let kid = device_token_kid(token)?;
+    let kid = crypto::device_token_kid(token).map_err(DeviceAuthError::Invalid)?;
     let row = db_devices::find_device(db, &kid)
         .await
         .map_err(DeviceAuthError::Db)?
@@ -107,19 +86,6 @@ pub async fn touch_live_device(db: &DbPool, row: &DeviceRow, now: DateTime<Utc>)
     }
 }
 
-/// Verify the self-signed registration JWS, length-limited. Returns the
-/// claims (name normalized) and the raw key.
-pub fn verify_registration(
-    token: &str,
-    audience: &str,
-    now: DateTime<Utc>,
-) -> Result<(RegistrationClaims, [u8; 32]), RegistrationError> {
-    if token.len() > MAX_DEVICE_TOKEN_LEN {
-        return Err(RegistrationError::Malformed);
-    }
-    crypto::verify_registration(token, audience, now.timestamp())
-}
-
 /// PKCE verifier: 43..=128 unreserved characters (RFC 7636 4.1).
 pub fn is_valid_code_verifier(verifier: &str) -> bool {
     (43..=128).contains(&verifier.len())
@@ -137,23 +103,5 @@ mod tests {
         assert!(is_valid_code_verifier(&format!("{}.~", "a".repeat(43))));
         assert!(!is_valid_code_verifier(&"a".repeat(42)));
         assert!(!is_valid_code_verifier(&format!("{}+", "a".repeat(43))));
-    }
-
-    #[test]
-    fn header_routing() {
-        assert!(!is_device_token("garbage"));
-        // {"alg":"HS256","typ":"JWT"}
-        assert!(!is_device_token(
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.x"
-        ));
-        // {"alg":"EdDSA","typ":"JWT"}
-        assert!(is_device_token(
-            "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.e30.x"
-        ));
-        // {"alg":"none"}
-        assert!(!is_device_token("eyJhbGciOiJub25lIn0.e30."));
-        let oversized = format!("eyJhbGciOiJFZERTQSJ9.{}", "a".repeat(MAX_DEVICE_TOKEN_LEN));
-        assert!(!is_device_token(&oversized));
-        assert!(device_token_kid(&oversized).is_err());
     }
 }

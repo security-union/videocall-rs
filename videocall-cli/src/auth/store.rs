@@ -28,9 +28,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use secrecy::zeroize::{Zeroize, Zeroizing};
+use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Keychain service name for every stored device.
 pub const KEYCHAIN_SERVICE: &str = "videocall-cli";
@@ -57,35 +57,27 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |e| StoreError::Io(path.display().to_string(), e)
 }
 
-/// One registered device. `Debug` redacts the key.
-#[derive(Debug)]
+/// One registered device, as stored. `Debug` redacts the key.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StoredDevice {
+    /// The API origin. Checked on load, so two origins can never share a key.
+    pub origin: String,
     pub device_id: String,
     pub fingerprint: String,
     pub name: String,
     pub user_id: String,
     pub user_name: String,
     /// The 32-byte Ed25519 seed, base64url.
+    #[serde(serialize_with = "expose", deserialize_with = "secret")]
     pub private_key: SecretString,
 }
 
-/// Serialized form; no `Debug`, key zeroized on drop.
-#[derive(Serialize, Deserialize)]
-struct Record {
-    /// Checked on load, so two origins can never share a key.
-    origin: String,
-    device_id: String,
-    fingerprint: String,
-    name: String,
-    user_id: String,
-    user_name: String,
-    private_key: String,
+fn expose<S: Serializer>(key: &SecretString, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(key.expose_secret())
 }
 
-impl Drop for Record {
-    fn drop(&mut self) {
-        self.private_key.zeroize();
-    }
+fn secret<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SecretString, D::Error> {
+    String::deserialize(deserializer).map(SecretString::from)
 }
 
 /// Where a record was found or saved.
@@ -166,8 +158,16 @@ impl Store {
     /// The device for `origin` and where it was found, if any.
     pub fn load(&self, origin: &str) -> Result<Option<(StoredDevice, Location)>, StoreError> {
         if self.use_keychain {
-            if let Some(text) = keychain::get(origin)?.map(Zeroizing::new) {
-                return Ok(parse(&text, origin, "keychain item")?.map(|d| (d, Location::Keychain)));
+            // A keychain that refuses to answer may be why `save` fell back
+            // to the file, so look there next.
+            match keychain::get(origin).map(|text| text.map(Zeroizing::new)) {
+                Ok(Some(text)) => {
+                    return Ok(
+                        parse(&text, origin, "keychain item")?.map(|d| (d, Location::Keychain))
+                    )
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("{e}; looking for a key file instead"),
             }
         }
         let path = self.path(origin);
@@ -181,20 +181,12 @@ impl Store {
         Ok(parse(&text, origin, &path.display().to_string())?.map(|d| (d, Location::File(path))))
     }
 
-    /// Save `device` for `origin`, in the keychain if possible, else in the
-    /// file, and remove any copy in the other place.
-    pub fn save(&self, origin: &str, device: &StoredDevice) -> Result<Location, StoreError> {
-        let record = Record {
-            origin: origin.into(),
-            device_id: device.device_id.clone(),
-            fingerprint: device.fingerprint.clone(),
-            name: device.name.clone(),
-            user_id: device.user_id.clone(),
-            user_name: device.user_name.clone(),
-            private_key: device.private_key.expose_secret().into(),
-        };
+    /// Save `device` for its origin, in the keychain if possible, else in
+    /// the file, and remove any copy in the other place.
+    pub fn save(&self, device: &StoredDevice) -> Result<Location, StoreError> {
+        let origin = device.origin.as_str();
         let text = Zeroizing::new(
-            toml::to_string(&record).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+            toml::to_string(device).map_err(|e| StoreError::Corrupt(e.to_string()))?,
         );
         if self.use_keychain {
             match keychain::set(origin, &text) {
@@ -211,12 +203,24 @@ impl Store {
         Ok(Location::File(path))
     }
 
-    /// Delete everything stored for `origin`.
+    /// Delete everything stored for `origin`. A keychain error is returned
+    /// only when there was no file to delete either.
     pub fn remove(&self, origin: &str) -> Result<(), StoreError> {
-        if self.use_keychain {
-            keychain::delete(origin)?;
+        let keychain = if self.use_keychain {
+            keychain::delete(origin)
+        } else {
+            Ok(())
+        };
+        let path = self.path(origin);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => keychain,
+            result => {
+                if let Err(e) = keychain {
+                    tracing::warn!("{e}");
+                }
+                result.map_err(io_err(&path))
+            }
         }
-        self.remove_file(origin)
     }
 
     fn remove_file(&self, origin: &str) -> Result<(), StoreError> {
@@ -252,15 +256,9 @@ impl Store {
 /// Parse a record; one saved for another origin counts as absent.
 fn parse(text: &str, origin: &str, source: &str) -> Result<Option<StoredDevice>, StoreError> {
     // `toml` errors quote the input, which holds the key: keep none of it.
-    let record: Record = toml::from_str(text).map_err(|_| StoreError::Corrupt(source.into()))?;
-    Ok((record.origin == origin).then(|| StoredDevice {
-        device_id: record.device_id.clone(),
-        fingerprint: record.fingerprint.clone(),
-        name: record.name.clone(),
-        user_id: record.user_id.clone(),
-        user_name: record.user_name.clone(),
-        private_key: SecretString::from(record.private_key.clone()),
-    }))
+    let device: StoredDevice =
+        toml::from_str(text).map_err(|_| StoreError::Corrupt(source.into()))?;
+    Ok((device.origin == origin).then_some(device))
 }
 
 #[cfg(unix)]
@@ -373,8 +371,9 @@ mod tests {
 
     const API: &str = "https://api.example.com";
 
-    fn device(key: &str) -> StoredDevice {
+    fn device(origin: &str, key: &str) -> StoredDevice {
         StoredDevice {
+            origin: origin.into(),
             device_id: "d".into(),
             fingerprint: "f".into(),
             name: "n".into(),
@@ -394,9 +393,9 @@ mod tests {
     fn round_trip_per_origin() {
         let (_tmp, store) = file_store();
         assert!(store.load(API).unwrap().is_none());
-        store.save(API, &device("seed-a")).unwrap();
+        store.save(&device(API, "seed-a")).unwrap();
         store
-            .save("http://localhost:8081", &device("seed-b"))
+            .save(&device("http://localhost:8081", "seed-b"))
             .unwrap();
         let (a, location) = store.load(API).unwrap().unwrap();
         assert_eq!(a.private_key.expose_secret(), "seed-a");
@@ -413,7 +412,7 @@ mod tests {
             store.path("https_//a-b.example")
         );
         store
-            .save("https://a-b.example", &device("seed-c"))
+            .save(&device("https://a-b.example", "seed-c"))
             .unwrap();
         assert!(store.load("https_//a-b.example").unwrap().is_none());
     }
@@ -425,7 +424,7 @@ mod tests {
         let (_tmp, store) = file_store();
         fs::create_dir_all(&store.dir).unwrap();
         fs::set_permissions(&store.dir, fs::Permissions::from_mode(0o755)).unwrap();
-        store.save(API, &device("seed-a")).unwrap();
+        store.save(&device(API, "seed-a")).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.dir), 0o700, "a loose config dir is tightened");
         assert_eq!(mode(&store.path(API)), 0o600);
@@ -441,7 +440,7 @@ mod tests {
     #[test]
     fn corrupt_record_error_hides_contents() {
         let (_tmp, store) = file_store();
-        store.save(API, &device("seed-a")).unwrap();
+        store.save(&device(API, "seed-a")).unwrap();
         fs::write(store.path(API), "private_key = \"seed-a\"\nbroken").unwrap();
         let err = store.load(API).unwrap_err();
         assert!(

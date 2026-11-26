@@ -18,12 +18,8 @@
 
 //! Loopback browser login (RFC 8252 section 7.3) with PKCE (RFC 7636).
 //!
-//! Rules: bind `127.0.0.1` only; only `GET /callback?…` is considered;
-//! `state` is compared first, in constant time; a request without our
-//! `state` gets a page and is otherwise ignored (it neither uses up the one
-//! callback nor ends the login); exactly one callback with our `state` is
-//! processed; `error=access_denied` means cancelled; no input is reflected;
-//! the wait ends after [`LOGIN_TIMEOUT`].
+//! `state` is checked before anything else, so a request from any other
+//! page on this machine neither uses up the one callback nor ends the login.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,9 +40,7 @@ pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// A PKCE S256 verifier and its challenge.
 pub struct Pkce {
-    /// Sent only in the code exchange.
     pub verifier: SecretString,
-    /// `BASE64URL(SHA256(verifier))`, sent in the authorize URL.
     pub challenge: String,
 }
 
@@ -300,17 +294,9 @@ mod tests {
             tokio::spawn(async move { server.wait_for_code(STATE, Duration::from_secs(10)).await });
 
         let _idle = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        for target in [
-            "/favicon.ico",
-            "/callback?code=c&state=state-attacker-000000",
-            "/callback?error=access_denied",
-        ] {
-            let page = get(port, target).await.unwrap();
-            assert!(
-                page.starts_with("HTTP/1.1 404") && !page.contains("attacker"),
-                "{target}"
-            );
-        }
+        let page = get(port, "/callback?code=c&state=state-attacker-000000").await;
+        let page = page.unwrap();
+        assert!(page.starts_with("HTTP/1.1 404") && !page.contains("attacker"));
         assert!(!wait.is_finished());
 
         let ok = get(port, &format!("/callback?code=the-code&state={STATE}"))

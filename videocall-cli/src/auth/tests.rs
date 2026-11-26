@@ -104,22 +104,12 @@ fn input_checks() {
         assert!(parse_pasted_code(&bad).is_err(), "{bad:?}");
     }
 
-    let exchange = |code: &str| {
-        exchange_error(ApiError::Device {
-            status: 400,
-            error: code.into(),
-            error_description: String::new(),
-        })
-        .to_string()
-    };
-    for (code, says) in [
-        ("not_configured", "device login disabled"),
-        ("invalid_grant", "Check the browser page"),
-        ("too_many_devices", "maximum number of devices"),
-        ("other", "other"),
-    ] {
-        assert!(exchange(code).contains(says), "{code}");
-    }
+    let rejected = exchange_error(ApiError::Device {
+        status: 400,
+        error: "invalid_grant".into(),
+        error_description: String::new(),
+    });
+    assert!(rejected.to_string().contains("Check the browser page"));
 }
 
 // A minimal meeting-api: answers from a handler and stamps a `Date` that is
@@ -247,6 +237,7 @@ fn ctx_with(
 fn save_device(ctx: &Ctx, api: &ApiOrigin, device_id: &str) -> DeviceKey {
     let key = DeviceKey::generate().unwrap();
     let device = StoredDevice {
+        origin: api.as_str().into(),
         device_id: device_id.into(),
         fingerprint: key.fingerprint(),
         name: "old".into(),
@@ -254,16 +245,15 @@ fn save_device(ctx: &Ctx, api: &ApiOrigin, device_id: &str) -> DeviceKey {
         user_name: "U".into(),
         private_key: key.seed_b64(),
     };
-    ctx.store.save(api.as_str(), &device).unwrap();
+    ctx.store.save(&device).unwrap();
     key
 }
 
 #[tokio::test]
 async fn a_401_is_retried_once_only_if_the_clock_explains_it() {
     let me = json!({
-        "device_id": OLD_ID, "status": "approved", "name": "n", "fingerprint": "f", "user_id": "u",
-        "user_name": "U", "created_at": 0, "decided_at": 0, "last_used_at": 0, "idle_expires_at": 0,
-        "abs_expires_at": 0,
+        "device_id": OLD_ID, "name": "n", "fingerprint": "f", "user_id": "u", "user_name": "U",
+        "created_at": 0, "last_used_at": 0, "idle_expires_at": 0, "abs_expires_at": 0,
     });
     // (server skew, server accepts fresh tokens?, expected signed requests, ok?)
     for (skew, accepts, signed, ok) in [

@@ -92,11 +92,6 @@ pub fn build_app(pool: DbPool) -> Router {
     routes::router().with_state(build_state(pool))
 }
 
-/// Build the router from an explicit state (e.g. with OAuth configured).
-pub fn build_app_with_state(state: AppState) -> Router {
-    routes::router().with_state(state)
-}
-
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.
 ///
 /// This replaces the old `Cookie: email=<email>` pattern. The JWT is signed
@@ -123,7 +118,8 @@ pub async fn response_json<T: DeserializeOwned>(resp: Response) -> T {
 
 /// Send one request through a fresh router.
 pub async fn send(state: &AppState, req: http::Request<Body>) -> Response {
-    build_app_with_state(state.clone())
+    routes::router()
+        .with_state(state.clone())
         .oneshot(req)
         .await
         .expect("oneshot")
@@ -195,8 +191,6 @@ pub enum Fixture {
     Stale,
     Revoked,
     IdleExpired,
-    /// `idle <= abs` is a schema CHECK, so this is idle-expired too.
-    AbsExpired,
 }
 
 /// Insert a device directly, skipping the sign-in flow. Its user name is
@@ -214,11 +208,6 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
             (used, used + day * 90, now + day * 365)
         }
         Fixture::IdleExpired => (now - day * 91, now - day, now + day * 200),
-        Fixture::AbsExpired => (
-            now - day,
-            now - Duration::minutes(1),
-            now - Duration::minutes(1),
-        ),
     };
     let device = db::devices::NewDevice {
         id: &id,
@@ -245,6 +234,15 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
         key,
         user_id: user_id.to_string(),
     }
+}
+
+/// Outstanding sign-in codes of `user`.
+pub async fn codes_of(pool: &DbPool, user: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM device_auth_codes WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// Delete the devices and codes of `users`.

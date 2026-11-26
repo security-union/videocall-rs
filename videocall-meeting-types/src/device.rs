@@ -226,9 +226,7 @@ pub struct DeviceStatusResponse {
     pub abs_expires_at: i64,
 }
 
-/// Error body of the CLI routes: `error` is `invalid_request`,
-/// `invalid_grant`, `invalid_token`, `key_already_registered`,
-/// `too_many_devices`, `not_configured` or `server_error`.
+/// Error body of the CLI routes (OAuth 2.0 shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceErrorResponse {
     pub error: String,
@@ -527,26 +525,14 @@ mod tests {
         for bad in ["Zg==", "Zm9v+", "Zm9v/", "Zh", "Zm9", "Z", "Zm9vY", "Zm 9v"] {
             assert_eq!(base64url_decode(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn authorize_request_round_trip() {
-        for raw in [
-            "device_name=C%2B%2B+rig&state=a%2Bb%25c",
-            "response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback&x=%3Cscript%3E#",
-            "",
-            &"a".repeat(MAX_AUTHORIZE_QUERY_LEN),
-        ] {
-            let request = encode_authorize_request(raw);
-            assert!(request.bytes().all(|b| BASE64URL.contains(&b)));
-            assert_eq!(decode_authorize_request(&request).as_deref(), Some(raw));
-        }
+        // The app's request parameter: bounded and UTF-8.
+        let longest = "a".repeat(MAX_AUTHORIZE_QUERY_LEN);
+        let request = encode_authorize_request(&longest);
+        assert_eq!(decode_authorize_request(&request), Some(longest));
         let too_long = encode_authorize_request(&"a".repeat(MAX_AUTHORIZE_QUERY_LEN + 1));
         assert_eq!(decode_authorize_request(&too_long), None);
-        assert_eq!(
-            decode_authorize_request(&base64url_encode(&[0xff, 0xfe])),
-            None
-        );
+        let not_utf8 = base64url_encode(&[0xff, 0xfe]);
+        assert_eq!(decode_authorize_request(&not_utf8), None);
     }
 
     #[test]

@@ -16,20 +16,11 @@
  * conditions.
  */
 
-//! The device's Ed25519 key, the clock it signs with, and the two tokens:
-//! the registration JWS (proof of possession, no `kid`) and a fresh device
-//! JWT per request (`kid` = `sub` = device id, `aud` = the API origin,
-//! 120 s lifetime, random `jti`). The token format is shared with
-//! meeting-api's verifier in `videocall_meeting_types::device::crypto`.
+//! The device's Ed25519 key and the clock it signs with. The token format is
+//! shared with meeting-api in `videocall_meeting_types::device::crypto`.
 //!
-//! The seed comes from the OS CSPRNG, lives only in the store and in
-//! zeroize-on-drop types, and never goes on argv, in the environment or in
-//! logs; `Debug` shows only the public key. In memory there are three
-//! copies, all zeroized on drop: the [`SigningKey`]; one PKCS#8 encoding
-//! inside the [`EncodingKey`] (jsonwebtoken zeroizes it; the `ed25519/zeroize`
-//! feature wipes the encoder's scratch buffers); and a temporary
-//! `SigningKey` jsonwebtoken parses on every `encode`, which its API can't
-//! avoid. Stack slots left by moves are out of zeroize's reach.
+//! The seed never goes on argv, in the environment or in logs, and every
+//! in-memory copy is a zeroize-on-drop type; `Debug` shows only the public key.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,7 +47,6 @@ pub enum KeyError {
 /// An Ed25519 device key.
 pub struct DeviceKey {
     signing: SigningKey,
-    /// PKCS#8 form for jsonwebtoken, built once.
     encoding: EncodingKey,
 }
 
@@ -67,7 +57,7 @@ impl std::fmt::Debug for DeviceKey {
 }
 
 impl DeviceKey {
-    /// A new key from 32 OS CSPRNG bytes.
+    /// A new key from the OS CSPRNG.
     pub fn generate() -> Result<Self, KeyError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut())?;
@@ -87,18 +77,15 @@ impl DeviceKey {
         Ok(Self { signing, encoding })
     }
 
-    /// The seed, base64url, for the store.
     pub fn seed_b64(&self) -> SecretString {
         let seed = Zeroizing::new(self.signing.to_bytes());
         SecretString::from(base64url_encode(seed.as_slice()))
     }
 
-    /// Public key, base64url (43 characters).
     pub fn public_key_b64(&self) -> String {
         base64url_encode(&self.signing.verifying_key().to_bytes())
     }
 
-    /// `XXXX-XXXX-XXXX-XXXX` fingerprint of the public key.
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.signing.verifying_key().to_bytes())
     }
@@ -181,6 +168,34 @@ mod tests {
             .device_token("aB3dE5fG7hI9jK1lM3nO5p", "https://a.example", 1)
             .unwrap();
         assert_ne!(a, b, "every token has its own jti");
+    }
+
+    /// RFC 8032 test 1 key; a swapped argument fails these verifies.
+    #[test]
+    fn signs_the_shared_vectors() {
+        let seed = SecretString::from("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A".to_string());
+        let key = DeviceKey::from_seed_b64(&seed).unwrap();
+        let public_key = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+        assert_eq!(key.public_key_b64(), public_key);
+        let (aud, name, now) = (
+            "https://api.example.com",
+            "videocall-cli on test-vector",
+            1_764_000_000,
+        );
+        let jws = key.registration_jws(aud, name, now).unwrap();
+        let (claims, _) = crypto::verify_registration(&jws, aud, now).unwrap();
+        assert_eq!(
+            (claims.public_key.as_str(), claims.name.as_str()),
+            (public_key, name)
+        );
+        let device_id = "aB3dE5fG7hI9jK1lM3nO5p";
+        let token = key.device_token(device_id, aud, now).unwrap();
+        assert_eq!(
+            crypto::verify_device_token(&token, device_id, public_key, aud, now)
+                .unwrap()
+                .sub,
+            device_id
+        );
     }
 
     #[test]

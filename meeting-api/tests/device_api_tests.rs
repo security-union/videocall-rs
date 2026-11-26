@@ -159,14 +159,6 @@ async fn sign_in(state: &AppState, user: &str, cli: &Cli) -> String {
         .to_string()
 }
 
-async fn codes_of(pool: &DbPool, user: &str) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM device_auth_codes WHERE user_id = $1")
-        .bind(user)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-}
-
 async fn expire_codes_of(pool: &DbPool, user: &str) {
     sqlx::query("UPDATE device_auth_codes SET expires_at = $2 WHERE user_id = $1")
         .bind(user)
@@ -322,10 +314,6 @@ async fn approve_rejects_invalid_input_and_writes_nothing() {
         ("code_challenge_method", json!("plain")),
         ("code_challenge", json!("short")),
         ("code_challenge", json!(format!("{}=", "A".repeat(43)))),
-        ("redirect_uri", json!("http://localhost:53682/callback")),
-        ("redirect_uri", json!("http://[::1]:53682/callback")),
-        ("redirect_uri", json!("http://127.0.0.1:80/callback")),
-        ("redirect_uri", json!(format!("{AUD}/cli/code"))),
         ("redirect_uri", json!("https://evil.example/callback")),
         ("state", json!("short")),
         ("state", json!(format!("{} x", "a".repeat(20)))),

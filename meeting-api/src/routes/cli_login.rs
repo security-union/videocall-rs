@@ -24,13 +24,12 @@
 use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use videocall_meeting_types::device as codes;
 use videocall_meeting_types::device::{
-    encode_authorize_request, APP_AUTHORIZE_PATH, AUTHORIZE_REQUEST_PARAM, MAX_AUTHORIZE_QUERY_LEN,
+    self as codes, encode_authorize_request, APP_AUTHORIZE_PATH, AUTHORIZE_REQUEST_PARAM,
+    MAX_AUTHORIZE_QUERY_LEN,
 };
-use videocall_meeting_types::APIError;
 
-use crate::error::AppError;
+use super::devices_api::{api_error, not_configured};
 use crate::state::AppState;
 
 /// `GET /cli/authorize`: `302` to `{ui origin}/devices/authorize?request=…`.
@@ -41,25 +40,14 @@ pub async fn authorize(State(state): State<AppState>, RawQuery(query): RawQuery)
         state.device.audience.as_deref(),
         state.device.ui_origin.as_deref(),
     ) else {
-        return AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            APIError {
-                code: codes::NOT_CONFIGURED.to_string(),
-                message: "Device sign-in is not configured on this server.".to_string(),
-                engineering_error: None,
-            },
-        )
-        .into_response();
+        return not_configured().into_response();
     };
     let query = query.unwrap_or_default();
     let bad_request = || {
-        AppError::new(
+        api_error(
             StatusCode::BAD_REQUEST,
-            APIError {
-                code: codes::INVALID_REQUEST.to_string(),
-                message: "The sign-in link is malformed.".to_string(),
-                engineering_error: None,
-            },
+            codes::INVALID_REQUEST,
+            "The sign-in link is malformed.",
         )
         .into_response()
     };

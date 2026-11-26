@@ -11,29 +11,23 @@
  * at your option.
  */
 
-//! The device JSON API.
-//!
-//! Browser session (`AuthUser`, `APIResponse` envelope): approve a CLI login
-//! (`POST /api/v1/devices/authorizations`), list the user's devices
-//! (`GET /api/v1/devices`), revoke one (`DELETE /api/v1/devices/{id}`). The
-//! state-changing two also pass [`check_browser_write`].
-//!
-//! CLI (bare JSON, `DeviceErrorResponse` on failure): the code exchange
-//! (`POST /api/v1/devices`) and the device's own status and self-revoke
-//! (`GET`/`DELETE /api/v1/devices/me`).
+//! The device JSON API. Browser routes answer in the `APIResponse`
+//! envelope; the CLI routes answer bare JSON with `DeviceErrorResponse`
+//! on failure.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use url::form_urlencoded;
 use videocall_meeting_types::device::{
-    self as codes, fingerprint, is_valid_client_state, is_valid_code_challenge, is_valid_device_id,
-    normalize_device_name, parse_redirect_uri, CreateDeviceAuthorizationRequest,
-    CreateDeviceAuthorizationResponse, DeviceErrorResponse, DeviceListItem, DeviceStatusResponse,
-    RedirectUri, RegisterDeviceRequest, RegisterDeviceResponse, CODE_CHALLENGE_METHOD_S256,
+    self as codes, crypto, fingerprint, is_valid_client_state, is_valid_code_challenge,
+    is_valid_device_id, normalize_device_name, parse_redirect_uri,
+    CreateDeviceAuthorizationRequest, CreateDeviceAuthorizationResponse, DeviceErrorResponse,
+    DeviceListItem, DeviceStatusResponse, RedirectUri, RegisterDeviceRequest,
+    RegisterDeviceResponse, CODE_CHALLENGE_METHOD_S256,
 };
 use videocall_meeting_types::{APIError, APIResponse};
 
@@ -41,8 +35,7 @@ use crate::auth::{device_unauthorized, extract_bearer_token, AuthUser};
 use crate::db::device_codes::{self as db_codes, DeviceCodeRow};
 use crate::db::devices::{self as db_devices, CappedInsert, DeviceRow, NewDevice};
 use crate::device_auth::{
-    self, is_valid_code_verifier, validate_public_key, verify_device_jwt, verify_registration,
-    AllowedStates, DeviceAuthError,
+    self, is_valid_code_verifier, verify_device_jwt, AllowedStates, DeviceAuthError,
 };
 use crate::error::AppError;
 use crate::secrets::{ct_eq, random_base64url, sha256_hex};
@@ -99,10 +92,6 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn ts(value: DateTime<Utc>) -> i64 {
-    value.timestamp()
-}
-
 /// `POST /api/v1/devices`
 pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(audience) = state.device.audience.clone() else {
@@ -155,8 +144,9 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         ) {
             return Err("PKCE mismatch");
         }
-        let (claims, raw_key) = verify_registration(&request.registration, &audience, now)
-            .map_err(|_| "registration JWS")?;
+        let (claims, raw_key) =
+            crypto::verify_registration(&request.registration, &audience, now.timestamp())
+                .ok_or("registration JWS")?;
         if claims.public_key != row.public_key || claims.name != row.device_name {
             return Err("key or name differs from the approval");
         }
@@ -214,8 +204,8 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
             name: row.device_name.clone(),
             user_id: user_id.to_string(),
             user_name: row.user_name.clone(),
-            idle_expires_at: ts(idle_expires_at),
-            abs_expires_at: ts(abs_expires_at),
+            idle_expires_at: idle_expires_at.timestamp(),
+            abs_expires_at: abs_expires_at.timestamp(),
         }),
     )
         .into_response()
@@ -258,10 +248,10 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
             fingerprint: row.fingerprint,
             user_id: row.user_id,
             user_name: row.user_name,
-            created_at: ts(row.created_at),
-            last_used_at: ts(row.last_used_at),
-            idle_expires_at: ts(row.idle_expires_at),
-            abs_expires_at: ts(row.abs_expires_at),
+            created_at: row.created_at.timestamp(),
+            last_used_at: row.last_used_at.timestamp(),
+            idle_expires_at: row.idle_expires_at.timestamp(),
+            abs_expires_at: row.abs_expires_at.timestamp(),
         }),
     )
         .into_response()
@@ -286,7 +276,7 @@ pub async fn revoke_me(State(state): State<AppState>, headers: HeaderMap) -> Res
 // Browser routes
 // ---------------------------------------------------------------------------
 
-fn api_error(status: StatusCode, code: &str, message: &str) -> AppError {
+pub(super) fn api_error(status: StatusCode, code: &str, message: &str) -> AppError {
     AppError::new(
         status,
         APIError {
@@ -294,6 +284,14 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> AppError {
             message: message.to_string(),
             engineering_error: None,
         },
+    )
+}
+
+pub(super) fn not_configured() -> AppError {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        codes::NOT_CONFIGURED,
+        "Device sign-in is not configured on this server.",
     )
 }
 
@@ -348,11 +346,7 @@ pub async fn create_authorization(
     body: Bytes,
 ) -> Result<Response, AppError> {
     if state.device.audience.is_none() || state.device.ui_origin.is_none() {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            codes::NOT_CONFIGURED,
-            "Device sign-in is not configured on this server.",
-        ));
+        return Err(not_configured());
     }
     check_browser_write(&state, &headers, true)?;
     let invalid = || {
@@ -378,7 +372,7 @@ pub async fn create_authorization(
             "Confirm that you started this sign-in yourself, on a device you own.",
         ));
     }
-    let raw_key = validate_public_key(&request.public_key).ok_or_else(invalid)?;
+    let raw_key = crypto::validate_public_key(&request.public_key).ok_or_else(invalid)?;
     if db_devices::public_key_exists(&state.db, &request.public_key).await? {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -446,12 +440,12 @@ pub async fn list_devices(
     let items: Vec<DeviceListItem> = rows
         .into_iter()
         .map(|row| DeviceListItem {
-            expires_at: ts(row.idle_expires_at.min(row.abs_expires_at)),
+            expires_at: row.idle_expires_at.min(row.abs_expires_at).timestamp(),
             id: row.id,
             name: row.name,
             fingerprint: row.fingerprint,
-            created_at: ts(row.created_at),
-            last_used_at: ts(row.last_used_at),
+            created_at: row.created_at.timestamp(),
+            last_used_at: row.last_used_at.timestamp(),
         })
         .collect();
     Ok(no_store(items))

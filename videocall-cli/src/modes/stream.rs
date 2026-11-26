@@ -32,48 +32,49 @@ use videocall_cli::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
-/// Resolves on Ctrl-C, or on SIGTERM on unix (systemd/docker stop).
+/// Install the stop handlers now and return a future that resolves on the
+/// first Ctrl-C, SIGTERM (systemd/docker stop) or SIGHUP (the SSH session
+/// went away). Installing them before any await means a signal during login
+/// or join is caught instead of killing the process.
 ///
 /// A requested stop exits 0 wherever it happens (joining, connecting or
 /// streaming). Once connected, the relay session is closed explicitly
 /// (code 0) so the relay drops us right away. The CLI does not call
 /// meeting-api `leave`: its account may also be in the meeting from a
 /// browser, and leaving would mark that participant as gone.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!("can't listen for Ctrl-C: {e}");
-            std::future::pending::<()>().await;
-        }
-    };
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    () = ctrl_c => {}
-                    _ = term.recv() => {}
-                }
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
             }
-            Err(e) => {
-                tracing::warn!("can't listen for SIGTERM: {e}");
-                ctrl_c.await;
-            }
-        }
+        })
     }
-    #[cfg(not(unix))]
-    ctrl_c.await;
+    #[cfg(windows)]
+    {
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+        })
+    }
 }
 
 /// Join the meeting through meeting-api, then stream to the relay.
 ///
-/// Exits 0 on Ctrl-C or SIGTERM, and with an error when the relay
-/// connection drops: the CLI doesn't reconnect, so a supervisor (systemd)
-/// restarts it and it joins again from scratch.
+/// Exits 0 on Ctrl-C, SIGTERM or SIGHUP, and with an error when the relay
+/// connection or the camera drops: the CLI doesn't reconnect, so a
+/// supervisor (systemd) restarts it and it joins again from scratch. See
+/// [`videocall_cli::exit`] for the codes.
 pub async fn stream(opt: Stream) -> anyhow::Result<()> {
-    // One listener for the whole run, so a signal between selects isn't lost.
-    let shutdown = shutdown_signal();
+    // One set of handlers for the whole run, installed before anything else.
+    let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
 
     // The CLI can only JOIN an existing call. The meeting must be created first
@@ -133,12 +134,18 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let client = WebTransportClient::new(opt, creds, user_id.clone());
         (user_id, CameraSynks::CameraSynk(Box::new(client)))
     };
-    tokio::select! {
-        result = client.connect() => result?,
-        () = &mut shutdown => {
-            println!("Stopped.");
-            return Ok(());
+    let stopped = tokio::select! {
+        result = client.connect() => {
+            result?;
+            false
         }
+        () = &mut shutdown => true,
+    };
+    if stopped {
+        // The session may have come up just before the signal.
+        client.close().await;
+        println!("Stopped.");
+        return Ok(());
     }
     let camera_config = CameraConfig {
         width,
@@ -183,12 +190,13 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
                 bail!("lost the relay connection ({reason}); exiting");
             }
         };
-        let Some(data) = data else { break };
+        let Some(data) = data else {
+            client.close().await;
+            bail!("the camera and microphone stopped sending; exiting");
+        };
         tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
             tracing::debug!("Packet not sent: {e}");
         }
     }
-    client.close().await;
-    Ok(())
 }

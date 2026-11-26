@@ -331,10 +331,13 @@ mod keychain {
             if let Err(mpsc::RecvTimeoutError::Timeout) =
                 waiting.recv_timeout(Duration::from_secs(2))
             {
+                #[cfg(target_os = "macos")]
                 eprintln!(
                     "Waiting for keychain access. If this Mac shows a dialog, choose Always \
                      Allow. Over SSH, answer it at the Mac's screen once."
                 );
+                #[cfg(target_os = "windows")]
+                eprintln!("Waiting for Windows Credential Manager...");
             }
         });
         let result = call();

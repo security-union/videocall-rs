@@ -22,31 +22,35 @@
 use std::future::Future;
 use std::time::Duration;
 
-use anyhow::bail;
 use secrecy::SecretString;
 use videocall_meeting_client::ApiError;
 
 use crate::auth::{AuthError, Credentials};
-use crate::backoff::{poll_delay, Backoff};
+use crate::backoff::{poll_delay, random_fraction, Backoff};
+use crate::exit::{is_transient_network, needs_human};
 
-/// Network trouble or a 5xx/429 from meeting-api: worth trying again.
+/// Network trouble or a 5xx/429 from meeting-api: worth trying again. A
+/// response body this build can't decode is not: retrying it forever would
+/// look healthy to systemd while never joining.
 pub fn is_transient(error: &AuthError) -> bool {
     match error {
-        AuthError::Api(ApiError::Network(_)) => true,
+        AuthError::Api(ApiError::Network(e)) => is_transient_network(e),
         AuthError::Api(ApiError::ServerError { status, .. }) => *status >= 500 || *status == 429,
         _ => false,
     }
 }
 
 /// A plain-English error for a meeting-api failure about `meeting_id`.
+/// "Not found" and "ended" need a human: a restart can't create the
+/// meeting or start it again.
 pub fn meeting_error(error: AuthError, meeting_id: &str) -> anyhow::Error {
     match error {
-        AuthError::Api(ApiError::NotFound(_)) => anyhow::anyhow!(
+        AuthError::Api(ApiError::NotFound(_)) => needs_human(format!(
             "meeting '{meeting_id}' doesn't exist or you are not in it. Create it in a browser \
              first; the CLI can only join existing meetings."
-        ),
+        )),
         AuthError::Api(ApiError::MeetingNotActive) => {
-            anyhow::anyhow!("meeting '{meeting_id}' has ended")
+            needs_human(format!("meeting '{meeting_id}' has ended"))
         }
         other => other.into(),
     }
@@ -117,6 +121,11 @@ pub async fn join(
 ) -> anyhow::Result<String> {
     let id = meeting_id.to_string();
     let name = display_name.map(str::to_string);
+    // Without a terminal this is likely one of many machines that systemd
+    // restarted at the same moment: spread their joins over 5 s.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        tokio::time::sleep(Duration::from_secs(5).mul_f64(random_fraction())).await;
+    }
     loop {
         let joined = retry(|| {
             let (id, name) = (id.clone(), name.clone());
@@ -129,7 +138,7 @@ pub async fn join(
         .map_err(|e| meeting_error(e, &id))?;
         match joined.status.as_str() {
             "admitted" => return Ok(joined.user_id),
-            "rejected" => bail!("the host declined your request to join meeting '{id}'"),
+            "rejected" => return Err(not_admitted(&id, "rejected")),
             "waiting_for_meeting" => {
                 println!("Meeting '{id}' hasn't started yet. Waiting for the host...");
                 poll(
@@ -143,7 +152,7 @@ pub async fn join(
                     },
                     |meeting| match meeting.state.as_str() {
                         "active" => Some(Ok(())),
-                        "ended" => Some(Err(anyhow::anyhow!("meeting '{id}' has ended"))),
+                        "ended" => Some(Err(needs_human(format!("meeting '{id}' has ended")))),
                         _ => None,
                     },
                 )
@@ -170,20 +179,24 @@ pub async fn join(
                 .await?;
                 return Ok(joined.user_id);
             }
-            other => bail!("unexpected join status for meeting '{id}': {other}"),
+            other => {
+                return Err(needs_human(format!(
+                    "unexpected join status for meeting '{id}': {other}"
+                )))
+            }
         }
     }
 }
 
 fn not_admitted(meeting_id: &str, status: &str) -> anyhow::Error {
     match status {
-        "rejected" => {
-            anyhow::anyhow!("the host declined your request to join meeting '{meeting_id}'")
-        }
-        other => anyhow::anyhow!(
+        "rejected" => needs_human(format!(
+            "the host declined your request to join meeting '{meeting_id}'"
+        )),
+        other => needs_human(format!(
             "you are no longer admitted to meeting '{meeting_id}' (status: {other}); the host \
              may have removed you. Run the command again to ask to join."
-        ),
+        )),
     }
 }
 
@@ -207,7 +220,7 @@ impl RoomTokenError {
     pub fn into_exit(self, meeting_id: &str) -> anyhow::Error {
         match self {
             RoomTokenError::Api(e) => meeting_error(e, meeting_id),
-            RoomTokenError::NotAdmitted(message) => anyhow::anyhow!(message),
+            RoomTokenError::NotAdmitted(message) => needs_human(message),
         }
     }
 }
@@ -256,6 +269,48 @@ mod tests {
         ))));
         assert!(RoomTokenError::Api(server(503)).is_transient());
         assert!(!RoomTokenError::NotAdmitted("x".into()).is_transient());
+    }
+
+    /// Real reqwest errors: a failed connect is transient; a 200 whose body
+    /// isn't JSON, and a request that can't be built, are not.
+    #[tokio::test]
+    async fn network_errors_are_transient_only_if_a_retry_can_help() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use videocall_meeting_client::reqwest;
+        let api = |e: reqwest::Error| AuthError::Api(ApiError::Network(e));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.read(&mut [0u8; 1024]).await;
+            let body = "<html>captive portal</html>";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let decode = response.json::<serde_json::Value>().await.unwrap_err();
+        assert!(!is_transient(&api(decode)), "an unparseable 200 is final");
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let connect = reqwest::get(format!("http://{closed}/")).await.unwrap_err();
+        assert!(is_transient(&api(connect)), "a refused connect is retried");
+
+        let builder = reqwest::Client::new()
+            .get("not a url")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            !is_transient(&api(builder)),
+            "a request that can't be built is final"
+        );
     }
 
     #[test]

@@ -360,8 +360,9 @@ pub async fn run(command: &AuthCommand) -> anyhow::Result<()> {
         AuthCommand::Login(args) => login(&ctx, args).await?,
         AuthCommand::Logout(args) => logout(&ctx, &ApiOrigin::from_url(&args.api_url)?).await?,
         AuthCommand::Status(args) => {
-            if !status(&ctx, &ApiOrigin::from_url(&args.api_url)?).await? {
-                std::process::exit(1);
+            let code = status(&ctx, &ApiOrigin::from_url(&args.api_url)?).await?;
+            if code != 0 {
+                std::process::exit(code.into());
             }
         }
     }
@@ -536,12 +537,14 @@ pub(crate) async fn logout(ctx: &Ctx, api: &ApiOrigin) -> Result<(), AuthError> 
     Ok(())
 }
 
-/// `auth status`. Returns whether the device is valid.
-pub(crate) async fn status(ctx: &Ctx, api: &ApiOrigin) -> Result<bool, AuthError> {
+/// `auth status`. Returns the exit code: 0 if the device is valid, else
+/// as for `stream` ([`crate::exit`]): 2 when a human has to log in again,
+/// 1 when the server couldn't be asked.
+pub(crate) async fn status(ctx: &Ctx, api: &ApiOrigin) -> Result<u8, AuthError> {
     println!("{}", api.as_str());
     let Some((device, location)) = ctx.store.load(api.as_str())? else {
         println!("  Not logged in. Run `videocall-cli auth login`.");
-        return Ok(false);
+        return Ok(crate::exit::NEEDS_HUMAN);
     };
     println!("  Device:       {} ({})", device.name, device.device_id);
     println!("  Fingerprint:  {}", device.fingerprint);
@@ -561,11 +564,15 @@ pub(crate) async fn status(ctx: &Ctx, api: &ApiOrigin) -> Result<bool, AuthError
                 days(me.idle_expires_at),
                 days(me.abs_expires_at)
             );
-            Ok(true)
+            Ok(0)
         }
         Err(e) => {
-            println!("  Status:       not valid ({e})");
-            Ok(false)
+            let code = crate::exit::auth_code(&e);
+            match code {
+                crate::exit::NEEDS_HUMAN => println!("  Status:       not valid ({e})"),
+                _ => println!("  Status:       unknown, couldn't ask the server ({e})"),
+            }
+            Ok(code)
         }
     }
 }

@@ -40,6 +40,7 @@ use videocall_types::protos::{
 use crate::auth::Credentials;
 use crate::backoff::Backoff;
 use crate::cli_args::Stream;
+use crate::exit::needs_human;
 use crate::net_policy::is_local_host;
 use crate::room;
 
@@ -81,24 +82,28 @@ impl LossSignal {
         self.reason.borrow().clone()
     }
 
-    /// Count a send result. Failures on a closed session, or too many in a
-    /// row, mark the connection lost. Returns false if it is lost.
+    /// Count a send result. Failures on a closed session (`close_reason`),
+    /// or too many in a row, mark the connection lost. The first failure of
+    /// a run is logged, then only the count. Returns false if it is lost.
     fn record_send(
         &self,
-        session: &web_transport_quinn::Session,
+        close_reason: impl FnOnce() -> Option<String>,
         result: anyhow::Result<()>,
     ) -> bool {
         match result {
             Ok(()) => {
-                self.consecutive_failures.store(0, Ordering::Relaxed);
+                let failed = self.consecutive_failures.swap(0, Ordering::Relaxed);
+                if failed > 0 {
+                    info!("Sends to the relay recovered after {failed} failures");
+                }
             }
             Err(e) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(closed) = session.close_reason() {
-                    self.mark_lost(closed.to_string());
+                if let Some(closed) = close_reason() {
+                    self.mark_lost(closed);
                 } else if failures >= MAX_CONSECUTIVE_SEND_FAILURES {
                     self.mark_lost(format!("{failures} sends in a row failed, last: {e}"));
-                } else {
+                } else if failures == 1 {
                     tracing::warn!("Failed to send to the relay: {e}");
                 }
             }
@@ -216,7 +221,8 @@ impl WebTransportClient {
                     ..Default::default()
                 };
                 let data = packet.write_to_bytes().unwrap();
-                loss.record_send(&session, Self::send(&session, data).await);
+                let result = Self::send(&session, data).await;
+                loss.record_send(|| session.close_reason().map(|r| r.to_string()), result);
             }
         });
     }
@@ -230,11 +236,11 @@ impl WebTransportClient {
 /// certificate).
 pub fn check_insecure_skip_verify(relay: &Url, insecure_skip_verify: bool) -> anyhow::Result<()> {
     if insecure_skip_verify && !is_local_host(relay) {
-        bail!(
+        return Err(needs_human(format!(
             "--insecure-skip-verify is only allowed for localhost, loopback, or private-range \
              relay addresses, not {}. Remove the flag to verify the relay's certificate.",
             relay.host_str().unwrap_or("<no host>")
-        );
+        )));
     }
     Ok(())
 }
@@ -255,8 +261,9 @@ pub fn lobby_url(relay: &Url, room_token: &str) -> Url {
 /// web-transport-quinn 0.8.1 keeps its connect error types private, so the
 /// status is read from the `Debug` text. A non-2xx response surfaces as
 /// `HttpError(ProtoError(WrongStatus(Some(401))))`; `ErrorStatus(401)` is the
-/// crate's other path for the same thing. Same approach as the relay tests in
-/// `actix-api/src/webtransport/mod.rs`.
+/// crate's other path for the same thing. `rejection_status_from_a_real_refusal`
+/// checks this against a real refusal, so a crate bump that changes it fails
+/// the test.
 pub fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
     let web_transport_quinn::ClientError::HttpError(inner) = err else {
         return None;
@@ -298,7 +305,7 @@ async fn connect_to_server(
     };
 
     let mut backoff = Backoff::relay();
-    let mut previous_was_401 = false;
+    let mut policy = ConnectPolicy::default();
     loop {
         // A fresh room token for every attempt: they expire after 300 s.
         let token = match room::room_token(creds, &options.meeting_id).await {
@@ -325,20 +332,20 @@ async fn connect_to_server(
                 format!("no answer within {} s", CONNECT_TIMEOUT.as_secs()),
             ),
         };
-        match after_connect_failure(status, previous_was_401) {
+        match policy.after_failure(status) {
             NextStep::RetryNow => {
-                previous_was_401 = true;
                 info!("Relay said the room token expired (401); retrying with a fresh one");
             }
             NextStep::Backoff => {
-                previous_was_401 = false;
                 let delay = backoff.next_delay();
                 tracing::error!(
                     "WebTransport connection failed: {error}. Retrying in {delay:.1?}..."
                 );
                 time::sleep(delay).await;
             }
-            NextStep::Fatal(reason) => bail!("{reason} (relay {})", options.url),
+            NextStep::Fatal(reason) => {
+                return Err(needs_human(format!("{reason} (relay {})", options.url)))
+            }
         }
     }
 }
@@ -358,10 +365,25 @@ pub(crate) enum NextStep {
     Fatal(String),
 }
 
-/// 401 means "come back with a fresh token": retry once immediately, and
-/// give up only if the very next attempt gets 401 too. 403 and 404 are
-/// terminal. Anything else (network, QUIC, timeout, 5xx) backs off.
-pub(crate) fn after_connect_failure(status: Option<u16>, previous_was_401: bool) -> NextStep {
+/// Decides the next step after each failed connect attempt.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectPolicy {
+    previous_was_401: bool,
+}
+
+impl ConnectPolicy {
+    /// 401 means "come back with a fresh token": retry once immediately,
+    /// and give up only if the very next attempt gets 401 too; any other
+    /// failure in between starts the count over. 403 and 404 are terminal.
+    /// Anything else (network, QUIC, timeout, 5xx) backs off.
+    pub(crate) fn after_failure(&mut self, status: Option<u16>) -> NextStep {
+        let step = next_step(status, self.previous_was_401);
+        self.previous_was_401 = step == NextStep::RetryNow;
+        step
+    }
+}
+
+fn next_step(status: Option<u16>, previous_was_401: bool) -> NextStep {
     match status {
         Some(401) if !previous_was_401 => NextStep::RetryNow,
         Some(401) => NextStep::Fatal(
@@ -397,7 +419,8 @@ impl CameraSynk for WebTransportClient {
                 let loss = loss.clone();
                 tokio::spawn(async move {
                     let result = WebTransportClient::send(&session_clone_inner, message).await;
-                    loss.record_send(&session_clone_inner, result);
+                    let close_reason = || session_clone_inner.close_reason().map(|r| r.to_string());
+                    loss.record_send(close_reason, result);
                 });
             }
         });
@@ -511,24 +534,95 @@ mod tests {
 
     #[test]
     fn connect_failure_policy() {
-        assert_eq!(after_connect_failure(Some(401), false), NextStep::RetryNow);
+        let mut policy = ConnectPolicy::default();
+        // 401, then a different failure, then 401 again: the streak restarts.
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        assert_eq!(policy.after_failure(Some(503)), NextStep::Backoff);
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        assert_eq!(policy.after_failure(None), NextStep::Backoff);
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        // 401 right after 401 is fatal.
         assert!(matches!(
-            after_connect_failure(Some(401), true),
+            policy.after_failure(Some(401)),
             NextStep::Fatal(_)
         ));
-        assert!(matches!(
-            after_connect_failure(Some(403), false),
-            NextStep::Fatal(_)
-        ));
-        assert!(matches!(
-            after_connect_failure(Some(404), false),
-            NextStep::Fatal(_)
-        ));
-        assert_eq!(after_connect_failure(Some(503), false), NextStep::Backoff);
-        assert_eq!(after_connect_failure(None, false), NextStep::Backoff);
-        // A timeout or network error after a 401 backs off and resets the
-        // 401 streak (the caller clears `previous_was_401`).
-        assert_eq!(after_connect_failure(None, true), NextStep::Backoff);
-        assert!(CONNECT_TIMEOUT < Duration::from_secs(30));
+        for status in [403, 404] {
+            let step = ConnectPolicy::default().after_failure(Some(status));
+            assert!(matches!(step, NextStep::Fatal(_)), "{status}");
+        }
+    }
+
+    #[test]
+    fn sends_mark_the_connection_lost() {
+        let failed = || Err(anyhow::anyhow!("stream reset"));
+        // 99 failures in a row are tolerated; a success resets the count.
+        let loss = LossSignal::new();
+        for _ in 1..MAX_CONSECUTIVE_SEND_FAILURES {
+            assert!(loss.record_send(|| None, failed()));
+        }
+        assert!(loss.record_send(|| None, Ok(())));
+        for _ in 1..MAX_CONSECUTIVE_SEND_FAILURES {
+            assert!(loss.record_send(|| None, failed()));
+        }
+        assert!(!loss.record_send(|| None, failed()), "the 100th in a row");
+        assert!(loss.reason().unwrap().contains("100 sends in a row failed"));
+
+        // A failure on a closed session is lost at once, with its reason.
+        let loss = LossSignal::new();
+        assert!(!loss.record_send(|| Some("closed by peer".into()), failed()));
+        assert_eq!(loss.reason().as_deref(), Some("closed by peer"));
+    }
+
+    /// The status comes from the real error a relay's refusal produces, so
+    /// a web-transport-quinn bump that changes its shape fails here.
+    #[tokio::test]
+    async fn rejection_status_from_a_real_refusal() {
+        use web_transport_quinn::quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/../actix-api/certs");
+        let cert = CertificateDer::from(std::fs::read(format!("{certs}/localhost.der")).unwrap());
+        let key =
+            PrivateKeyDer::try_from(std::fs::read(format!("{certs}/localhost_key.der")).unwrap())
+                .unwrap();
+        // Our own endpoint, so the test holds each connection open until
+        // the client has read the refusal.
+        use web_transport_quinn::quinn;
+        let mut tls = quinn::rustls::ServerConfig::builder_with_provider(
+            web_transport_quinn::crypto::default_provider(),
+        )
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic));
+        let endpoint = quinn::Endpoint::server(config, ([127, 0, 0, 1], 0).into()).unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            for status in [401u16, 403, 404] {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let request = web_transport_quinn::Request::accept(conn.clone())
+                    .await
+                    .unwrap();
+                let status = web_transport_quinn::http::StatusCode::from_u16(status).unwrap();
+                request.close(status).await.unwrap();
+                open.push(conn);
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        // SAFETY: test-only client against the local test server above.
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new()
+                .with_no_certificate_verification()
+                .unwrap()
+        };
+        for expected in [401u16, 403, 404] {
+            let url = Url::parse(&format!("https://127.0.0.1:{port}/lobby?token=t")).unwrap();
+            let error = client.connect(url).await.unwrap_err();
+            assert_eq!(rejection_status(&error), Some(expected), "{error:?}");
+        }
     }
 }

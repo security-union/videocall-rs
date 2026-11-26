@@ -26,7 +26,9 @@ use url::{Host, Url};
 /// True when `url` points at `localhost`, a loopback address, an RFC 1918
 /// private IPv4 address, or an IPv6 unique-local (`fc00::/7`) address.
 ///
-/// Any other DNS name is not local: it could resolve anywhere.
+/// Everything else is refused, including link-local (`169.254.0.0/16`,
+/// `fe80::/10`) and carrier-grade NAT (`100.64.0.0/10`) addresses, and any
+/// other DNS name: it could resolve anywhere.
 pub fn is_local_host(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
@@ -85,6 +87,9 @@ mod tests {
             "https://[2001:db8::1]",
             "https://[::ffff:8.8.8.8]",
             "https://raspberrypi.local",
+            "https://169.254.1.1",
+            "https://100.64.0.1",
+            "https://[fe80::1]",
         ] {
             assert!(!local(url), "{url} should not be local");
         }

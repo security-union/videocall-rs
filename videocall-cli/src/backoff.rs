@@ -80,7 +80,7 @@ pub fn poll_delay() -> Duration {
 }
 
 /// Uniform in `[0, 1)` from the OS RNG; `0.5` if the RNG is unavailable.
-fn random_fraction() -> f64 {
+pub(crate) fn random_fraction() -> f64 {
     let mut bytes = [0u8; 4];
     if getrandom::fill(&mut bytes).is_err() {
         return 0.5;

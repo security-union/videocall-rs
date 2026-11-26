@@ -21,9 +21,12 @@ mod modes;
 
 use modes::info::get_info;
 use modes::stream::stream;
+use std::process::ExitCode;
+use std::time::Duration;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use videocall_cli::cli_args::{Info, Mode, Opt};
+use videocall_cli::exit;
 
 async fn initialize() {
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -48,8 +51,31 @@ async fn initialize() {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// How long exit waits for leftover tasks once `run` returns. A blocking
+/// DNS lookup on a dead network can hold a worker for the resolver's full
+/// timeout (5 s per try); the relay close already had its own 500 ms.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Error: can't start the async runtime: {e}");
+            return ExitCode::from(exit::RESTART);
+        }
+    };
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(exit::code(&e))
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(

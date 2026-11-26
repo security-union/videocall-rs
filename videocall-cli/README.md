@@ -116,7 +116,17 @@ videocall-cli stream \
 
 Add `--display-name "Garage cam"` to show a different name than your account's.
 
-Ctrl-C or SIGTERM closes the relay connection and exits 0. If the relay connection drops, the CLI exits non-zero instead of reconnecting, so run it under systemd with `Restart=on-failure` and it joins again from scratch. While joining, it keeps retrying meeting-api and the relay through network trouble: relay connects back off from 1 s to 30 s, and each connect attempt gets 15 s.
+Ctrl-C, SIGTERM or SIGHUP closes the relay connection and exits 0. The CLI doesn't reconnect: when the relay connection or the camera drops, it exits 1 and a supervisor starts it again, which joins from scratch. While joining, it keeps retrying meeting-api and the relay through network trouble: relay connects back off from 1 s to 30 s, and each connect attempt gets 15 s.
+
+Exit code 2 means a restart won't help and a human has to act: not logged in or revoked, declined or removed by the host, a meeting that doesn't exist or has ended, a relay that refused the token, or a bad flag. So the systemd unit for a Pi looks like this:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/videocall-cli stream --meeting-id <meeting-id> --video-device-index 0
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+```
 
 ## 🍓 Raspberry Pi or SSH
 

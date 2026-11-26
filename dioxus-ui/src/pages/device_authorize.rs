@@ -457,10 +457,15 @@ mod tests {
         }
     }
 
-    /// `videocall-cli auth login --name "C++ rig"`, and a state holding
-    /// `+` and `%`.
-    fn plus_query() -> String {
-        query("http://127.0.0.1:5000/callback", "")
+    /// The API's `request=` form survives the router untouched, so the
+    /// router's percent-decoding cannot reach `+` or `%`.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn encoded_request_survives_the_router() {
+        use videocall_meeting_types::device::encode_authorize_request;
+        // `videocall-cli auth login --name "C++ rig"`, and a state holding
+        // `+` and `%`.
+        let raw = query("http://127.0.0.1:5000/callback", "")
             .replace(
                 "state=abcdefghijklmnopqrstuvwxyz",
                 "state=abcdefghijklmnop%2Bqrs%25tu",
@@ -468,24 +473,8 @@ mod tests {
             .replace(
                 "device_name=videocall-cli%20on%20pi4",
                 "device_name=C%2B%2B+rig",
-            )
-    }
-
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn raw_query_keeps_plus_and_percent() {
-        let request = parse_authorize_query(&plus_query()).unwrap();
-        assert_eq!(request.body.device_name, "C++ rig");
-        assert_eq!(request.body.state, "abcdefghijklmnop+qrs%tu");
-    }
-
-    /// The API's `request=` form survives the router untouched, so the
-    /// router's percent-decoding cannot reach `+` or `%`.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn encoded_request_survives_the_router() {
-        use videocall_meeting_types::device::encode_authorize_request;
-        let encoded = encode_authorize_request(&plus_query());
+            );
+        let encoded = encode_authorize_request(&raw);
         let route: crate::routing::Route = format!("/devices/authorize?request={encoded}")
             .parse()
             .unwrap();

@@ -25,7 +25,7 @@ use actix_http::ws::{Codec, Message, ProtocolError};
 use actix_web::web::Bytes;
 use actix_web::{get, web, Error, HttpRequest, HttpResponse};
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
 use crate::constants::MAX_FRAME_SIZE;
@@ -36,8 +36,7 @@ use crate::token_validator;
 #[derive(Debug, serde::Deserialize)]
 pub struct LobbyTokenQuery {
     /// JWT room access token. Identity and room are extracted from the claims.
-    /// A missing or empty token gets 401.
-    pub token: Option<String>,
+    pub token: String,
 }
 
 /// Start a WebSocket connection with a custom codec.
@@ -58,8 +57,7 @@ where
 /// WebSocket connection endpoint (token-based).
 ///
 /// Identity (user_id) and room are extracted from the JWT claims.
-/// No user_id or room in the URL path. 401 when the token is missing or
-/// expired, 403 when it is invalid.
+/// No user_id or room in the URL path.
 #[get("/lobby")]
 pub async fn ws_connect_authenticated(
     query: web::Query<LobbyTokenQuery>,
@@ -73,11 +71,7 @@ pub async fn ws_connect_authenticated(
         return Ok(HttpResponse::InternalServerError().body("Server misconfigured"));
     }
 
-    let Some(token) = query.token.as_deref().filter(|t| !t.is_empty()) else {
-        info!("WS connection rejected: no room access token");
-        return Ok(HttpResponse::Unauthorized().body("room access token is required"));
-    };
-    let claims = match token_validator::decode_room_token(&jwt_secret, token) {
+    let claims = match token_validator::decode_room_token(&jwt_secret, &query.token) {
         Ok(c) => c,
         Err(e) => {
             e.log("WS");

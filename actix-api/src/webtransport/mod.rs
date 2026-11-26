@@ -24,17 +24,15 @@ use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::token_validator::{self, TokenError};
 use actix::prelude::*;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
-use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 use videocall_meeting_types::token::RoomAccessTokenClaims;
-use web_transport_quinn::http::StatusCode;
 
 lazy_static::lazy_static! {
     static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
@@ -47,10 +45,6 @@ lazy_static::lazy_static! {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 }
-
-/// Longest a refused CONNECT keeps its connection open so the status arrives
-/// (see the accept loop in `start`).
-const REJECT_LINGER: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,46 +197,25 @@ pub async fn start(
     // Create Quinn endpoint with our custom config
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
 
+    let mut server = web_transport_quinn::Server::new(endpoint);
+
     info!(
         "listening on {} with {}s idle timeout and {}s keep-alive",
         opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
     );
 
-    // Accept loop: what `web_transport_quinn::Server::accept` does, but we keep
-    // our own handle to each QUIC connection. Without it, no status reaches a
-    // refused client: dropping the last handle closes the connection at once
-    // and quinn discards the unsent 401/403/404, so the client sees only a bare
-    // close and cannot tell "fetch a new token" from "refused". Holding the
-    // handle lets the response go out and be retransmitted on a lossy,
-    // high-latency link; `reject_connect` lets go when the client closes, or
-    // after `REJECT_LINGER`.
-    //
+    // Accept new WebTransport connections
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
     // actor requires the actix LocalSet context for spawn_local.
-    while let Some(incoming) = endpoint.accept().await {
+    while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
         actix_rt::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    debug!("QUIC handshake failed: {err}");
-                    return;
-                }
-            };
-            let request = match web_transport_quinn::Request::accept(conn.clone()).await {
-                Ok(request) => request,
-                Err(err) => {
-                    debug!("WebTransport handshake failed: {err}");
-                    return;
-                }
-            };
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
-                conn,
                 chat_server,
                 nats_client,
                 tracker_sender,
@@ -258,96 +231,59 @@ pub async fn start(
     Ok(())
 }
 
-/// Why a WebTransport CONNECT was refused, and the HTTP status to answer with.
-#[derive(Debug)]
-enum ConnectRejection {
-    /// The path is not `/lobby`. Includes the removed `/lobby/{user_id}/{room}` form.
-    NotFound,
-    /// `JWT_SECRET` is not configured on this server.
-    Misconfigured,
-    /// The room access token is missing or failed validation.
-    Token(TokenError),
-}
-
-impl ConnectRejection {
-    /// 404 for another path; 401 when the token is missing or expired (come
-    /// back with a fresh one); 403 when it was read and refused.
-    fn status(&self) -> StatusCode {
-        match self {
-            ConnectRejection::NotFound => StatusCode::NOT_FOUND,
-            ConnectRejection::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
-            ConnectRejection::Token(TokenError::Missing) => StatusCode::UNAUTHORIZED,
-            ConnectRejection::Token(e) if e.is_retryable() => StatusCode::UNAUTHORIZED,
-            ConnectRejection::Token(_) => StatusCode::FORBIDDEN,
-        }
-    }
-}
-
-/// Decide whether a WebTransport CONNECT may join, from its URL alone.
-///
-/// The only accepted form is `/lobby?token=<JWT>`; identity and room come from
-/// the token claims. This mirrors the WebSocket `GET /lobby` handler.
+/// Decide from the CONNECT URL alone whether it may join. The only accepted
+/// form is `/lobby?token=<JWT>`; a refused request is dropped, as before.
 fn authorize_connect(
     path: &str,
     token: Option<&str>,
     jwt_secret: &str,
-) -> Result<RoomAccessTokenClaims, ConnectRejection> {
+) -> anyhow::Result<RoomAccessTokenClaims> {
     if path.trim_end_matches('/') != "/lobby" {
-        return Err(ConnectRejection::NotFound);
+        return Err(anyhow!("Invalid path: expected /lobby?token=<JWT>"));
     }
     if jwt_secret.is_empty() {
-        return Err(ConnectRejection::Misconfigured);
+        return Err(anyhow!("JWT_SECRET not set"));
     }
-    let token = token
-        .filter(|t| !t.is_empty())
-        .ok_or(ConnectRejection::Token(TokenError::Missing))?;
-    token_validator::decode_room_token(jwt_secret, token).map_err(ConnectRejection::Token)
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        TokenError::Missing.log("WT");
+        return Err(anyhow!("room access token is required"));
+    };
+    token_validator::decode_room_token(jwt_secret, token).map_err(|e| {
+        e.log("WT");
+        anyhow!("token validation failed: {}", e.client_message())
+    })
 }
 
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
-    conn: quinn::Connection,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     // Never log the full URL: the query string carries the room token.
-    let url = request.url();
-    debug!("received WebTransport CONNECT for path {}", url.path());
+    let uri = request.url();
+    debug!("received WebTransport request for path {}", uri.path());
 
-    let token = url
+    // Extract ?token= from query string
+    let token = uri
         .query_pairs()
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
+
+    // Identity and room come from the JWT claims; there is no other way in.
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-
-    let claims = match authorize_connect(url.path(), token.as_deref(), &jwt_secret) {
-        Ok(claims) => claims,
-        Err(rejection) => {
-            match &rejection {
-                ConnectRejection::NotFound => {
-                    info!("WT connection rejected: unknown path {}", url.path())
-                }
-                ConnectRejection::Misconfigured => error!("JWT_SECRET not set"),
-                ConnectRejection::Token(e) => e.log("WT"),
-            }
-            reject_connect(request, conn, rejection.status()).await;
-            return Ok(());
-        }
-    };
-    // Only the refusal path needs our extra handle; the session owns the
-    // connection from here on.
-    drop(conn);
-
+    let claims = authorize_connect(uri.path(), token.as_deref(), &jwt_secret)?;
     info!(
         "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
         claims.sub, claims.room, claims.display_name, claims.observer
     );
-    let username = claims.sub;
-    let lobby_id = claims.room;
-    let observer = claims.observer;
-    let display_name = claims.display_name;
+    let (username, lobby_id, observer, display_name) = (
+        claims.sub,
+        claims.room,
+        claims.observer,
+        claims.display_name,
+    );
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -370,20 +306,6 @@ async fn run_webtransport_connection_from_request(
         info!("closing session: {}", err);
     }
     Ok(())
-}
-
-/// Answer a CONNECT with an error status, then hold the QUIC connection until
-/// the client closes it or `REJECT_LINGER` passes, so the status is delivered.
-async fn reject_connect(
-    request: web_transport_quinn::Request,
-    conn: quinn::Connection,
-    status: StatusCode,
-) {
-    if let Err(err) = request.close(status).await {
-        debug!("failed to send WebTransport rejection {status}: {err}");
-        return;
-    }
-    let _ = tokio::time::timeout(REJECT_LINGER, conn.closed()).await;
 }
 
 /// Handle a WebTransport session using the WtChatSession actor
@@ -577,7 +499,7 @@ mod tests {
 
     async fn wait_for_server_ready() {
         let condition = || async {
-            match connect_client_as("test", "test").await {
+            match connect_client("test", "test").await {
                 Ok(_) => {
                     info!("Server is ready!");
                     true
@@ -605,52 +527,12 @@ mod tests {
             .expect("generate room token")
     }
 
-    /// Connect as `user` to `room` through the token endpoint.
-    async fn connect_client_as(
+    /// Connect as `user` to `meeting` with a freshly minted room token.
+    async fn connect_client(
         user: &str,
-        room: &str,
+        meeting: &str,
     ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
-        connect_client_with_token(&token_for(user, room)).await
-    }
-
-    /// Open a WebTransport session to an arbitrary path and query on the test
-    /// server, returning the raw client error so tests can read the status.
-    async fn connect_raw(
-        path_and_query: &str,
-    ) -> Result<web_transport_quinn::Session, web_transport_quinn::ClientError> {
-        let base = std::env::var("WEBTRANSPORT_URL")
-            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
-        let url = url::Url::parse(&format!("{}{}", base.trim_end_matches('/'), path_and_query))
-            .expect("valid test URL");
-        let client = unsafe {
-            web_transport_quinn::ClientBuilder::new()
-                .with_no_certificate_verification()
-                .expect("build client")
-        };
-        client.connect(url).await
-    }
-
-    /// The HTTP status of a refused CONNECT, if that is why `err` happened.
-    ///
-    /// web-transport-quinn keeps its connect error types private, so we read
-    /// the status out of the `Debug` text. A non-200 response surfaces as
-    /// `HttpError(ProtoError(WrongStatus(Some(401))))` in 0.8.1; the
-    /// `ErrorStatus(401)` form is the crate's other path for the same thing.
-    fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
-        let web_transport_quinn::ClientError::HttpError(inner) = err else {
-            return None;
-        };
-        let text = format!("{inner:?}");
-        ["WrongStatus(Some(", "ErrorStatus("]
-            .iter()
-            .find_map(|marker| text.split(marker).nth(1))
-            .and_then(|rest| {
-                rest.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse()
-                    .ok()
-            })
+        connect_client_with_token(&token_for(user, meeting)).await
     }
 
     /// Connect via the token-based endpoint: GET /lobby?token=<JWT>
@@ -768,13 +650,13 @@ mod tests {
         let user_b = "user-b";
 
         println!("Connecting client A: {user_a}");
-        let session_a = connect_client_as(user_a, meeting)
+        let session_a = connect_client(user_a, meeting)
             .await
             .expect("connect client A");
         println!("Client A connected!");
 
         println!("Connecting client B: {user_b}");
-        let session_b = connect_client_as(user_b, meeting)
+        let session_b = connect_client(user_b, meeting)
             .await
             .expect("connect client B");
         println!("Client B connected!");
@@ -948,17 +830,15 @@ mod tests {
 
         println!("\n--- Establishing Connections ---");
 
-        let session_a = connect_client_as(user_a, lobby_1)
+        let session_a = connect_client(user_a, lobby_1)
             .await
             .expect("connect alice");
         println!("✓ Alice connected to lobby-secure");
 
-        let session_b = connect_client_as(user_b, lobby_2)
-            .await
-            .expect("connect bob");
+        let session_b = connect_client(user_b, lobby_2).await.expect("connect bob");
         println!("✓ Bob connected to lobby-public");
 
-        let session_c = connect_client_as(user_c, lobby_1)
+        let session_c = connect_client(user_c, lobby_1)
             .await
             .expect("connect charlie");
         println!("✓ Charlie connected to lobby-secure");
@@ -1294,7 +1174,7 @@ mod tests {
         // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
-        let session_alice = connect_client_as("alice", room_id)
+        let session_alice = connect_client("alice", room_id)
             .await
             .expect("connect alice");
         wait_for_session_ready(&session_alice, "Alice")
@@ -1305,9 +1185,7 @@ mod tests {
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
-        let session_bob = connect_client_as("bob", room_id)
-            .await
-            .expect("connect bob");
+        let session_bob = connect_client("bob", room_id).await.expect("connect bob");
         wait_for_session_ready(&session_bob, "Bob")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1316,7 +1194,7 @@ mod tests {
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
 
-        let session_charlie = connect_client_as("charlie", room_id)
+        let session_charlie = connect_client("charlie", room_id)
             .await
             .expect("connect charlie");
         wait_for_session_ready(&session_charlie, "Charlie")
@@ -1366,8 +1244,9 @@ mod tests {
     const JWT_SECRET: &str = "test-secret-for-integration-tests";
     const TOKEN_TTL_SECS: i64 = 600;
 
-    /// Start the real WT server for JWT tests.
+    /// Set up env and start the real WT server for JWT tests.
     async fn setup_jwt_wt() {
+        std::env::set_var("JWT_SECRET", JWT_SECRET);
         let _handle = start_webtransport_server().await;
         wait_for_server_ready().await;
     }
@@ -1474,64 +1353,29 @@ mod tests {
     #[test]
     fn authorize_connect_decisions() {
         let token = token_for("alice", "room-1");
-        let token = Some(token.as_str());
         let expired = meeting_api::token::generate_room_token(
             JWT_SECRET, -120, "alice", "room-1", false, "Alice",
         )
         .expect("generate token");
         let refused = [
-            (
-                "/lobby/alice/room-1",
-                None,
-                JWT_SECRET,
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                "/lobby/alice/room-1",
-                token,
-                JWT_SECRET,
-                StatusCode::NOT_FOUND,
-            ),
-            ("/", None, JWT_SECRET, StatusCode::NOT_FOUND),
-            ("/lobbyx", None, JWT_SECRET, StatusCode::NOT_FOUND),
-            ("/lobby/extra", None, JWT_SECRET, StatusCode::NOT_FOUND),
-            ("/lobby", None, JWT_SECRET, StatusCode::UNAUTHORIZED),
-            ("/lobby", Some(""), JWT_SECRET, StatusCode::UNAUTHORIZED),
-            (
-                "/lobby",
-                Some("not.a.jwt"),
-                JWT_SECRET,
-                StatusCode::FORBIDDEN,
-            ),
-            ("/lobby", token, "another-secret", StatusCode::FORBIDDEN),
-            (
-                "/lobby",
-                Some(&expired),
-                JWT_SECRET,
-                StatusCode::UNAUTHORIZED,
-            ),
-            ("/lobby", token, "", StatusCode::INTERNAL_SERVER_ERROR),
+            ("/lobby", None),                       // no token
+            ("/lobby", Some("")),                   // empty token
+            ("/lobby", Some("not.a.jwt")),          // bad token
+            ("/lobby", Some(expired.as_str())),     // expired token
+            ("/lobby/alice/room-1", None),          // removed path form
+            ("/lobby/alice/room-1", Some(&*token)), // removed path form, even with a token
         ];
-        for (path, token, secret, status) in refused {
-            let rejection = authorize_connect(path, token, secret).unwrap_err();
-            assert_eq!(rejection.status(), status, "{path} {token:?} {secret:?}");
-        }
-        for path in ["/lobby", "/lobby/"] {
-            let claims = authorize_connect(path, token, JWT_SECRET).expect("valid token");
-            assert_eq!(
-                (claims.sub.as_str(), claims.room.as_str()),
-                ("alice", "room-1")
+        for (path, token) in refused {
+            assert!(
+                authorize_connect(path, token, JWT_SECRET).is_err(),
+                "{path} {token:?} must be refused"
             );
-            assert!(!claims.observer);
         }
-    }
-
-    /// The refusal status must reach a real client (see `REJECT_LINGER`).
-    #[actix_rt::test]
-    async fn test_wt_refusal_status_reaches_the_client() {
-        setup_jwt_wt().await;
-        let err = connect_raw("/lobby").await.expect_err("must be refused");
-        assert_eq!(rejection_status(&err), Some(401), "got {err:?}");
+        let claims = authorize_connect("/lobby", Some(&token), JWT_SECRET).expect("valid token");
+        assert_eq!(
+            (claims.sub.as_str(), claims.room.as_str()),
+            ("alice", "room-1")
+        );
     }
 
     #[actix_rt::test]

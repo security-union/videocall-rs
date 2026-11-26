@@ -20,7 +20,7 @@
 //! Verified scenarios:
 //! - Valid tokens issued by meeting-api allow connection via `GET /lobby?token=`
 //! - Expired / invalid / unauthorized tokens are rejected
-//! - A missing token is rejected with 401
+//! - A missing token is rejected
 //! - The removed `GET /lobby/{email}/{room}` form is refused (404)
 
 use actix::Actor;
@@ -318,13 +318,15 @@ async fn test_path_form_is_refused() {
 
 #[actix_rt::test]
 #[serial]
-async fn test_missing_token_is_401() {
+async fn test_missing_token_is_refused() {
     let port = JWT_PORT + 6;
     setup(port).await;
 
-    for path in ["/lobby", "/lobby?token="] {
+    // Same statuses as before the path form was removed: the query extractor
+    // answers 400 without `token`, and an empty token fails validation (403).
+    for (path, status) in [("/lobby", 400), ("/lobby?token=", 403)] {
         let result = try_connect_raw(port, path).await;
-        assert_eq!(result.err(), Some(401), "{path} must be refused with 401");
+        assert_eq!(result.err(), Some(status), "{path} must be refused");
     }
 }
 

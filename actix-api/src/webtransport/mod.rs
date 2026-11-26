@@ -52,6 +52,34 @@ lazy_static::lazy_static! {
 /// (see the accept loop in `start`).
 const REJECT_LINGER: Duration = Duration::from_secs(3);
 
+/// Longest a connection may take from QUIC accept to a parsed CONNECT: the
+/// QUIC handshake plus the HTTP/3 SETTINGS and CONNECT exchange.
+///
+/// Without it, a client that finishes QUIC and never sends SETTINGS or
+/// CONNECT holds a task and a connection forever: our 1 s keep-alives stop
+/// the 30 s idle timeout from ever firing.
+///
+/// Why 10 s: a clean handshake is about three round trips, roughly 1 s on a
+/// 300 ms mobile link. Each lost flight costs a probe timeout, which starts
+/// near 1 s before quinn has an RTT sample and doubles on every repeat, so
+/// three losses in a row add about 1 + 2 + 4 = 7 s. It applies only before
+/// the session is accepted, never to a running call.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most connections that may be between QUIC accept and either an accepted
+/// session or the end of their refusal linger, at once. A connection holds
+/// its permit for the handshake (at most `HANDSHAKE_TIMEOUT`) and, if
+/// refused, through `REJECT_LINGER`, so the linger cannot be used to pile up
+/// connections. An accepted session gives its permit back before it starts,
+/// so live calls never count. When all permits are taken a new connection is
+/// refused at the QUIC layer at once, with no linger.
+#[cfg(not(test))]
+const MAX_PENDING_HANDSHAKES: usize = 2048;
+/// Small enough that a test can fill it; above the handful of concurrent
+/// connections any other test opens.
+#[cfg(test)]
+const MAX_PENDING_HANDSHAKES: usize = 16;
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -215,34 +243,50 @@ pub async fn start(
     // close and cannot tell "fetch a new token" from "refused". Holding the
     // handle lets the response go out and be retransmitted on a lossy,
     // high-latency link; `reject_connect` lets go when the client closes, or
-    // after `REJECT_LINGER`.
+    // after `REJECT_LINGER`. `HANDSHAKE_TIMEOUT` and `MAX_PENDING_HANDSHAKES`
+    // bound what connections that never get that far can hold.
     //
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
     // actor requires the actix LocalSet context for spawn_local.
+    let handshake_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
         trace_span!("New connection being attempted");
+        let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+            debug!("refusing connection: {MAX_PENDING_HANDSHAKES} handshakes already pending");
+            incoming.refuse();
+            continue;
+        };
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
         actix_rt::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    debug!("QUIC handshake failed: {err}");
+            let handshake = async {
+                let conn = incoming
+                    .await
+                    .map_err(|err| format!("QUIC handshake failed: {err}"))?;
+                let request = web_transport_quinn::Request::accept(conn.clone())
+                    .await
+                    .map_err(|err| format!("WebTransport handshake failed: {err}"))?;
+                Ok::<_, String>((request, conn))
+            };
+            // On timeout the future is dropped, which drops the connection
+            // and closes it.
+            let (request, conn) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(err)) => {
+                    debug!("{err}");
                     return;
                 }
-            };
-            let request = match web_transport_quinn::Request::accept(conn.clone()).await {
-                Ok(request) => request,
-                Err(err) => {
-                    debug!("WebTransport handshake failed: {err}");
+                Err(_) => {
+                    debug!("WebTransport handshake timed out after {HANDSHAKE_TIMEOUT:?}");
                     return;
                 }
             };
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
                 conn,
+                handshake_permit,
                 chat_server,
                 nats_client,
                 tracker_sender,
@@ -307,6 +351,7 @@ fn authorize_connect(
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     conn: quinn::Connection,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
@@ -332,13 +377,16 @@ async fn run_webtransport_connection_from_request(
                 ConnectRejection::Misconfigured => error!("JWT_SECRET not set"),
                 ConnectRejection::Token(e) => e.log("WT"),
             }
+            // The permit is held through the linger.
             reject_connect(request, conn, rejection.status()).await;
+            drop(handshake_permit);
             return Ok(());
         }
     };
     // Only the refusal path needs our extra handle; the session owns the
-    // connection from here on.
+    // connection from here on, and it no longer counts as pending.
     drop(conn);
+    drop(handshake_permit);
 
     info!(
         "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
@@ -1468,6 +1516,154 @@ mod tests {
         wait_for_session_ready(&session, "bob")
             .await
             .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    /// Accepts any server certificate, for the raw-QUIC tests below that
+    /// never get as far as WebTransport.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// A bare QUIC connection to the test server with the WebTransport ALPN,
+    /// that never speaks HTTP/3: what a stalled or hostile client looks like.
+    async fn connect_silent_quic() -> Result<quinn::Connection, quinn::ConnectionError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config"),
+        ));
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let server = url::Url::parse(&base)
+            .expect("valid WEBTRANSPORT_URL")
+            .socket_addrs(|| Some(443))
+            .expect("resolve WEBTRANSPORT_URL")
+            .into_iter()
+            .next()
+            .expect("WEBTRANSPORT_URL resolves");
+        let local = if server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let mut endpoint =
+            quinn::Endpoint::client(local.parse().expect("bind addr")).expect("client endpoint");
+        endpoint.set_default_client_config(client_config);
+        endpoint
+            .connect(server, "localhost")
+            .expect("start QUIC connect")
+            .await
+    }
+
+    /// A client that finishes QUIC but never sends SETTINGS or CONNECT is
+    /// closed once `HANDSHAKE_TIMEOUT` passes, and not before.
+    #[actix_rt::test]
+    async fn test_wt_silent_client_dropped_after_handshake_timeout() {
+        setup_jwt_wt().await;
+        let conn = connect_silent_quic().await.expect("QUIC handshake");
+        let started = std::time::Instant::now();
+        let closed =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(5), conn.closed())
+                .await
+                .expect("server should close a silent connection");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed + Duration::from_millis(500) >= HANDSHAKE_TIMEOUT,
+            "closed too early ({elapsed:?}): {closed:?}"
+        );
+    }
+
+    /// With every pending slot taken, a new connection is refused at once;
+    /// the slots come back as soon as the pending clients go away, and a
+    /// real client then gets in.
+    #[actix_rt::test]
+    async fn test_wt_pending_handshake_cap_refuses_then_recovers() {
+        setup_jwt_wt().await;
+        let mut silent = Vec::new();
+        for _ in 0..MAX_PENDING_HANDSHAKES {
+            silent.push(connect_silent_quic().await.expect("within the cap"));
+        }
+
+        let started = std::time::Instant::now();
+        let refused = connect_silent_quic()
+            .await
+            .expect_err("over the cap must be refused");
+        assert!(
+            matches!(refused, quinn::ConnectionError::ConnectionClosed(_)),
+            "{refused:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "refused at once"
+        );
+
+        for conn in &silent {
+            conn.close(0u32.into(), b"bye");
+        }
+        drop(silent);
+        // The server notices the closes within a round trip; give it a moment.
+        let mut admitted = None;
+        for _ in 0..20 {
+            match connect_client_as("alice", "wt-cap-room").await {
+                Ok(session) => {
+                    admitted = Some(session);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let session = admitted.expect("a real client gets in once the slots are free");
         session.close(0u32, b"done");
     }
 

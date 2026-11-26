@@ -207,7 +207,7 @@ let
         namespace = "services";
         shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin websocket_server'";
-        environment = [ "ACTIX_PORT=8080" "DATABASE_ENABLED=false" "SERVICE_TYPE=websocket" ];
+        environment = [ "ACTIX_PORT=8080" "SERVICE_TYPE=websocket" ];
         depends_on.nats.condition = "process_healthy";
       };
       webtransport = {
@@ -326,7 +326,7 @@ let
         namespace = "services";
         shutdown = rustShutdown;
         command = e2eServerCmd "websocket_server" packages.videocall-api-bins;
-        environment = [ "ACTIX_PORT=8080" "DATABASE_ENABLED=false" "SERVICE_TYPE=websocket" ];
+        environment = [ "ACTIX_PORT=8080" "SERVICE_TYPE=websocket" ];
         depends_on.nats.condition = "process_healthy";
       };
       dioxus-ui = {
@@ -367,7 +367,6 @@ let
     export RUST_LOG="''${RUST_LOG:-debug,async_nats=info}"
     export REGION="''${REGION:-us-east}"
     export SERVER_ID="''${SERVER_ID:-server-1}"
-    export UI_ENDPOINT="''${UI_ENDPOINT:-http://localhost:3001}"
     export API_BASE_URL="''${API_BASE_URL:-http://localhost:8081}"
     export ACTIX_UI_BACKEND_URL="''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}"
     export WEBTRANSPORT_HOST="''${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}"
@@ -417,11 +416,9 @@ let
       export AFTER_LOGIN_URL="''${AFTER_LOGIN_URL:-http://localhost:3001}"
       export ALLOWED_REDIRECT_URLS="''${ALLOWED_REDIRECT_URLS:-http://localhost:3001}"
       export DEVICE_TOKEN_AUDIENCE="''${DEVICE_TOKEN_AUDIENCE:-http://localhost:8081}"
-      export UI_ENDPOINT="''${UI_ENDPOINT:-http://localhost:3001}"
       export API_BASE_URL="''${API_BASE_URL:-http://localhost:8081}"
       export ACTIX_UI_BACKEND_URL="''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}"
       export WEBTRANSPORT_HOST="''${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}"
-      export FEATURE_MEETING_MANAGEMENT="''${FEATURE_MEETING_MANAGEMENT:-true}"
       export ENABLE_OAUTH="''${ENABLE_OAUTH:-false}"
       export WEBTRANSPORT_ENABLED="''${WEBTRANSPORT_ENABLED:-false}"
       export E2EE_ENABLED="''${E2EE_ENABLED:-false}"

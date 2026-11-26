@@ -114,6 +114,10 @@ videocall-cli stream \
   --bitrate-kbps 500
 ```
 
+Add `--display-name "Garage cam"` to show a different name than your account's.
+
+Ctrl-C or SIGTERM closes the relay connection and exits 0. If the relay connection drops, the CLI exits non-zero instead of reconnecting, so run it under systemd with `Restart=on-failure` and it joins again from scratch. While joining, it keeps retrying meeting-api and the relay through network trouble: relay connects back off from 1 s to 30 s, and each connect attempt gets 15 s.
+
 ## 🍓 Raspberry Pi or SSH
 
 With no browser on the machine, use `--remote` (automatic over SSH or without a desktop session). Open the printed URL on your laptop or phone, approve, and paste the code it shows back into the terminal:
@@ -161,6 +165,8 @@ RUST_LOG=info cargo run --release -- auth login --api-url http://localhost:8081
 RUST_LOG=info cargo run --release -- stream --api-url http://localhost:8081 \
   --url https://127.0.0.1:4433 --insecure-skip-verify --meeting-id <meeting-id> ...
 ```
+
+`--insecure-skip-verify` only works for a relay on localhost, a loopback address, or a private-range IP. Anywhere else the CLI refuses it, because the room token would go to whoever answers.
 
 ## 📦 Build a `.deb` Package
 

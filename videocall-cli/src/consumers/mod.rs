@@ -45,4 +45,18 @@ impl CameraSynk for CameraSynks {
             CameraSynks::DeadSynk(dead_synk) => dead_synk.send_packet(data).await,
         }
     }
+
+    async fn lost(&self) -> String {
+        match self {
+            CameraSynks::CameraSynk(client) => client.lost().await,
+            CameraSynks::DeadSynk(dead_synk) => dead_synk.lost().await,
+        }
+    }
+
+    async fn close(&self) {
+        match self {
+            CameraSynks::CameraSynk(client) => client.close().await,
+            CameraSynks::DeadSynk(dead_synk) => dead_synk.close().await,
+        }
+    }
 }

@@ -151,6 +151,10 @@ pub struct Stream {
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
+    /// Name shown to other participants. Defaults to your account's name.
+    #[clap(long = "display-name")]
+    pub display_name: Option<String>,
+
     /// Specify which camera to use, either by index number or name.
     ///
     /// Examples:
@@ -222,8 +226,11 @@ pub struct Stream {
     #[clap(long = "debug-offline-streaming-test")]
     pub local_streaming_test: bool,
 
-    /// Skip TLS certificate verification for QUIC connections.
-    /// Warning: This makes connections insecure and should only be used for testing.
+    /// Skip TLS certificate verification for the relay (QUIC) connection.
+    ///
+    /// Only allowed when --url is localhost, a loopback address, or a
+    /// private-range IP (a local dev stack); refused otherwise. Never applies
+    /// to the meeting-api connection.
     #[clap(long = "insecure-skip-verify")]
     pub insecure_skip_verify: bool,
 }

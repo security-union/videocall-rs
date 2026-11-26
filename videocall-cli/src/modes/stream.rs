@@ -16,13 +16,14 @@
  * conditions.
  */
 
+use anyhow::bail;
 use tokio::sync::mpsc::channel;
 use videocall_cli::auth::store::Store;
 use videocall_cli::auth::{ApiOrigin, Credentials};
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
 use videocall_cli::consumers::dead_synk::DeadSynk;
-use videocall_cli::consumers::webtransport::WebTransportClient;
+use videocall_cli::consumers::webtransport::{check_insecure_skip_verify, WebTransportClient};
 use videocall_cli::consumers::CameraSynks;
 use videocall_cli::producers::{
     camera::{CameraConfig, CameraDaemon},
@@ -31,7 +32,50 @@ use videocall_cli::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
+/// Resolves on Ctrl-C, or on SIGTERM on unix (systemd/docker stop).
+///
+/// A requested stop exits 0 wherever it happens (joining, connecting or
+/// streaming). Once connected, the relay session is closed explicitly
+/// (code 0) so the relay drops us right away. The CLI does not call
+/// meeting-api `leave`: its account may also be in the meeting from a
+/// browser, and leaving would mark that participant as gone.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("can't listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("can't listen for SIGTERM: {e}");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Join the meeting through meeting-api, then stream to the relay.
+///
+/// Exits 0 on Ctrl-C or SIGTERM, and with an error when the relay
+/// connection drops: the CLI doesn't reconnect, so a supervisor (systemd)
+/// restarts it and it joins again from scratch.
 pub async fn stream(opt: Stream) -> anyhow::Result<()> {
+    // One listener for the whole run, so a signal between selects isn't lost.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     // The CLI can only JOIN an existing call. The meeting must be created first
     // by a user from a browser at https://videocall.rs — the API no longer lets
     // the CLI create a call, so if nobody created it in the browser this stream
@@ -54,7 +98,7 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
 
     println!(
         "User requested resolution {}x{} and format {}",
-        width, height, &format
+        width, height, format
     );
     let framerate = opt.fps;
     // validate framerate
@@ -73,14 +117,29 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let user_id = "offline-streaming-test".to_string();
         (user_id, CameraSynks::DeadSynk(DeadSynk::new(opt)))
     } else {
+        // Fail fast on a bad flag before logging in or joining anything.
+        check_insecure_skip_verify(&opt.url, opt.insecure_skip_verify)?;
         // Join as the account that approved this machine's device key.
         let api = ApiOrigin::from_url(&opt.api.api_url)?;
         let creds = Credentials::load(Store::open_default()?, api).await?;
-        let user_id = videocall_cli::room::join(&creds, &opt.meeting_id).await?;
+        let join = videocall_cli::room::join(&creds, &opt.meeting_id, opt.display_name.as_deref());
+        let user_id = tokio::select! {
+            user_id = join => user_id?,
+            () = &mut shutdown => {
+                println!("Stopped before joining meeting '{}'.", opt.meeting_id);
+                return Ok(());
+            }
+        };
         let client = WebTransportClient::new(opt, creds, user_id.clone());
         (user_id, CameraSynks::CameraSynk(Box::new(client)))
     };
-    client.connect().await?;
+    tokio::select! {
+        result = client.connect() => result?,
+        () = &mut shutdown => {
+            println!("Stopped.");
+            return Ok(());
+        }
+    }
     let camera_config = CameraConfig {
         width,
         height,
@@ -112,13 +171,24 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
             .expect("failed to start microphone");
     }
 
-    while let Some(data) = wt_rx.recv().await {
+    loop {
+        let data = tokio::select! {
+            data = wt_rx.recv() => data,
+            () = &mut shutdown => {
+                client.close().await;
+                println!("Stopped.");
+                return Ok(());
+            }
+            reason = client.lost() => {
+                bail!("lost the relay connection ({reason}); exiting");
+            }
+        };
+        let Some(data) = data else { break };
         tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
-            tracing::error!("Failed to send packet: {}", e);
-        } else {
-            tracing::debug!("Packet sent successfully to WebTransport client");
+            tracing::debug!("Packet not sent: {e}");
         }
     }
+    client.close().await;
     Ok(())
 }

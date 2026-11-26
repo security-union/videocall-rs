@@ -126,7 +126,7 @@ videocall-cli auth login --remote --name "Garage Pi"
 ```
 It prints a URL. Open it on any device where you can sign in (your laptop, your phone), check the fingerprint, approve, and paste the code the page shows back into the terminal. The code works once, for a few minutes, and only for this login, so don't paste it anywhere else.
 
-Every machine has its own key, so logging in on the Pi doesn't touch your laptop. `videocall-cli auth logout` revokes this machine on the server and deletes its key, even if the server can't be reached. Running `auth login` again replaces the key, and revokes the old one once the new login has worked. To see or revoke all your machines, open [api.videocall.rs/devices](https://api.videocall.rs/devices); a revoked machine stops working on its next request.
+Every machine has its own key, so logging in on the Pi doesn't touch your laptop. `videocall-cli auth logout` revokes this machine on the server and deletes its key, even if the server can't be reached. Running `auth login` again replaces the key, and revokes the old one once the new login has worked. To see or revoke all your machines, open [api.videocall.rs/devices](https://api.videocall.rs/devices); a revoked machine stops working on its next request. Revoking stops new joins within five minutes but doesn't cut a relay session that's already connected.
 
 A Pi has no clock battery, so right after boot its time can be off until NTP catches up. The CLI notices from the server's time, signs with that instead, and tells you to fix NTP.
 

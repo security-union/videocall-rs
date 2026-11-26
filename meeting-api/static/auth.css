@@ -12,8 +12,10 @@
  * use are copied. meeting-api/tests/theme_tokens_tests.rs fails if any of
  * them differs from the theme in light, dark or Increase Contrast.
  *
- * Mobile first: the base rules are the phone layout, and one min-width
- * query (the theme's 640px "regular" breakpoint) widens it.
+ * Mobile first: the base rules are the phone layout, and the theme's
+ * 640px "regular" breakpoint widens it. The device list has one more
+ * breakpoint of its own (see "Device list" below): it stays a stack of
+ * cards until its six columns fit side by side without wrapping.
  */
 
 :root {
@@ -215,6 +217,7 @@ input:focus-visible {
   border-radius: var(--radius-md);
   font: var(--text-headline);
   text-decoration: none;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -231,6 +234,50 @@ input:focus-visible {
 .button-danger {
   background: var(--color-danger-tint);
   color: var(--color-danger);
+}
+
+/* A secondary action that should not compete with the content (the
+   theme's plain button: no fill, accent label, narrower padding). */
+.button-plain {
+  background: transparent;
+  color: var(--color-link);
+  padding-left: var(--space-3);
+  padding-right: var(--space-3);
+}
+
+/* Values that must never break in the middle: fingerprints, dates,
+   addresses. */
+.fingerprint,
+.value {
+  white-space: nowrap;
+}
+
+.date {
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Signed in as …" with the plain Sign out button beside it, the same on
+   the consent page and on /devices. The button wraps under the text when
+   the line is too narrow for both. */
+.identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  column-gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.identity .signed-in,
+.sign-out {
+  margin: 0;
+}
+
+/* Pull the plain button's padding out so its label lines up with the card
+   edge, beside the text or, when wrapped, under it. */
+.identity .button-plain {
+  margin-left: calc(-1 * var(--space-3));
+  margin-right: calc(-1 * var(--space-3));
 }
 
 .notice {
@@ -258,7 +305,11 @@ input:focus-visible {
   background: var(--color-fill-tertiary);
   color: var(--color-label);
   font: 600 1.0625rem/1.4 var(--font-mono);
+  /* A textarea, so the whole 43-character code is visible on a phone: it
+     wraps anywhere (it has no separators) and copying it adds no breaks. */
   overflow-wrap: anywhere;
+  word-break: break-all;
+  resize: none;
 }
 
 .facts {
@@ -273,6 +324,10 @@ input:focus-visible {
 .facts dd {
   margin: 0 0 var(--space-3);
   overflow-wrap: anywhere;
+}
+
+.facts .hint {
+  display: block;
 }
 
 .check {
@@ -326,7 +381,16 @@ input:focus-visible {
   border: 0;
 }
 
-/* Device list: stacked cards on phones, a table from 640px. */
+/* Device list. A real table in the markup. Until the wide breakpoint each
+   row is restacked as a card: the name and Revoke on the first line, then
+   one label/value line per column. */
+.table-wrap {
+  /* Safety net only: a value that cannot fit (a very long IPv6 address on
+     a narrow phone) scrolls inside the card, never the page. */
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .devices {
   width: 100%;
   border-collapse: collapse;
@@ -341,17 +405,31 @@ input:focus-visible {
 }
 
 .devices tr {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-3);
   padding: var(--space-3) 0;
   border-bottom: 1px solid var(--color-separator);
 }
 
-.devices td {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-1) 0;
+.devices th.device-name {
+  grid-row: 1;
+  grid-column: 1;
+  padding: 0 0 var(--space-2);
+  font: var(--text-headline);
+  text-align: left;
   overflow-wrap: anywhere;
+}
+
+.devices td {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  column-gap: var(--space-3);
+  padding: var(--space-1) 0;
 }
 
 .devices td::before {
@@ -360,9 +438,24 @@ input:focus-visible {
   font: var(--text-footnote);
 }
 
+/* An IPv6 address may break only between its groups (each group is an
+   inline-block span), and only when it is wider than the space left. */
+.devices td.address {
+  white-space: normal;
+}
+
+.address-groups {
+  text-align: right;
+}
+
+.address-group {
+  display: inline-block;
+}
+
 .devices td.row-action {
-  justify-content: flex-end;
-  padding-top: var(--space-2);
+  grid-row: 1;
+  grid-column: 2;
+  padding: 0 0 var(--space-2);
 }
 
 .devices td.row-action::before {
@@ -398,6 +491,16 @@ input:focus-visible {
   .actions .button {
     width: auto;
   }
+}
+
+/* Wide enough for all six device columns on one line each (measured with
+   the longest values: a 19-character fingerprint, three dates, an IPv4
+   address and the Revoke button). Media queries cannot read custom
+   properties, so the width is written out here. */
+@media (min-width: 1080px) {
+  .page:has(.card-wide) {
+    max-width: 72rem;
+  }
 
   .devices thead {
     position: static;
@@ -418,6 +521,7 @@ input:focus-visible {
     padding: var(--space-3) var(--space-2);
     text-align: left;
     vertical-align: middle;
+    white-space: nowrap;
     border-bottom: 1px solid var(--color-separator);
   }
 
@@ -426,11 +530,42 @@ input:focus-visible {
     color: var(--color-label-secondary);
   }
 
+  .devices thead th:first-child {
+    padding-left: 0;
+  }
+
+  .devices td {
+    font: var(--text-subheadline);
+  }
+
+  .devices td.mono {
+    font-family: var(--font-mono);
+  }
+
+  .devices td.address,
+  .address-groups {
+    white-space: normal;
+    text-align: left;
+  }
+
+  /* The name is the cell that wraps (at hyphens first); everything else
+     keeps its value on one line, except a long IPv6 address, which may
+     break between groups when the row is short of space. */
+  .devices th.device-name {
+    min-width: 10rem;
+    padding: var(--space-3) var(--space-2) var(--space-3) 0;
+    font: var(--text-headline);
+    color: var(--color-label);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
   .devices td::before {
     content: none;
   }
 
   .devices td.row-action {
+    padding: var(--space-2) 0 var(--space-2) var(--space-2);
     text-align: right;
   }
 }

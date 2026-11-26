@@ -966,7 +966,7 @@ GET /devices
 POST /devices/{device_id}/revoke
 ```
 
-Browser session (cookie) only. Lists the user's live devices (name, fingerprint, last use, the IP it was approved from); the revoke form POSTs and redirects (303) back to `/devices`. A revoked device fails on its next request.
+Browser session (cookie) only. Lists the user's live devices (name, fingerprint, last use, the IP it was approved from); the revoke form POSTs and redirects (303) back to `/devices`. A revoked device fails on its next request. Revoking stops new joins within five minutes (the longest a CLI room token lives) but does not cut a relay session that is already connected.
 
 ---
 

@@ -67,13 +67,6 @@ pub fn html_escape(value: &str) -> String {
     out
 }
 
-/// An IP for display: only if it parses as an address, otherwise "unknown".
-pub fn display_ip(ip: Option<&str>) -> String {
-    ip.and_then(|ip| ip.parse::<IpAddr>().ok())
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 /// Referrer policy for every page, sent as the header and as a `<meta>`.
 ///
 /// `same-origin`, not `no-referrer`: under `no-referrer` the Fetch spec
@@ -195,8 +188,7 @@ pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
     let body = format!(
         "<section class=\"card\">\n\
          <h1>Sign in videocall-cli?</h1>\n\
-         <p class=\"signed-in\">Signed in as <strong>{viewer_name}</strong> ({viewer_user_id}).</p>\n\
-         {sign_out}\
+         {identity}\
          <dl class=\"facts\">\n\
          <dt>Device name</dt><dd>{name}</dd>\n\
          <dt>Key fingerprint</dt><dd><span class=\"mono fingerprint\">{fingerprint}</span> \
@@ -215,9 +207,15 @@ pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
          </div>\n\
          </form>\n\
          </section>",
-        viewer_name = html_escape(view.viewer_name),
-        viewer_user_id = html_escape(view.viewer_user_id),
-        sign_out = sign_out_form(Some(&request.id), "Not you? Sign out"),
+        identity = identity_bar(
+            &format!(
+                "<strong>{}</strong> ({}).",
+                html_escape(view.viewer_name),
+                html_escape(view.viewer_user_id)
+            ),
+            Some(&request.id),
+            "Not you? Sign out"
+        ),
         name = html_escape(&request.device_name),
         fingerprint = html_escape(view.fingerprint),
         kind_text = html_escape(kind_text),
@@ -227,6 +225,19 @@ pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
         warning = html_escape(WARNING_COPY),
     );
     html(StatusCode::OK, "Sign in videocall-cli?", &body)
+}
+
+/// "Signed in as …" with the sign-out form beside it: the same place and the
+/// same plain style on the consent page and on /devices. `who` is HTML
+/// that the caller has already escaped.
+fn identity_bar(who: &str, request_id: Option<&str>, sign_out_label: &str) -> String {
+    format!(
+        "<div class=\"identity\">\n\
+         <p class=\"signed-in\">Signed in as {who}</p>\n\
+         {form}\
+         </div>\n",
+        form = sign_out_form(request_id, sign_out_label),
+    )
 }
 
 /// A POST form to `/cli/sign-out`. With `request_id` the "sign in again"
@@ -242,7 +253,7 @@ fn sign_out_form(request_id: Option<&str>, label: &str) -> String {
         .unwrap_or_default();
     format!(
         "<form method=\"post\" action=\"/cli/sign-out\" class=\"sign-out\">\n\
-         {hidden}<button type=\"submit\" class=\"button button-secondary\">{label}</button>\n\
+         {hidden}<button type=\"submit\" class=\"button button-plain\">{label}</button>\n\
          </form>\n",
         label = html_escape(label),
     )
@@ -269,8 +280,8 @@ pub fn code_page(code: &str, expires_in_secs: i64) -> Response {
         "<section class=\"card\">\n\
          <h1>Your sign-in code</h1>\n\
          <label for=\"code\">Code</label>\n\
-         <input id=\"code\" class=\"code-field\" type=\"text\" readonly value=\"{code}\" \
-         autocomplete=\"off\" spellcheck=\"false\" aria-describedby=\"code-hint\">\n\
+         <textarea id=\"code\" class=\"code-field\" readonly rows=\"2\" \
+         autocomplete=\"off\" spellcheck=\"false\" aria-describedby=\"code-hint\">{code}</textarea>\n\
          <p class=\"hint\" id=\"code-hint\">Paste this into the terminal where you ran \
          videocall-cli auth login --remote. Never share it with anyone or paste it anywhere else. \
          It works once and expires in {minutes} minutes.</p>\n\
@@ -416,20 +427,73 @@ fn day(value: DateTime<Utc>) -> String {
     value.format("%Y-%m-%d").to_string()
 }
 
+/// The address a device was approved from, if it tells the user anything.
+/// Addresses that belong to infrastructure (loopback, private, CGNAT,
+/// link-local, ULA; the same classification as the per-client cap) are
+/// the ingress or a proxy, not the user's network, so they are not shown.
+fn approved_from(ip: Option<&str>) -> Option<IpAddr> {
+    let ip = ip?.parse::<IpAddr>().ok()?;
+    crate::routes::device_pages::cap_key(Some(ip)).map(|_| ip)
+}
+
+/// An address as markup that may break only between IPv6 groups: each
+/// `xxxx:` group is its own inline-block span (Chrome breaks at `<wbr>`
+/// even under `white-space: nowrap`, so that cannot be used). An IPv4
+/// address is one piece.
+fn address_groups(address: &str) -> String {
+    if !address.contains(':') {
+        return html_escape(address);
+    }
+    let groups: String = address
+        .split_inclusive(':')
+        .map(|group| {
+            format!(
+                "<span class=\"address-group\">{}</span>",
+                html_escape(group)
+            )
+        })
+        .collect();
+    // One wrapper, so the stacked layout's flex row sees a single value.
+    format!("<span class=\"address-groups\">{groups}</span>")
+}
+
 /// The signed-in user's live devices, each with a Revoke form.
+///
+/// A real table (row header = device name, column headers for each value),
+/// so it reads correctly with CSS off and to a screen reader. Below the wide
+/// breakpoint the CSS restacks each row as a card; the explicit ARIA roles
+/// keep the table semantics in browsers that drop them when a table's
+/// `display` changes.
 pub fn devices_page(viewer_name: &str, devices: &[DeviceRow]) -> Response {
+    let addresses: Vec<Option<IpAddr>> = devices
+        .iter()
+        .map(|d| approved_from(d.requester_ip.as_deref()))
+        .collect();
+    let show_addresses = addresses.iter().any(Option::is_some);
     let rows: String = devices
         .iter()
-        .map(|d| {
+        .zip(&addresses)
+        .map(|(d, address)| {
+            let address_cell = match (show_addresses, address) {
+                (false, _) => String::new(),
+                (true, Some(ip)) => format!(
+                    "<td role=\"cell\" data-label=\"Approved from\" class=\"value mono address\">{}</td>\n",
+                    address_groups(&ip.to_string())
+                ),
+                (true, None) => "<td role=\"cell\" data-label=\"Approved from\" class=\"value\">\
+                     <span aria-hidden=\"true\">-</span>\
+                     <span class=\"visually-hidden\">Not shown</span></td>\n"
+                    .to_string(),
+            };
             format!(
-                "<tr>\n\
-                 <td data-label=\"Name\">{name}</td>\n\
-                 <td data-label=\"Fingerprint\" class=\"mono\">{fingerprint}</td>\n\
-                 <td data-label=\"Approved\">{approved}</td>\n\
-                 <td data-label=\"Last used\">{used}</td>\n\
-                 <td data-label=\"Expires\">{expires}</td>\n\
-                 <td data-label=\"Approved from\">{ip}</td>\n\
-                 <td class=\"row-action\"><form method=\"post\" action=\"/devices/{id}/revoke\">\
+                "<tr role=\"row\">\n\
+                 <th role=\"rowheader\" scope=\"row\" class=\"device-name\">{name}</th>\n\
+                 <td role=\"cell\" data-label=\"Fingerprint\" class=\"value mono\">{fingerprint}</td>\n\
+                 <td role=\"cell\" data-label=\"Approved\" class=\"value date\">{approved}</td>\n\
+                 <td role=\"cell\" data-label=\"Last used\" class=\"value date\">{used}</td>\n\
+                 <td role=\"cell\" data-label=\"Expires\" class=\"value date\">{expires}</td>\n\
+                 {address_cell}\
+                 <td role=\"cell\" class=\"row-action\"><form method=\"post\" action=\"/devices/{id}/revoke\">\
                  <button type=\"submit\" class=\"button button-danger\" \
                  aria-label=\"Revoke {name}\">Revoke</button></form></td>\n\
                  </tr>",
@@ -438,34 +502,45 @@ pub fn devices_page(viewer_name: &str, devices: &[DeviceRow]) -> Response {
                 approved = day(d.decided_at),
                 used = day(d.last_used_at),
                 expires = day(d.idle_expires_at.min(d.abs_expires_at)),
-                ip = html_escape(&display_ip(d.requester_ip.as_deref())),
                 id = html_escape(&d.id),
             )
         })
         .collect();
+    let address_header = if show_addresses {
+        "<th role=\"columnheader\" scope=\"col\">Approved from</th>"
+    } else {
+        ""
+    };
     let content = if devices.is_empty() {
         "<p class=\"empty\">No devices are signed in.</p>".to_string()
     } else {
         format!(
-            "<div class=\"table-wrap\">\n<table class=\"devices\">\n\
+            "<div class=\"table-wrap\">\n<table class=\"devices\" role=\"table\">\n\
              <caption class=\"visually-hidden\">Signed-in devices</caption>\n\
-             <thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Fingerprint</th>\
-             <th scope=\"col\">Approved</th><th scope=\"col\">Last used</th>\
-             <th scope=\"col\">Expires</th><th scope=\"col\">Approved from</th>\
-             <th scope=\"col\"><span class=\"visually-hidden\">Actions</span></th></tr></thead>\n\
-             <tbody>\n{rows}\n</tbody>\n</table>\n</div>"
+             <thead role=\"rowgroup\"><tr role=\"row\">\
+             <th role=\"columnheader\" scope=\"col\">Name</th>\
+             <th role=\"columnheader\" scope=\"col\">Fingerprint</th>\
+             <th role=\"columnheader\" scope=\"col\">Approved</th>\
+             <th role=\"columnheader\" scope=\"col\">Last used</th>\
+             <th role=\"columnheader\" scope=\"col\">Expires</th>{address_header}\
+             <th role=\"columnheader\" scope=\"col\"><span class=\"visually-hidden\">Actions</span></th>\
+             </tr></thead>\n\
+             <tbody role=\"rowgroup\">\n{rows}\n</tbody>\n</table>\n</div>"
         )
     };
     let body = format!(
         "<section class=\"card card-wide\">\n\
          <h1>Your devices</h1>\n\
-         <p class=\"lead\">Signed in as <strong>{viewer}</strong>. These devices can join meetings as you. \
+         {identity}\
+         <p class=\"lead\">These devices can join meetings as you. \
          Revoke any you do not recognise.</p>\n\
          {content}\n\
-         {sign_out}\
          </section>",
-        viewer = html_escape(viewer_name),
-        sign_out = sign_out_form(None, "Sign out"),
+        identity = identity_bar(
+            &format!("<strong>{}</strong>.", html_escape(viewer_name)),
+            None,
+            "Sign out"
+        ),
     );
     html(StatusCode::OK, "Your devices", &body)
 }
@@ -484,10 +559,24 @@ mod tests {
     }
 
     #[test]
-    fn ip_display_only_parses_addresses() {
-        assert_eq!(display_ip(Some("203.0.113.7")), "203.0.113.7");
-        assert_eq!(display_ip(Some("::1")), "::1");
-        assert_eq!(display_ip(Some("<b>evil</b>")), "unknown");
-        assert_eq!(display_ip(None), "unknown");
+    fn approved_from_shows_only_public_parsed_addresses() {
+        let shown = |ip: Option<&str>| approved_from(ip).map(|ip| ip.to_string());
+        assert_eq!(shown(Some("203.0.113.7")).as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            shown(Some("2001:db8:1:2::9")).as_deref(),
+            Some("2001:db8:1:2::9")
+        );
+        for hidden in [
+            Some("10.244.0.85"),
+            Some("127.0.0.1"),
+            Some("100.64.0.1"),
+            Some("169.254.1.1"),
+            Some("fd00::1"),
+            Some("::1"),
+            Some("<b>evil</b>"),
+            None,
+        ] {
+            assert_eq!(shown(hidden), None, "{hidden:?}");
+        }
     }
 }

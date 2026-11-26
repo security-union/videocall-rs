@@ -259,6 +259,14 @@ async fn authorize(state: &AppState, cli: &Cli) -> String {
     id.to_string()
 }
 
+/// The one-time code from the remote Code page (a readonly textarea).
+fn code_from_page(html: &str) -> String {
+    let marker = "aria-describedby=\"code-hint\">";
+    let start = html.find(marker).expect("code field") + marker.len();
+    let end = html[start..].find("</textarea>").expect("textarea end") + start;
+    html[start..end].to_string()
+}
+
 fn extract_after<'a>(html: &'a str, marker: &str) -> &'a str {
     let start = html
         .find(marker)
@@ -335,7 +343,7 @@ async fn approve_remote(state: &AppState, cli: &Cli, user: &str) -> String {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(header(&resp, "location").is_none());
     let html = body_text(resp).await;
-    extract_after(&html, "readonly value=\"").to_string()
+    code_from_page(&html)
 }
 
 async fn exchange_json(state: &AppState, body: &Value) -> Response {
@@ -1097,7 +1105,7 @@ async fn remote_approval_needs_the_checkbox_and_shows_a_no_store_code() {
         Some("same-origin")
     );
     let html = body_text(resp).await;
-    let code = extract_after(&html, "readonly value=\"").to_string();
+    let code = code_from_page(&html);
     assert!(code.len() >= 43);
 
     // GET /cli/code never shows a code.
@@ -1473,7 +1481,7 @@ async fn codes_nonces_and_tokens_never_reach_the_log() {
             pair(&pairs, "code").unwrap().to_string()
         } else {
             let html = body_text(resp).await;
-            extract_after(&html, "readonly value=\"").to_string()
+            code_from_page(&html)
         };
         let body = cli.exchange_body(&code);
         // A failing exchange with the real code logs too.
@@ -1505,6 +1513,79 @@ async fn register(st: &AppState, user: &str) -> (Cli, RegisterDeviceResponse) {
     let resp = exchange_json(st, &cli.exchange_body(&code)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     (cli, response_json(resp).await)
+}
+
+/// "Approved from" shows only an address that means something to the
+/// user: a cluster or proxy address is hidden, and the column disappears
+/// when no device has a showable one. The list is a real table with a row
+/// header per device, and Sign out sits beside "Signed in as".
+#[tokio::test]
+#[serial]
+async fn devices_page_hides_infrastructure_addresses_and_keeps_table_semantics() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let st = state(&pool);
+    let user = unique_user();
+    delete_user_devices(&pool, &user).await;
+    let (_cli, first) = register(&st, &user).await;
+    let (_cli, second) = register(&st, &user).await;
+    let set_ip = |device: String, ip: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE devices SET requester_ip = $1 WHERE id = $2")
+                .bind(ip)
+                .bind(device)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    let page = || async { body_text(send(&st, cookie_get("/devices", &user)).await).await };
+
+    // One public, one cluster-internal: the column is there, the internal
+    // address is not.
+    set_ip(first.device_id.clone(), "203.0.113.7").await;
+    set_ip(second.device_id.clone(), "10.244.0.85").await;
+    let html = page().await;
+    assert!(html.contains(">Approved from</th>"));
+    assert!(html.contains(">203.0.113.7</td>"));
+    assert!(!html.contains("10.244.0.85"));
+    assert!(html.contains("<span class=\"visually-hidden\">Not shown</span>"));
+    assert_eq!(
+        html.matches("<th role=\"rowheader\" scope=\"row\"").count(),
+        2
+    );
+    assert!(html.contains("<table class=\"devices\" role=\"table\">"));
+    let identity = extract_between(&html, "<div class=\"identity\">", "</div>");
+    assert!(identity.contains("Signed in as"));
+    assert!(identity.contains("action=\"/cli/sign-out\""));
+    assert!(identity.contains("class=\"button button-plain\""));
+
+    // No showable address at all: no column, no row.
+    set_ip(first.device_id.clone(), "100.64.1.2").await;
+    let html = page().await;
+    assert!(!html.contains("Approved from"));
+    assert!(!html.contains("100.64.1.2"));
+
+    // An IPv6 address is split into groups the layout may break between.
+    set_ip(first.device_id.clone(), "2001:db8::7").await;
+    let html = page().await;
+    assert!(html.contains(
+        "<span class=\"address-groups\"><span class=\"address-group\">2001:</span>\
+         <span class=\"address-group\">db8:</span><span class=\"address-group\">:</span>\
+         <span class=\"address-group\">7</span></span>"
+    ));
+    delete_user_devices(&pool, &user).await;
+    reset(&pool).await;
+}
+
+fn extract_between<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
+    let from = html
+        .find(start)
+        .unwrap_or_else(|| panic!("{start} in page"))
+        + start.len();
+    let to = html[from..].find(end).expect("end marker") + from;
+    &html[from..to]
 }
 
 #[tokio::test]

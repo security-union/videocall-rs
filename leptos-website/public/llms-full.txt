@@ -106,6 +106,12 @@ videocall-cli stream --meeting-id <meeting-id> --video-device-index 0
 Then open `https://app.videocall.rs/meeting/<meeting-id>` in any browser. Same
 meeting id, so the Pi's camera and your browser land in the same call.
 
+Device management is built in. Each machine running `videocall-cli` gets its own
+key, approved once in the browser with your normal account, and the server stores
+only the public key. You can see every approved device and revoke any of them at
+`https://api.videocall.rs/devices`; a revoked device stops being able to join within
+minutes.
+
 ### 02 — RUN: the whole system on your machine
 
 For evaluating the full stack end to end — media servers, meeting API, and UI —

@@ -19,6 +19,7 @@ Key facts:
 ## Try it (three ways)
 
 - Stream a camera in three commands: `cargo install videocall-cli`, `videocall-cli auth login` (once), then `videocall-cli stream --meeting-id <id> --video-device-index 0`. Create the meeting in a browser first, then open `https://app.videocall.rs/meeting/<id>` in a browser.
+- Device management is built in: each machine running `videocall-cli` gets its own key, approved once in the browser with your normal account, and the server stores only the public key. See and revoke every approved device at `https://api.videocall.rs/devices`; a revoked device stops being able to join within minutes.
 - Run the whole stack natively: `git clone https://github.com/security-union/videocall-rs.git && cd videocall-rs && make dev`, then open `http://localhost:3001/meeting/demo`.
 - Embed the client: `cargo add videocall-client` and build on the same transport and media pipeline in your own Rust/WASM app.
 

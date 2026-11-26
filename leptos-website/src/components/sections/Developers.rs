@@ -255,7 +255,7 @@ fn TryRow() -> impl IntoView {
                     <span class="section-index text-fg" aria-hidden="true">"TRY"</span>
                 </div>
                 <h3 class="text-h3 text-fg mt-3">"Stream a camera in three commands"</h3>
-                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No build. Log in once, then it's a camera and a meeting id. Over SSH, open the printed URL on your laptop and paste back the code it shows."</p>
+                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No build. Log in once, then it's a camera and a meeting id. Over SSH, open the printed URL on your laptop and paste back the code it shows. Device management is built in: each machine gets its own key, and you can see and revoke every one at api.videocall.rs/devices."</p>
             </div>
             <div class="md:col-span-8 lg:col-span-9">
                 <div class="relative">

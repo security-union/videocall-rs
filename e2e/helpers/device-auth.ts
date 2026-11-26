@@ -9,6 +9,8 @@
  * - registration JWS / device JWT: EdDSA, `iss: videocall-cli`, `aud: <API origin>`
  */
 import { createHash, generateKeyPairSync, randomBytes, sign, KeyObject } from "crypto";
+import { createServer, type IncomingHttpHeaders } from "http";
+import type { AddressInfo } from "net";
 
 /** meeting-api's public origin. Must equal the stack's DEVICE_TOKEN_AUDIENCE. */
 export const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
@@ -129,4 +131,43 @@ export function deviceJwt(key: DeviceKey, deviceId: string): string {
       jti: randomBytes(16).toString("base64url"),
     },
   );
+}
+
+export interface CallbackHit {
+  /** Path and query, e.g. `/callback?code=…&state=…`. */
+  url: string;
+  headers: IncomingHttpHeaders;
+}
+
+export interface LoopbackListener {
+  /** `http://127.0.0.1:{port}/callback`, the loopback redirect_uri. */
+  redirectUri: string;
+  /** Resolves with the first request the listener receives. */
+  firstHit: Promise<CallbackHit>;
+  close(): Promise<void>;
+}
+
+/**
+ * The CLI's loopback listener: an HTTP server on 127.0.0.1 and a free port
+ * that records the first request and answers with a small page.
+ */
+export async function startLoopbackListener(): Promise<LoopbackListener> {
+  let resolveHit!: (hit: CallbackHit) => void;
+  const firstHit = new Promise<CallbackHit>((resolve) => (resolveHit = resolve));
+  const server = createServer((req, res) => {
+    resolveHit({ url: req.url ?? "", headers: req.headers });
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><title>CLI listener</title><h1>CLI listener reached</h1>");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    redirectUri: `http://127.0.0.1:${port}/callback`,
+    firstHit,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
 }

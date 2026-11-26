@@ -9,6 +9,7 @@
  * defaults both to http://localhost:8081), or every page answers 503 and the
  * consent POST fails its Origin check.
  */
+import { randomBytes } from "crypto";
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import {
@@ -19,35 +20,45 @@ import {
   generateDeviceKey,
   generatePkce,
   registrationJws,
+  startLoopbackListener,
   uniqueDeviceName,
   uniqueEmail,
   type DeviceKey,
   type Pkce,
 } from "../helpers/device-auth";
 
-interface RemoteLogin {
+interface CliLogin {
   key: DeviceKey;
   pkce: Pkce;
   deviceName: string;
+  state: string;
+  redirectUri: string;
+  /** The consent request id from the consent page URL. */
+  requestId: string;
 }
 
-/** Open a remote-login authorize link and land on the consent page. */
-async function openConsent(page: Page): Promise<RemoteLogin> {
-  const login: RemoteLogin = {
-    key: generateDeviceKey(),
-    pkce: generatePkce(),
-    deviceName: uniqueDeviceName(),
-  };
+/**
+ * Open an authorize link and land on the consent page. Remote login unless
+ * a loopback `redirectUri` is given.
+ */
+async function openConsent(page: Page, redirectUri = REMOTE_REDIRECT_URI): Promise<CliLogin> {
+  const key = generateDeviceKey();
+  const pkce = generatePkce();
+  const deviceName = uniqueDeviceName();
+  const state = randomBytes(16).toString("base64url");
   await page.goto(
     authorizeUrl({
-      publicKey: login.key.publicKey,
-      deviceName: login.deviceName,
-      codeChallenge: login.pkce.challenge,
+      publicKey: key.publicKey,
+      deviceName,
+      codeChallenge: pkce.challenge,
+      state,
+      redirectUri,
     }),
   );
   await expect(page).toHaveURL(/\/cli\/consent\?request=[A-Za-z0-9_-]{22}$/);
   await expect(page.getByRole("heading", { name: "Sign in videocall-cli?" })).toBeVisible();
-  return login;
+  const requestId = new URL(page.url()).searchParams.get("request")!;
+  return { key, pkce, deviceName, state, redirectUri, requestId };
 }
 
 /** Tick the remote checkbox, approve, and return the one-time code shown. */
@@ -63,14 +74,14 @@ async function approveAndReadCode(page: Page): Promise<string> {
 /** Exchange the code at POST /api/v1/devices, as the CLI does. */
 async function registerDevice(
   request: APIRequestContext,
-  login: RemoteLogin,
+  login: CliLogin,
   code: string,
 ): Promise<string> {
   const response = await request.post(`${API_URL}/api/v1/devices`, {
     data: {
       code,
       code_verifier: login.pkce.verifier,
-      redirect_uri: REMOTE_REDIRECT_URI,
+      redirect_uri: login.redirectUri,
       registration: registrationJws(login.key, login.deviceName),
     },
   });
@@ -85,6 +96,32 @@ function devicesMe(request: APIRequestContext, key: DeviceKey, deviceId: string)
   return request.get(`${API_URL}/api/v1/devices/me`, {
     headers: { Authorization: `Bearer ${deviceJwt(key, deviceId)}` },
   });
+}
+
+const SESSION_COOKIE = process.env.COOKIE_NAME || "session";
+
+/** Console messages about Content Security Policy, for failure reports. */
+function collectCspMessages(page: Page): string[] {
+  const messages: string[] = [];
+  page.on("console", (message) => {
+    if (/content security policy|form-action/i.test(message.text())) {
+      messages.push(message.text());
+    }
+  });
+  return messages;
+}
+
+/** The browser shows the loopback listener's page, or the test reports why not. */
+async function expectListenerReached(page: Page, cspMessages: string[]): Promise<void> {
+  try {
+    await expect(page.getByRole("heading", { name: "CLI listener reached" })).toBeVisible();
+  } catch (error) {
+    throw new Error(
+      `Browser did not reach the loopback listener (now at ${page.url()}). ` +
+        `CSP console messages: ${JSON.stringify(cspMessages)}`,
+      { cause: error },
+    );
+  }
 }
 
 function deviceRow(page: Page, deviceName: string) {
@@ -209,6 +246,100 @@ test.describe("CLI device login pages", () => {
         expect(box!.x).toBeGreaterThanOrEqual(0);
         expect(box!.x + box!.width).toBeLessThanOrEqual(375);
       }
+    });
+
+    test("loopback login: approve sends the browser to the CLI listener with code and state", async ({
+      page,
+      request,
+    }) => {
+      const listener = await startLoopbackListener();
+      try {
+        const cspMessages = collectCspMessages(page);
+        const consentResponse = page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/cli/consent" &&
+            response.request().method() === "GET",
+        );
+        const login = await openConsent(page, listener.redirectUri);
+        // Chromium enforces form-action on the redirect that follows a form
+        // POST, so the page must allow exactly this callback and nothing wider.
+        expect((await consentResponse).headers()["content-security-policy"]).toContain(
+          `form-action 'self' ${listener.redirectUri};`,
+        );
+        // Loopback logins have no "I started this myself" checkbox.
+        await expect(page.getByRole("checkbox")).toHaveCount(0);
+
+        await page.getByRole("button", { name: "Approve" }).click();
+        // The 303 after the form POST must pass the per-response CSP
+        // `form-action 'self' http://127.0.0.1:{port}/callback`.
+        await expectListenerReached(page, cspMessages);
+
+        const hit = await listener.firstHit;
+        const callback = new URL(hit.url, listener.redirectUri);
+        expect(callback.pathname).toBe("/callback");
+        expect(callback.searchParams.get("state")).toBe(login.state);
+        expect(callback.searchParams.get("error")).toBeNull();
+        const code = callback.searchParams.get("code");
+        expect(code).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        expect(hit.headers.referer).toBeUndefined();
+        expect(hit.headers.origin).toBeUndefined();
+
+        await registerDevice(request, login, code!);
+        await page.goto(`${API_URL}/devices`);
+        await expect(deviceRow(page, login.deviceName)).toHaveCount(1);
+      } finally {
+        await listener.close();
+      }
+    });
+
+    test("loopback login: deny sends the browser to the CLI listener with access_denied", async ({
+      page,
+    }) => {
+      const listener = await startLoopbackListener();
+      try {
+        const cspMessages = collectCspMessages(page);
+        const login = await openConsent(page, listener.redirectUri);
+        await page.getByRole("button", { name: "Deny" }).click();
+        await expectListenerReached(page, cspMessages);
+
+        const hit = await listener.firstHit;
+        const callback = new URL(hit.url, listener.redirectUri);
+        expect(callback.pathname).toBe("/callback");
+        expect(callback.searchParams.get("error")).toBe("access_denied");
+        expect(callback.searchParams.get("state")).toBe(login.state);
+        expect(callback.searchParams.get("code")).toBeNull();
+
+        await page.goto(`${API_URL}/devices`);
+        await expect(deviceRow(page, login.deviceName)).toHaveCount(0);
+      } finally {
+        await listener.close();
+      }
+    });
+
+    test("sign out from the consent page clears the session and links back to the request", async ({
+      page,
+      context,
+    }) => {
+      const login = await openConsent(page);
+      const consentUrl = `${API_URL}/cli/consent?request=${login.requestId}`;
+
+      await page.getByRole("button", { name: "Not you? Sign out" }).click();
+      await expect(page.getByRole("heading", { name: "Signed out" })).toBeVisible();
+
+      const cookies = await context.cookies(API_URL);
+      expect(cookies.map((cookie) => cookie.name)).not.toContain(SESSION_COOKIE);
+
+      const href = await page.getByRole("link", { name: "Sign in again" }).getAttribute("href");
+      const signIn = new URL(href!, API_URL);
+      expect(signIn.origin).toBe(API_URL);
+      expect(signIn.pathname).toBe("/login");
+      expect(signIn.searchParams.get("returnTo")).toBe(consentUrl);
+
+      // The same browser can no longer see the decision form. page.request
+      // shares this context's cookie jar; redirects are not followed so a
+      // configured OAuth provider is never contacted.
+      const consent = await page.request.get(consentUrl, { maxRedirects: 0 });
+      expect(await consent.text()).not.toContain('action="/cli/consent"');
     });
   });
 

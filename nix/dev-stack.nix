@@ -427,7 +427,7 @@ let
       export SERVER_ID="''${SERVER_ID:-server-1}"
       : "''${PC_PORT_NUM:=28082}"
       export PC_PORT_NUM
-      exec process-compose up -f ${e2eConfigFile} "$@"
+      exec process-compose up --disable-dotenv -f ${e2eConfigFile} "$@"
     '';
   };
 in

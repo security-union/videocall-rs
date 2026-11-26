@@ -19,7 +19,8 @@
 //! The device's Ed25519 key, the clock it signs with, and the two tokens:
 //! the registration JWS (proof of possession, no `kid`) and a fresh device
 //! JWT per request (`kid` = `sub` = device id, `aud` = the API origin,
-//! 120 s lifetime, random `jti`).
+//! 120 s lifetime, random `jti`). The token format is shared with
+//! meeting-api's verifier in `videocall_meeting_types::device::crypto`.
 //!
 //! The seed comes from the OS CSPRNG, lives only in the store and in
 //! zeroize-on-drop types, and never goes on argv, in the environment or in
@@ -33,16 +34,11 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
-use videocall_meeting_types::device::{
-    fingerprint, DeviceTokenClaims, RegistrationClaims, CLI_ISSUER, DEVICE_TOKEN_TTL_SECS,
-};
+use videocall_meeting_types::device::crypto::{self, EncodingKey};
+use videocall_meeting_types::device::{base64url_decode, base64url_encode, fingerprint};
 
 use super::random_b64url;
 
@@ -80,33 +76,26 @@ impl DeviceKey {
 
     /// Load from the stored base64url seed.
     pub fn from_seed_b64(seed: &SecretString) -> Result<Self, KeyError> {
-        let bytes = Zeroizing::new(
-            URL_SAFE_NO_PAD
-                .decode(seed.expose_secret())
-                .map_err(|_| KeyError::Corrupt)?,
-        );
+        let bytes =
+            Zeroizing::new(base64url_decode(seed.expose_secret()).ok_or(KeyError::Corrupt)?);
         let seed: &[u8; 32] = bytes.as_slice().try_into().map_err(|_| KeyError::Corrupt)?;
         Self::from_signing(SigningKey::from_bytes(seed))
     }
 
     fn from_signing(signing: SigningKey) -> Result<Self, KeyError> {
-        // jsonwebtoken takes PKCS#8 DER; `der` is a zeroize-on-drop SecretDocument.
-        let der = signing
-            .to_pkcs8_der()
-            .map_err(|e| KeyError::Sign(e.to_string()))?;
-        let encoding = EncodingKey::from_ed_der(der.as_bytes());
+        let encoding = crypto::encoding_key(&signing).map_err(KeyError::Sign)?;
         Ok(Self { signing, encoding })
     }
 
     /// The seed, base64url, for the store.
     pub fn seed_b64(&self) -> SecretString {
         let seed = Zeroizing::new(self.signing.to_bytes());
-        SecretString::from(URL_SAFE_NO_PAD.encode(seed.as_slice()))
+        SecretString::from(base64url_encode(seed.as_slice()))
     }
 
     /// Public key, base64url (43 characters).
     pub fn public_key_b64(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.signing.verifying_key().to_bytes())
+        base64url_encode(&self.signing.verifying_key().to_bytes())
     }
 
     /// `XXXX-XXXX-XXXX-XXXX` fingerprint of the public key.
@@ -114,49 +103,16 @@ impl DeviceKey {
         fingerprint(&self.signing.verifying_key().to_bytes())
     }
 
-    fn sign(&self, header: &Header, claims: &impl serde::Serialize) -> Result<String, KeyError> {
-        jsonwebtoken::encode(header, claims, &self.encoding)
-            .map_err(|e| KeyError::Sign(e.to_string()))
-    }
-
     /// A device JWT for one request to `aud`.
     pub fn device_token(&self, device_id: &str, aud: &str, now: i64) -> Result<String, KeyError> {
-        self.device_token_with_jti(device_id, aud, now, random_b64url(16)?)
-    }
-
-    /// [`Self::device_token`] with a given `jti`, so tests can compare
-    /// against the shared vectors.
-    fn device_token_with_jti(
-        &self,
-        device_id: &str,
-        aud: &str,
-        now: i64,
-        jti: String,
-    ) -> Result<String, KeyError> {
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(device_id.to_string());
-        let claims = DeviceTokenClaims {
-            iss: CLI_ISSUER.to_string(),
-            sub: device_id.to_string(),
-            aud: aud.to_string(),
-            iat: now,
-            exp: now + DEVICE_TOKEN_TTL_SECS,
-            jti,
-        };
-        self.sign(&header, &claims)
+        crypto::sign_device_token(&self.encoding, device_id, aud, now, random_b64url(16)?)
+            .map_err(|e| KeyError::Sign(e.to_string()))
     }
 
     /// The registration JWS for `aud`, naming the device `name`.
     pub fn registration_jws(&self, aud: &str, name: &str, now: i64) -> Result<String, KeyError> {
-        let claims = RegistrationClaims {
-            iss: CLI_ISSUER.to_string(),
-            aud: aud.to_string(),
-            iat: now,
-            exp: now + DEVICE_TOKEN_TTL_SECS,
-            public_key: self.public_key_b64(),
-            name: name.to_string(),
-        };
-        self.sign(&Header::new(Algorithm::EdDSA), &claims)
+        crypto::sign_registration(&self.encoding, &self.public_key_b64(), aud, name, now)
+            .map_err(|e| KeyError::Sign(e.to_string()))
     }
 }
 
@@ -209,37 +165,6 @@ pub fn local_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Shared with meeting-api's `device_token_vectors` test; read by
-    /// relative path so neither crate depends on the other.
-    #[test]
-    fn signing_matches_the_shared_vectors() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../videocall-meeting-types/tests/vectors/device_tokens.json"
-        );
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let s = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap().to_string();
-        let key = DeviceKey::from_seed_b64(&SecretString::from(s(&v, "seed_b64url"))).unwrap();
-        assert_eq!(key.public_key_b64(), s(&v, "public_key"));
-        assert_eq!(key.fingerprint(), s(&v, "fingerprint"));
-
-        let (d, r) = (&v["device_token"], &v["registration"]);
-        assert_eq!(
-            d["exp"].as_i64().unwrap(),
-            d["iat"].as_i64().unwrap() + DEVICE_TOKEN_TTL_SECS
-        );
-        let token = key.device_token_with_jti(
-            &s(d, "device_id"),
-            &s(d, "aud"),
-            d["iat"].as_i64().unwrap(),
-            s(d, "jti"),
-        );
-        assert_eq!(token.unwrap(), s(d, "token"), "device JWT");
-        let jws = key.registration_jws(&s(r, "aud"), &s(r, "name"), r["iat"].as_i64().unwrap());
-        assert_eq!(jws.unwrap(), s(r, "token"), "registration JWS");
-    }
 
     #[test]
     fn seed_round_trip_redaction_and_fresh_jti() {

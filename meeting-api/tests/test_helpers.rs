@@ -19,13 +19,9 @@ use axum::body::Body;
 use axum::http;
 use axum::response::Response;
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::{Duration, Utc};
-use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use meeting_api::config::DeviceAuthConfig;
 use meeting_api::db::{self, DbPool};
 use meeting_api::secrets::random_base64url;
@@ -33,7 +29,9 @@ use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tower::ServiceExt;
-use videocall_meeting_types::device::{fingerprint, DeviceTokenClaims, CLI_ISSUER};
+use videocall_meeting_types::device::{
+    base64url_encode, crypto, fingerprint, DeviceTokenClaims, CLI_ISSUER,
+};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -151,17 +149,13 @@ pub fn new_key() -> SigningKey {
 }
 
 pub fn public_key_of(key: &SigningKey) -> String {
-    URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+    base64url_encode(&key.verifying_key().to_bytes())
 }
 
 /// Sign `claims` as an EdDSA JWT, the way the CLI does.
 pub fn sign_eddsa<T: Serialize>(key: &SigningKey, kid: Option<&str>, claims: &T) -> String {
-    let header = Header {
-        kid: kid.map(str::to_string),
-        ..Header::new(Algorithm::EdDSA)
-    };
-    let der = key.to_pkcs8_der().expect("pkcs8");
-    encode(&header, claims, &EncodingKey::from_ed_der(der.as_bytes())).expect("sign")
+    let key = crypto::encoding_key(key).expect("encoding key");
+    crypto::sign(&key, kid, claims).expect("sign")
 }
 
 pub fn device_claims(sub: &str, aud: &str, iat: i64, exp: i64) -> DeviceTokenClaims {
@@ -228,7 +222,7 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
     };
     let device = db::devices::NewDevice {
         id: &id,
-        public_key: &URL_SAFE_NO_PAD.encode(raw),
+        public_key: &base64url_encode(&raw),
         fingerprint: &fingerprint(&raw),
         name: "fixture",
         user_id,

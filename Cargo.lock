@@ -8327,7 +8327,6 @@ name = "videocall-cli"
 version = "4.1.2"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "clap",
  "cpal",
  "ed25519",
@@ -8335,7 +8334,6 @@ dependencies = [
  "getrandom 0.3.4",
  "httpdate",
  "image 0.25.9",
- "jsonwebtoken",
  "keyring",
  "libc",
  "protobuf",
@@ -8343,7 +8341,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 1.0.69",
@@ -8453,6 +8450,8 @@ dependencies = [
 name = "videocall-meeting-types"
 version = "0.2.0"
 dependencies = [
+ "ed25519-dalek",
+ "jsonwebtoken",
  "serde",
  "serde_json",
  "sha2 0.10.9",

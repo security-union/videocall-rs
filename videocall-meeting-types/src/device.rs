@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "device-crypto")]
+pub mod crypto;
+
 /// `iss` claim of every device JWT and registration JWS.
 pub const CLI_ISSUER: &str = "videocall-cli";
 
@@ -334,8 +337,13 @@ pub fn decode_authorize_request(request: &str) -> Option<String> {
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// RFC 7636 S256 PKCE challenge: `BASE64URL(SHA256(verifier))`.
+pub fn code_challenge_s256(verifier: &str) -> String {
+    base64url_encode(&Sha256::digest(verifier.as_bytes()))
+}
+
 /// RFC 4648 base64url without padding.
-fn base64url_encode(bytes: &[u8]) -> String {
+pub fn base64url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let group = chunk
@@ -352,7 +360,7 @@ fn base64url_encode(bytes: &[u8]) -> String {
 /// Strict base64url: alphabet only, no padding, and only the canonical
 /// spelling (unused trailing bits zero), so every byte string has exactly
 /// one accepted encoding.
-fn base64url_decode(encoded: &str) -> Option<Vec<u8>> {
+pub fn base64url_decode(encoded: &str) -> Option<Vec<u8>> {
     if encoded.len() % 4 == 1 {
         return None;
     }
@@ -490,6 +498,14 @@ mod tests {
         assert_eq!(decode_public_key(&"_".repeat(43)), None);
         assert_eq!(decode_public_key(&"A".repeat(43)), Some([0; 32]));
         assert_eq!(decode_public_key(&"A".repeat(42)), None);
+    }
+
+    #[test]
+    fn rfc7636_appendix_b_challenge() {
+        assert_eq!(
+            code_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     #[test]

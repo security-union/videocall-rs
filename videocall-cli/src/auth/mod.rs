@@ -37,8 +37,6 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use url::{Host, Url};
 use videocall_meeting_client::devices::CliAuthorizeParams;
@@ -94,7 +92,7 @@ impl From<getrandom::Error> for AuthError {
 pub(crate) fn random_b64url(n: usize) -> Result<String, getrandom::Error> {
     let mut bytes = vec![0u8; n];
     getrandom::fill(&mut bytes)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    Ok(videocall_meeting_types::device::base64url_encode(&bytes))
 }
 
 /// A meeting-api origin: the `aud` of every token and the store key.

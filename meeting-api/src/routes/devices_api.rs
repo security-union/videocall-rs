@@ -45,7 +45,7 @@ use crate::device_auth::{
     AllowedStates, DeviceAuthError,
 };
 use crate::error::AppError;
-use crate::secrets::{ct_eq, pkce_s256, random_base64url, sha256_hex};
+use crate::secrets::{ct_eq, random_base64url, sha256_hex};
 use crate::state::AppState;
 
 /// Largest accepted body on the two POST routes.
@@ -149,7 +149,10 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         if request.redirect_uri != row.redirect_uri {
             return Err("redirect_uri mismatch");
         }
-        if !ct_eq(&pkce_s256(&request.code_verifier), &row.code_challenge) {
+        if !ct_eq(
+            &codes::code_challenge_s256(&request.code_verifier),
+            &row.code_challenge,
+        ) {
             return Err("PKCE mismatch");
         }
         let (claims, raw_key) = verify_registration(&request.registration, &audience, now)

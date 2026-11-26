@@ -20,20 +20,19 @@ mod test_helpers;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use meeting_api::db::{self, DbPool};
 use meeting_api::routes::devices_api::MAX_DEVICES_PER_USER;
-use meeting_api::secrets::{pkce_s256, random_base64url, sha256_hex};
+use meeting_api::secrets::{random_base64url, sha256_hex};
 use meeting_api::state::AppState;
 use serde_json::{json, Value};
 use serial_test::serial;
 use test_helpers::*;
 use url::Url;
 use videocall_meeting_types::device::{
-    decode_authorize_request, fingerprint, RegistrationClaims, CLI_ISSUER, CLI_REMOTE_REDIRECT_URI,
+    self, base64url_decode, base64url_encode, crypto, decode_authorize_request, fingerprint,
+    CLI_REMOTE_REDIRECT_URI,
 };
 
 const AUD: &str = TEST_DEVICE_AUDIENCE;
@@ -69,7 +68,7 @@ impl Cli {
     fn approval(&self, confirm: bool) -> Value {
         json!({
             "redirect_uri": self.redirect_uri,
-            "code_challenge": pkce_s256(&self.verifier),
+            "code_challenge": device::code_challenge_s256(&self.verifier),
             "code_challenge_method": "S256",
             "state": self.state,
             "public_key": public_key_of(&self.key),
@@ -79,16 +78,9 @@ impl Cli {
     }
 
     fn registration(&self, signer: &SigningKey, aud: &str, public_key: &str, name: &str) -> String {
-        let now = Utc::now().timestamp();
-        let claims = RegistrationClaims {
-            iss: CLI_ISSUER.to_string(),
-            aud: aud.to_string(),
-            iat: now,
-            exp: now + 120,
-            public_key: public_key.to_string(),
-            name: name.to_string(),
-        };
-        sign_eddsa(signer, None, &claims)
+        let key = crypto::encoding_key(signer).expect("encoding key");
+        crypto::sign_registration(&key, public_key, aud, name, Utc::now().timestamp())
+            .expect("sign")
     }
 
     fn exchange_body(&self, code: &str) -> Value {
@@ -263,7 +255,7 @@ async fn loopback_approve_and_exchange() {
     assert_eq!(pairs.len(), 2);
     let (key, code) = &pairs[0];
     assert_eq!(key, "code");
-    assert_eq!(URL_SAFE_NO_PAD.decode(code).unwrap().len(), 32);
+    assert_eq!(base64url_decode(code).unwrap().len(), 32);
     assert_eq!(pairs[1], ("state".to_string(), cli.state.clone()));
 
     // Only the hash is stored.
@@ -338,7 +330,7 @@ async fn approve_rejects_invalid_input_and_writes_nothing() {
         ("state", json!("short")),
         ("state", json!(format!("{} x", "a".repeat(20)))),
         ("public_key", json!("A".repeat(42))),
-        ("public_key", json!(URL_SAFE_NO_PAD.encode([0u8; 32]))), // weak
+        ("public_key", json!(base64url_encode(&[0u8; 32]))), // weak
         ("device_name", json!("-leading")),
         ("device_name", json!("caf\u{e9}")),
         ("device_name", json!("")),
@@ -589,7 +581,7 @@ async fn device_cap_holds_under_concurrent_inserts() {
                 let raw = new_key().verifying_key().to_bytes();
                 let device = db::devices::NewDevice {
                     id: &random_base64url(16),
-                    public_key: &URL_SAFE_NO_PAD.encode(raw),
+                    public_key: &base64url_encode(&raw),
                     fingerprint: &fingerprint(&raw),
                     name: "racer",
                     user_id: &user,

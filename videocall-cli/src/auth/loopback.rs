@@ -29,16 +29,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use secrecy::SecretString;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use videocall_meeting_types::device::RedirectUri;
+use videocall_meeting_types::device::{code_challenge_s256, RedirectUri};
 
 use super::random_b64url;
 
@@ -60,7 +57,7 @@ impl Pkce {
     }
 
     fn from_verifier(verifier: String) -> Self {
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let challenge = code_challenge_s256(&verifier);
         Self {
             verifier: SecretString::from(verifier),
             challenge,

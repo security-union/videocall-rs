@@ -13,9 +13,16 @@ keywords = ["videocall", "meeting", "api", "types"]
 categories = ["network-programming"]
 description = "Shared API types for the videocall.rs meeting backend"
 
+[features]
+# Device-token signing and verification (videocall-cli, meeting-api). Off by
+# default so the browser build carries no signing code.
+device-crypto = ["dep:ed25519-dalek", "dep:jsonwebtoken"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "alloc"], optional = true }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"], optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

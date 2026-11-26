@@ -20,9 +20,9 @@ use super::*;
 use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use videocall_meeting_types::device::{base64url_decode, code_challenge_s256};
 
 const OLD_ID: &str = "oLdDeViCe0123456789abc";
 const NEW_ID: &str = "nEwDeViCe0123456789abc";
@@ -157,7 +157,7 @@ fn jwt_part(head: &str, part: usize) -> Option<Value> {
     let token = head
         .lines()
         .find_map(|l| l.strip_prefix("authorization: Bearer "))?;
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(token.split('.').nth(part)?).ok()?).ok()
+    serde_json::from_slice(&base64url_decode(token.split('.').nth(part)?)?).ok()
 }
 
 async fn mock(
@@ -329,12 +329,7 @@ async fn logout_deletes_locally_even_if_the_server_refuses_or_is_gone() {
 
 fn registration_claims(body: &Value) -> Value {
     let jws = body["registration"].as_str().unwrap();
-    serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(jws.split('.').nth(1).unwrap())
-            .unwrap(),
-    )
-    .unwrap()
+    serde_json::from_slice(&base64url_decode(jws.split('.').nth(1).unwrap()).unwrap()).unwrap()
 }
 
 /// A meeting-api for login whose clock is an hour ahead of ours. The
@@ -348,7 +343,7 @@ async fn login_server(code: &'static str, wrong_fingerprint: bool) -> Mock {
             if seen.body["code"] != code || !fresh(claims["iat"].as_i64(), now) {
                 return (400, json!({"error": "invalid_grant", "error_description": "x"}));
             }
-            let pk = URL_SAFE_NO_PAD.decode(claims["public_key"].as_str().unwrap()).unwrap();
+            let pk = base64url_decode(claims["public_key"].as_str().unwrap()).unwrap();
             let fingerprint = match wrong_fingerprint {
                 true => "0000-0000-0000-0000".to_string(),
                 false => videocall_meeting_types::device::fingerprint(&pk),
@@ -400,10 +395,7 @@ fn check_login(server: &Mock, ctx: &Ctx, url: &str, redirect_uri: &str) {
     assert_eq!(post.body["redirect_uri"], redirect_uri);
     assert_eq!(query(url, "redirect_uri"), redirect_uri);
     let verifier = post.body["code_verifier"].as_str().unwrap();
-    assert_eq!(
-        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier)),
-        query(url, "code_challenge")
-    );
+    assert_eq!(code_challenge_s256(verifier), query(url, "code_challenge"));
     let claims = registration_claims(&post.body);
     assert_eq!(claims["aud"], server.api.as_str());
     assert_eq!(claims["name"], query(url, "device_name"));

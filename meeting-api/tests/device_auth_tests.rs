@@ -20,8 +20,6 @@ mod test_helpers;
 use axum::body::Body;
 use axum::http::{self, Request, StatusCode};
 use axum::response::Response;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use meeting_api::db::{self, meetings as db_meetings, DbPool};
@@ -30,6 +28,7 @@ use meeting_api::state::AppState;
 use serde_json::{json, Value};
 use serial_test::serial;
 use test_helpers::*;
+use videocall_meeting_types::device::base64url_encode;
 use videocall_meeting_types::RoomAccessTokenClaims;
 
 async fn create_meeting(pool: &DbPool, room: &str, creator: &str, active: bool) {
@@ -116,8 +115,8 @@ async fn rejected_credentials_get_401() {
     };
     let alg_none = format!(
         "{}.{}.",
-        URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"none","kid":"{}"}}"#, device.id)),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        base64url_encode(format!(r#"{{"alg":"none","kid":"{}"}}"#, device.id).as_bytes()),
+        base64url_encode(&serde_json::to_vec(&claims).unwrap())
     );
     let unknown = random_base64url(16);
     let room_token = meeting_api::token::generate_room_token(
@@ -157,7 +156,7 @@ async fn rejected_credentials_get_401() {
         ),
         (
             "HS256 keyed with the encoded public key".into(),
-            get(&hs256(URL_SAFE_NO_PAD.encode(raw_key).as_bytes())),
+            get(&hs256(base64url_encode(&raw_key).as_bytes())),
             false,
         ),
         ("alg none".into(), get(&alg_none), false),

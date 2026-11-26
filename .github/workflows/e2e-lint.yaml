@@ -13,6 +13,7 @@ jobs:
   lint:
     name: ESLint + Prettier + TypeCheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: e2e

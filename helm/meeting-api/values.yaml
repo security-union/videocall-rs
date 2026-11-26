@@ -79,18 +79,15 @@ env:
   - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
   # --- CLI device login (videocall-cli) ---
-  # Public origin of THIS service exactly as browsers and the CLI reach it
-  # (scheme + host, no path). It is the audience of device tokens and the
-  # origin of the consent pages (/cli/authorize, /devices). Unset disables
-  # device login (pages return 503); a non-origin value fails startup. Must
-  # match the ingress host below.
-  - name: DEVICE_TOKEN_AUDIENCE
-    value: "https://api.videocall.rs"
-  # Take the requester IP (shown on the consent page, used for per-IP limits)
-  # from the right-most X-Forwarded-For entry. Only true when the service sits
-  # behind the ingress, which appends the real peer address.
-  - name: TRUST_X_FORWARDED_FOR
-    value: "true"
+  # DEVICE_TOKEN_AUDIENCE (public origin of THIS service, scheme + host, no
+  # path) and TRUST_X_FORWARDED_FOR are NOT listed here on purpose: the
+  # deployment template adds them when the ingress is enabled, so they survive
+  # deployments that replace this whole `env` list (PR previews do).
+  #   DEVICE_TOKEN_AUDIENCE   = https://<ingress.hosts[0].host>  (http:// when
+  #                             ingress.tls is empty)
+  #   TRUST_X_FORWARDED_FOR   = "true"  (the pod sits behind the ingress)
+  # Add an entry with the same name below to override either. Unset audience
+  # disables device login (pages return 503); a non-origin value fails startup.
   # Optional tuning, defaults shown.
   # An approved device dies after this many seconds unused (90 days).
   # - name: DEVICE_IDLE_TTL_SECS

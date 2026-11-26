@@ -34,6 +34,23 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            {{- /*
+              Device login settings derived from the ingress, so deployments that
+              replace the whole `env` list (PR previews pass --set env[N]) still
+              get them. An explicit entry in `env` always wins.
+            */}}
+            {{- $envNames := list }}
+            {{- range .Values.env }}{{- $envNames = append $envNames .name }}{{- end }}
+            {{- if and .Values.ingress.enabled .Values.ingress.hosts }}
+            {{- if not (has "DEVICE_TOKEN_AUDIENCE" $envNames) }}
+            - name: DEVICE_TOKEN_AUDIENCE
+              value: {{ printf "%s://%s" (ternary "https" "http" (not (empty .Values.ingress.tls))) (index .Values.ingress.hosts 0).host | quote }}
+            {{- end }}
+            {{- if not (has "TRUST_X_FORWARDED_FOR" $envNames) }}
+            - name: TRUST_X_FORWARDED_FOR
+              value: "true"
+            {{- end }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

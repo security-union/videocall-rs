@@ -317,15 +317,38 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
 mod keychain {
     use super::{StoreError, KEYCHAIN_SERVICE};
     use keyring::{Entry, Error};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     pub const AVAILABLE: bool = true;
+
+    /// Run a keychain call; if it takes over 2 s, say why on stderr. macOS
+    /// asks before a rebuilt binary may use the item, and the call blocks
+    /// until someone answers that dialog on the Mac's screen.
+    fn with_notice<T>(call: impl FnOnce() -> T) -> T {
+        let (done, waiting) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) =
+                waiting.recv_timeout(Duration::from_secs(2))
+            {
+                eprintln!(
+                    "Waiting for keychain access. If this Mac shows a dialog, choose Always \
+                     Allow. Over SSH, answer it at the Mac's screen once."
+                );
+            }
+        });
+        let result = call();
+        drop(done);
+        result
+    }
 
     fn entry(origin: &str) -> Result<Entry, StoreError> {
         Entry::new(KEYCHAIN_SERVICE, origin).map_err(|e| StoreError::Keychain(e.to_string()))
     }
 
     pub fn get(origin: &str) -> Result<Option<String>, StoreError> {
-        match entry(origin)?.get_password() {
+        let entry = entry(origin)?;
+        match with_notice(|| entry.get_password()) {
             Ok(v) => Ok(Some(v)),
             Err(Error::NoEntry) => Ok(None),
             Err(e) => Err(StoreError::Keychain(e.to_string())),

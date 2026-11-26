@@ -25,7 +25,6 @@ jobs:
     timeout-minutes: 30
     env:
       CLI: ${{ github.workspace }}/target/debug/videocall-cli
-      MOCK_PYTHON: ${{ runner.temp }}/venv/bin/python3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +39,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet cryptography
+          echo "MOCK_PYTHON=$RUNNER_TEMP/venv/bin/python3" >> "$GITHUB_ENV"
 
       - name: Keychain works, login and logout
         run: videocall-cli/tests/macos-keychain.sh works

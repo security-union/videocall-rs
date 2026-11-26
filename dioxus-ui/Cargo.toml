@@ -117,6 +117,7 @@ web-sys = { version = "0.3.107", features = [
 ] }
 
 [features]
-default = []
+default = ["media-server-jwt-auth"]
 fake-peers = []
 oauth = []
+media-server-jwt-auth = []

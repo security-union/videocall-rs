@@ -17,8 +17,10 @@
  */
 
 pub mod actors;
+pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;
+pub mod db;
 pub mod lobby;
 pub mod messages;
 pub mod metrics;

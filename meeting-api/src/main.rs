@@ -130,22 +130,11 @@ async fn main() {
         .allow_credentials(true);
 
     let state = AppState::new(pool, &config, nats);
-    // Pages are merged after the CORS layer so they are never CORS-readable.
-    let app = routes::app(cors)
-        .with_state(state)
-        // The requester IP shown on the consent page and used by the per-IP cap.
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let app = routes::router().layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
         .expect("failed to bind listener");
-
-    match config.device.audience.as_deref() {
-        Some(aud) => tracing::info!("Device JWTs accepted with aud={aud}"),
-        None => tracing::error!(
-            "DEVICE_TOKEN_AUDIENCE is not set: CLI device login is disabled and every device token gets 401"
-        ),
-    }
 
     tracing::info!("Meeting Backend listening on {}", config.listen_addr);
 

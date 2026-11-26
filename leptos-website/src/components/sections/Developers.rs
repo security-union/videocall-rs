@@ -90,7 +90,7 @@ pub fn DevelopersSection() -> impl IntoView {
                         code=RUN_CMD
                     >
                         "The entire stack — Postgres, NATS, the relays, meeting-api, and the UI — runs natively with hot reload. Open "
-                        <ShipLink href="http://localhost:3001/meeting/demo">"localhost:3001/meeting/demo"</ShipLink>
+                        <ShipLink href="http://localhost:3001/meeting/you/demo">"localhost:3001/meeting/you/demo"</ShipLink>
                         ". You are in the call. Going to production? The repo ships "
                         <ShipLink href="https://github.com/security-union/videocall-rs/tree/main/helm">"Helm charts"</ShipLink>
                         "."
@@ -255,7 +255,7 @@ fn TryRow() -> impl IntoView {
                     <span class="section-index text-fg" aria-hidden="true">"TRY"</span>
                 </div>
                 <h3 class="text-h3 text-fg mt-3">"Stream a camera in three commands"</h3>
-                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No build. Log in once, then it's a camera and a meeting id. Over SSH, open the printed URL on your laptop and paste back the code it shows. Device management is built in: each machine gets its own key, and you can see and revoke every one at api.videocall.rs/devices."</p>
+                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. Each robot gets its own key, made on the machine and never copied off it. You approve it once from your laptop or phone, even over SSH with auth login --remote. Every machine shows up at app.videocall.rs/devices, and you can revoke one without touching the rest."</p>
             </div>
             <div class="md:col-span-8 lg:col-span-9">
                 <div class="relative">

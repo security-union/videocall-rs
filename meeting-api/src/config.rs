@@ -50,92 +50,42 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
-    /// CLI device-key settings (`DEVICE_*`, `TRUST_X_FORWARDED_FOR`).
     pub device: DeviceAuthConfig,
 }
 
-/// CLI device-key settings.
-#[derive(Debug, Clone)]
+/// CLI device sign-in settings, derived from existing variables.
+#[derive(Debug, Clone, Default)]
 pub struct DeviceAuthConfig {
-    /// `DEVICE_TOKEN_AUDIENCE`: this server's public origin, e.g.
-    /// `https://api.videocall.rs`. It is the `aud` of every device JWT and
-    /// registration JWS, the only accepted `Origin` on the consent form, the
-    /// base of the remote `redirect_uri`, and the origin of the closed
-    /// post-login return targets. `None` disables device auth.
+    /// `DEVICE_TOKEN_AUDIENCE`: this server's public origin, the `aud` of
+    /// every device JWT. `None` disables device auth.
     pub audience: Option<String>,
-    /// `DEVICE_IDLE_TTL_SECS`: an approved device dies after this long unused.
-    pub idle_ttl_secs: i64,
-    /// `DEVICE_ABS_TTL_SECS`: an approved device dies this long after approval.
-    pub abs_ttl_secs: i64,
-    /// `DEVICE_MAX_PER_USER`: live approved devices per user.
-    pub max_per_user: i64,
-    /// `DEVICE_MAX_PENDING`: unexpired login requests, globally.
-    pub max_pending: i64,
-    /// `DEVICE_MAX_PENDING_PER_IP`: unexpired login requests per requester IP.
-    pub max_pending_per_ip: i64,
-    /// `TRUST_X_FORWARDED_FOR`: take the requester IP from the right-most
-    /// `X-Forwarded-For` entry instead of the TCP peer.
-    pub trust_x_forwarded_for: bool,
-}
-
-pub const DEFAULT_DEVICE_IDLE_TTL_SECS: i64 = 90 * 24 * 3600;
-pub const DEFAULT_DEVICE_ABS_TTL_SECS: i64 = 365 * 24 * 3600;
-pub const DEFAULT_DEVICE_MAX_PER_USER: i64 = 10;
-pub const DEFAULT_DEVICE_MAX_PENDING: i64 = 10_000;
-pub const DEFAULT_DEVICE_MAX_PENDING_PER_IP: i64 = 5;
-
-impl Default for DeviceAuthConfig {
-    fn default() -> Self {
-        Self {
-            audience: None,
-            idle_ttl_secs: DEFAULT_DEVICE_IDLE_TTL_SECS,
-            abs_ttl_secs: DEFAULT_DEVICE_ABS_TTL_SECS,
-            max_per_user: DEFAULT_DEVICE_MAX_PER_USER,
-            max_pending: DEFAULT_DEVICE_MAX_PENDING,
-            max_pending_per_ip: DEFAULT_DEVICE_MAX_PENDING_PER_IP,
-            trust_x_forwarded_for: false,
-        }
-    }
+    /// Origin of `AFTER_LOGIN_URL` (if absolute), which hosts the consent
+    /// page. Read directly, so device login does not depend on OAuth.
+    pub ui_origin: Option<String>,
+    /// `Origin` values accepted on state-changing device routes:
+    /// `CORS_ALLOWED_ORIGIN` plus `ui_origin`, compared as exact strings.
+    pub browser_origins: Vec<String>,
 }
 
 impl DeviceAuthConfig {
-    /// Read the device settings from the environment.
-    pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let positive = |name: &str, default: i64| -> Result<i64, String> {
-            match var(name) {
-                None => Ok(default),
-                Some(v) => match v.trim().parse::<i64>() {
-                    Ok(n) if n > 0 => Ok(n),
-                    _ => Err(format!("{name} must be a positive integer")),
-                },
-            }
-        };
-        let audience = var("DEVICE_TOKEN_AUDIENCE")
+    pub fn from_env(cors_allowed_origin: &[String]) -> Result<Self, String> {
+        let audience = env::var("DEVICE_TOKEN_AUDIENCE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
             .map(|s| {
                 parse_origin(s.trim())
                     .ok_or_else(|| format!("DEVICE_TOKEN_AUDIENCE is not an http(s) origin: {s}"))
             })
             .transpose()?;
-        let trust_x_forwarded_for = match var("TRUST_X_FORWARDED_FOR") {
-            None => false,
-            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                _ => return Err("TRUST_X_FORWARDED_FOR must be true or false".into()),
-            },
-        };
+        let ui_origin = env::var("AFTER_LOGIN_URL")
+            .ok()
+            .and_then(|url| parse_origin(url.trim()));
+        let mut browser_origins = cors_allowed_origin.to_vec();
+        browser_origins.extend(ui_origin.clone());
         Ok(Self {
             audience,
-            idle_ttl_secs: positive("DEVICE_IDLE_TTL_SECS", DEFAULT_DEVICE_IDLE_TTL_SECS)?,
-            abs_ttl_secs: positive("DEVICE_ABS_TTL_SECS", DEFAULT_DEVICE_ABS_TTL_SECS)?,
-            max_per_user: positive("DEVICE_MAX_PER_USER", DEFAULT_DEVICE_MAX_PER_USER)?,
-            max_pending: positive("DEVICE_MAX_PENDING", DEFAULT_DEVICE_MAX_PENDING)?,
-            max_pending_per_ip: positive(
-                "DEVICE_MAX_PENDING_PER_IP",
-                DEFAULT_DEVICE_MAX_PENDING_PER_IP,
-            )?,
-            trust_x_forwarded_for,
+            ui_origin,
+            browser_origins,
         })
     }
 }
@@ -208,7 +158,7 @@ impl Config {
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
+        let cors_allowed_origin: Vec<String> = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
@@ -222,8 +172,6 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
-
-        let device = DeviceAuthConfig::from_env()?;
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -295,6 +243,8 @@ impl Config {
                 })
             })
             .transpose()?;
+
+        let device = DeviceAuthConfig::from_env(&cors_allowed_origin)?;
 
         Ok(Self {
             listen_addr,

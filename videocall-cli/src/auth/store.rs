@@ -16,231 +16,114 @@
  * conditions.
  */
 
-//! Local storage for the CLI's device key.
+//! Where this machine's device key lives: one record per API origin.
 //!
-//! Layout of the config directory (see [`config_dir`]):
-//!
-//! - `hosts.toml`: non-secret metadata per API origin (device id,
-//!   fingerprint, name, approving user, status, and which backend holds the
-//!   key).
-//! - `credentials.toml`: the Ed25519 private key seed when the file backend
-//!   is used. Mode 0600, written via temp file + rename, and refused on read
-//!   if group- or world-accessible.
-//! - `.lock`: exclusive advisory lock taken around every read-modify-write,
-//!   so two CLI processes (say, a login and a logout) never interleave.
-//!
-//! On macOS and Windows the key goes to the OS keychain (service
-//! [`KEYCHAIN_SERVICE`], account = API origin), falling back to the file if
-//! the keychain refuses the write. Linux always uses the file.
+//! macOS and Windows: the OS keychain (service [`KEYCHAIN_SERVICE`],
+//! account = API origin), falling back to the file if the keychain refuses
+//! the write. Elsewhere: `{config dir}/<origin>.toml`, mode 0600, in a 0700
+//! directory owned by this user, written via temp file + rename, and refused
+//! on read if another user owns it or can access it.
 
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use secrecy::zeroize::{Zeroize, Zeroizing};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-/// Keychain service name used for every stored secret.
+/// Keychain service name for every stored device.
 pub const KEYCHAIN_SERVICE: &str = "videocall-cli";
 
 /// Environment variable that overrides the config directory.
 pub const CONFIG_DIR_ENV: &str = "VIDEOCALL_CONFIG_DIR";
 
-/// Environment variable that forces the file backend when set to `file`.
-pub const CREDENTIAL_STORE_ENV: &str = "VIDEOCALL_CREDENTIAL_STORE";
-
-const HOSTS_FILE: &str = "hosts.toml";
-const CREDENTIALS_FILE: &str = "credentials.toml";
-const LOCK_FILE: &str = ".lock";
-
-/// Errors from the credential store.
+/// A store failure. Messages never contain the key.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// No usable config directory could be determined.
     #[error("cannot determine a config directory; set {CONFIG_DIR_ENV}")]
     NoConfigDir,
-
-    /// The credentials file is readable by other users.
-    #[error(
-        "refusing to read {path}: it is accessible by other users (mode {mode:o}). \
-         Run `chmod 600 {path}` or log in again."
-    )]
-    InsecurePermissions {
-        /// Path of the offending file.
-        path: String,
-        /// Its permission bits.
-        mode: u32,
-    },
-
-    /// A file in the config directory could not be parsed.
-    #[error("{path} is corrupt: {reason}")]
-    Corrupt {
-        /// Path of the offending file.
-        path: String,
-        /// Parser message (never contains secret values).
-        reason: String,
-    },
-
-    /// A file or directory in the store belongs to another user.
-    #[error(
-        "refusing to use {path}: it is owned by another user (uid {owner}). \
-         Set {CONFIG_DIR_ENV} to a directory you own."
-    )]
-    NotOwned {
-        /// Path of the offending file or directory.
-        path: String,
-        /// Its owner's uid.
-        owner: u32,
-    },
-
-    /// The OS keychain failed.
+    #[error("refusing to use {0}: {1}")]
+    Insecure(String, String),
+    #[error("{0} is corrupt; run `videocall-cli auth logout`, then log in again")]
+    Corrupt(String),
     #[error("keychain error: {0}")]
     Keychain(String),
-
-    /// Filesystem failure.
-    #[error("{context}: {source}")]
-    Io {
-        /// What was being done.
-        context: String,
-        /// Underlying error.
-        source: io::Error,
-    },
+    #[error("{0}: {1}")]
+    Io(String, io::Error),
 }
 
-fn io_err(context: impl Into<String>) -> impl FnOnce(io::Error) -> StoreError {
-    let context = context.into();
-    move |source| StoreError::Io { context, source }
+fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
+    move |e| StoreError::Io(path.display().to_string(), e)
 }
 
-/// Where a host's secret is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StoreKind {
-    /// macOS Keychain or Windows Credential Manager.
-    Keychain,
-    /// `credentials.toml` in the config directory (plain text, mode 0600).
-    File,
-}
-
-/// Non-secret metadata for one API origin, stored in `hosts.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostEntry {
-    /// Server-assigned device id (the JWT `kid` and `sub`).
-    pub device_id: String,
-    /// `XXXX-XXXX-XXXX-XXXX` fingerprint of the public key.
-    pub fingerprint: String,
-    /// Device name registered with the server.
-    pub name: String,
-    /// Id of the user who approved this device.
-    pub user_id: String,
-    /// That user's display name at approval time.
-    pub user_name: String,
-    /// Backend holding the private key.
-    pub store: StoreKind,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct HostsFile {
-    #[serde(default)]
-    hosts: BTreeMap<String, HostEntry>,
-}
-
-/// The secret part of a credential: the Ed25519 private key seed,
-/// base64url. `Debug` prints it redacted; it is zeroized on drop.
+/// One registered device. `Debug` redacts the key.
 #[derive(Debug)]
-pub struct Secret {
-    /// 32-byte seed, base64url without padding.
+pub struct StoredDevice {
+    pub device_id: String,
+    pub fingerprint: String,
+    pub name: String,
+    pub user_id: String,
+    pub user_name: String,
+    /// The 32-byte Ed25519 seed, base64url.
     pub private_key: SecretString,
 }
 
-/// Serialized form of [`Secret`]. No `Debug` impl; zeroized on drop.
+/// Serialized form; no `Debug`, key zeroized on drop.
 #[derive(Serialize, Deserialize)]
-struct SecretRecord {
+struct Record {
+    /// Checked on load, so two origins can never share a key.
+    origin: String,
+    device_id: String,
+    fingerprint: String,
+    name: String,
+    user_id: String,
+    user_name: String,
     private_key: String,
 }
 
-impl Drop for SecretRecord {
+impl Drop for Record {
     fn drop(&mut self) {
         self.private_key.zeroize();
     }
 }
 
-impl From<&Secret> for SecretRecord {
-    fn from(secret: &Secret) -> Self {
-        Self {
-            private_key: secret.private_key.expose_secret().to_string(),
+/// Where a record was found or saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    Keychain,
+    File(PathBuf),
+}
+
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Location::Keychain => write!(f, "the OS keychain (service \"{KEYCHAIN_SERVICE}\")"),
+            Location::File(path) => write!(f, "{}", path.display()),
         }
     }
 }
 
-impl From<&SecretRecord> for Secret {
-    fn from(record: &SecretRecord) -> Self {
-        Self {
-            private_key: SecretString::from(record.private_key.clone()),
-        }
-    }
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct CredentialsFile {
-    #[serde(default)]
-    hosts: BTreeMap<String, SecretRecord>,
-}
-
-/// Resolve the config directory from the environment.
-///
-/// `VIDEOCALL_CONFIG_DIR` if set, else `$XDG_CONFIG_HOME/videocall`, else
+/// `$VIDEOCALL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/videocall`, else
 /// `%APPDATA%\videocall` on Windows, else `~/.config/videocall`.
-pub fn config_dir() -> Result<PathBuf, StoreError> {
-    #[allow(deprecated)] // `home_dir` is correct on every platform we ship.
-    let home = std::env::home_dir();
-    config_dir_from(|key| std::env::var_os(key), home, cfg!(windows)).ok_or(StoreError::NoConfigDir)
-}
-
-/// Pure version of [`config_dir`] for tests.
 pub(crate) fn config_dir_from(
-    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    env: impl Fn(&str) -> Option<String>,
     home: Option<PathBuf>,
     windows: bool,
 ) -> Option<PathBuf> {
-    let non_empty = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(dir) = non_empty(CONFIG_DIR_ENV) {
-        return Some(dir);
-    }
-    if let Some(xdg) = non_empty("XDG_CONFIG_HOME") {
-        return Some(xdg.join("videocall"));
-    }
-    if windows {
-        if let Some(appdata) = non_empty("APPDATA") {
-            return Some(appdata.join("videocall"));
-        }
-    }
-    home.map(|h| h.join(".config").join("videocall"))
+    let var = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    var(CONFIG_DIR_ENV)
+        .or_else(|| var("XDG_CONFIG_HOME").map(|d| d.join("videocall")))
+        .or_else(|| {
+            windows
+                .then(|| var("APPDATA"))
+                .flatten()
+                .map(|d| d.join("videocall"))
+        })
+        .or_else(|| home.map(|h| h.join(".config").join("videocall")))
 }
 
-/// Proof that the caller holds the store's exclusive lock. Released when the
-/// last clone is dropped (clones let blocking tasks carry the proof).
-#[derive(Clone)]
-pub struct StoreLock {
-    _file: std::sync::Arc<File>,
-}
-
-/// Run store I/O (files or the keychain) on tokio's blocking pool so it
-/// never stalls the async runtime threads.
-pub async fn run_blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
-) -> Result<T, StoreError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| StoreError::Io {
-            context: "credential store task".to_string(),
-            source: io::Error::other(e.to_string()),
-        })?
-}
-
-/// Credential store rooted at one config directory.
+/// The device store rooted at one config directory.
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
@@ -248,20 +131,16 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open the store in the default config directory, using the keychain
-    /// where the platform has one unless `VIDEOCALL_CREDENTIAL_STORE=file`.
+    /// The default config directory, with the keychain where there is one.
     pub fn open_default() -> Result<Self, StoreError> {
-        let force_file = std::env::var(CREDENTIAL_STORE_ENV)
-            .map(|v| v.eq_ignore_ascii_case("file"))
-            .unwrap_or(false);
-        Ok(Self::with_dir(
-            config_dir()?,
-            keychain::AVAILABLE && !force_file,
-        ))
+        #[allow(deprecated)] // `home_dir` is correct on every platform we ship.
+        let home = std::env::home_dir();
+        let dir = config_dir_from(|key| std::env::var(key).ok(), home, cfg!(windows))
+            .ok_or(StoreError::NoConfigDir)?;
+        Ok(Self::with_dir(dir, true))
     }
 
-    /// Open a store in `dir`. `use_keychain` is ignored where no keychain
-    /// backend is compiled in.
+    /// A store in `dir`; `use_keychain` is ignored where there is none.
     pub fn with_dir(dir: PathBuf, use_keychain: bool) -> Self {
         Self {
             dir,
@@ -269,339 +148,187 @@ impl Store {
         }
     }
 
-    /// The config directory.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Path of the plain-text credentials file.
-    pub fn credentials_path(&self) -> PathBuf {
-        self.dir.join(CREDENTIALS_FILE)
-    }
-
-    fn hosts_path(&self) -> PathBuf {
-        self.dir.join(HOSTS_FILE)
-    }
-
-    /// Create the config dir at 0700, or check an existing one: it must be
-    /// ours, and anything looser than 0700 is tightened.
-    fn ensure_dir(&self) -> Result<(), StoreError> {
-        if self.dir.is_dir() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                let meta = fs::metadata(&self.dir)
-                    .map_err(io_err(format!("inspecting {}", self.dir.display())))?;
-                check_owner(meta.uid(), &self.dir)?;
-                if meta.permissions().mode() & 0o077 != 0 {
-                    fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
-                        .map_err(io_err(format!("securing {}", self.dir.display())))?;
+    /// `<origin>.toml` with everything outside `[A-Za-z0-9.-]` as `_`.
+    fn path(&self, origin: &str) -> PathBuf {
+        let name: String = origin
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                    c
+                } else {
+                    '_'
                 }
+            })
+            .collect();
+        self.dir.join(format!("{name}.toml"))
+    }
+
+    /// The device for `origin` and where it was found, if any.
+    pub fn load(&self, origin: &str) -> Result<Option<(StoredDevice, Location)>, StoreError> {
+        if self.use_keychain {
+            if let Some(text) = keychain::get(origin)?.map(Zeroizing::new) {
+                return Ok(parse(&text, origin, "keychain item")?.map(|d| (d, Location::Keychain)));
             }
-            return Ok(());
         }
+        let path = self.path(origin);
+        let mut file = match File::open(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            other => other.map_err(io_err(&path))?,
+        };
+        check_private(&file, &path)?;
+        let mut text = Zeroizing::new(String::new());
+        file.read_to_string(&mut text).map_err(io_err(&path))?;
+        Ok(parse(&text, origin, &path.display().to_string())?.map(|d| (d, Location::File(path))))
+    }
+
+    /// Save `device` for `origin`, in the keychain if possible, else in the
+    /// file, and remove any copy in the other place.
+    pub fn save(&self, origin: &str, device: &StoredDevice) -> Result<Location, StoreError> {
+        let record = Record {
+            origin: origin.into(),
+            device_id: device.device_id.clone(),
+            fingerprint: device.fingerprint.clone(),
+            name: device.name.clone(),
+            user_id: device.user_id.clone(),
+            user_name: device.user_name.clone(),
+            private_key: device.private_key.expose_secret().into(),
+        };
+        let text = Zeroizing::new(
+            toml::to_string(&record).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+        );
+        if self.use_keychain {
+            match keychain::set(origin, &text) {
+                Ok(()) => return self.remove_file(origin).map(|()| Location::Keychain),
+                Err(e) => tracing::warn!("{e}; storing the key in a file instead"),
+            }
+        }
+        self.ensure_dir()?;
+        let path = self.path(origin);
+        write_private(&path, text.as_bytes())?;
+        if self.use_keychain {
+            let _ = keychain::delete(origin);
+        }
+        Ok(Location::File(path))
+    }
+
+    /// Delete everything stored for `origin`.
+    pub fn remove(&self, origin: &str) -> Result<(), StoreError> {
+        if self.use_keychain {
+            keychain::delete(origin)?;
+        }
+        self.remove_file(origin)
+    }
+
+    fn remove_file(&self, origin: &str) -> Result<(), StoreError> {
+        let path = self.path(origin);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Create the config dir at 0700, or require an existing one to be ours
+    /// and tighten it to 0700.
+    fn ensure_dir(&self) -> Result<(), StoreError> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&self.dir)
-            .map_err(io_err(format!("creating {}", self.dir.display())))?;
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&self.dir).map_err(io_err(&self.dir))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
-                .map_err(io_err(format!("securing {}", self.dir.display())))?;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = fs::metadata(&self.dir).map_err(io_err(&self.dir))?;
+            check_owner(meta.uid(), &self.dir)?;
+            if meta.permissions().mode() & 0o077 != 0 {
+                fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
+                    .map_err(io_err(&self.dir))?;
+            }
         }
         Ok(())
     }
-
-    /// Take the exclusive lock, waiting for other processes to release it.
-    pub async fn lock(&self) -> Result<StoreLock, StoreError> {
-        let store = self.clone();
-        run_blocking(move || {
-            store.ensure_dir()?;
-            let path = store.dir.join(LOCK_FILE);
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let file = options
-                .open(&path)
-                .map_err(io_err(format!("opening {}", path.display())))?;
-            file.lock()
-                .map_err(io_err(format!("locking {}", path.display())))?;
-            Ok(StoreLock {
-                _file: std::sync::Arc::new(file),
-            })
-        })
-        .await
-    }
-
-    /// Metadata for `origin`, if logged in.
-    pub fn host(&self, origin: &str) -> Result<Option<HostEntry>, StoreError> {
-        Ok(self.read_hosts()?.hosts.remove(origin))
-    }
-
-    /// Load the secret for `origin` from the backend recorded in `kind`.
-    pub fn load_secret(&self, origin: &str, kind: StoreKind) -> Result<Option<Secret>, StoreError> {
-        match kind {
-            StoreKind::Keychain => {
-                let Some(text) = keychain::get(origin)? else {
-                    return Ok(None);
-                };
-                let text = Zeroizing::new(text);
-                let record: SecretRecord =
-                    toml::from_str(&text).map_err(|e| StoreError::Corrupt {
-                        path: format!("keychain item {KEYCHAIN_SERVICE}/{origin}"),
-                        reason: e.message().to_string(),
-                    })?;
-                Ok(Some(Secret::from(&record)))
-            }
-            StoreKind::File => Ok(self.read_credentials()?.hosts.get(origin).map(Secret::from)),
-        }
-    }
-
-    /// Persist `secret` and metadata for `origin`, durably, before returning.
-    ///
-    /// Tries the keychain first when enabled, falling back to the file. The
-    /// secret is written before `hosts.toml`, and a copy left in the other
-    /// backend is removed. Returns the backend actually used.
-    pub fn save(
-        &self,
-        origin: &str,
-        mut entry: HostEntry,
-        secret: &Secret,
-        _lock: &StoreLock,
-    ) -> Result<StoreKind, StoreError> {
-        self.ensure_dir()?;
-        let record = SecretRecord::from(secret);
-        let mut kind = StoreKind::File;
-        if self.use_keychain {
-            let text = Zeroizing::new(
-                toml::to_string(&record).map_err(|e| StoreError::Keychain(e.to_string()))?,
-            );
-            match keychain::set(origin, &text) {
-                Ok(()) => kind = StoreKind::Keychain,
-                Err(e) => tracing::warn!("{e}; falling back to the credentials file"),
-            }
-        }
-        match kind {
-            StoreKind::Keychain => {
-                let mut creds = self.read_credentials_lenient()?;
-                if creds.hosts.remove(origin).is_some() {
-                    self.write_credentials(&creds)?;
-                }
-            }
-            StoreKind::File => {
-                let mut creds = self.read_credentials_lenient()?;
-                creds.hosts.insert(origin.to_string(), record);
-                self.write_credentials(&creds)?;
-                if self.use_keychain {
-                    let _ = keychain::delete(origin);
-                }
-            }
-        }
-        entry.store = kind;
-        let mut hosts = self.read_hosts()?;
-        hosts.hosts.insert(origin.to_string(), entry);
-        self.write_hosts(&hosts)?;
-        Ok(kind)
-    }
-
-    /// Delete everything stored for `origin` (both backends and metadata).
-    ///
-    /// Works even when `credentials.toml` has loose permissions: the file is
-    /// rewritten fresh at 0600 without this origin's entry.
-    pub fn remove(&self, origin: &str, _lock: &StoreLock) -> Result<(), StoreError> {
-        if keychain::AVAILABLE {
-            keychain::delete(origin)?;
-        }
-        let mut creds = match self.read_credentials_checked(false) {
-            Err(StoreError::Corrupt { .. }) => CredentialsFile::default(),
-            other => other?,
-        };
-        if creds.hosts.remove(origin).is_some() {
-            self.write_credentials(&creds)?;
-        }
-        let mut hosts = self.read_hosts()?;
-        if hosts.hosts.remove(origin).is_some() {
-            self.write_hosts(&hosts)?;
-        }
-        Ok(())
-    }
-
-    fn read_hosts(&self) -> Result<HostsFile, StoreError> {
-        let path = self.hosts_path();
-        match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| StoreError::Corrupt {
-                path: path.display().to_string(),
-                reason: e.message().to_string(),
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HostsFile::default()),
-            Err(e) => Err(io_err(format!("reading {}", path.display()))(e)),
-        }
-    }
-
-    fn write_hosts(&self, hosts: &HostsFile) -> Result<(), StoreError> {
-        let text = toml::to_string(hosts).map_err(|e| StoreError::Corrupt {
-            path: self.hosts_path().display().to_string(),
-            reason: e.to_string(),
-        })?;
-        write_atomic(&self.hosts_path(), text.as_bytes())
-    }
-
-    fn read_credentials(&self) -> Result<CredentialsFile, StoreError> {
-        self.read_credentials_checked(true)
-    }
-
-    fn read_credentials_checked(&self, check_mode: bool) -> Result<CredentialsFile, StoreError> {
-        let path = self.credentials_path();
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CredentialsFile::default()),
-            Err(e) => return Err(io_err(format!("opening {}", path.display()))(e)),
-        };
-        if check_mode {
-            check_private(&file, &path)?;
-        }
-        let mut text = Zeroizing::new(String::new());
-        io::Read::read_to_string(&mut file, &mut text)
-            .map_err(io_err(format!("reading {}", path.display())))?;
-        // Parse errors from `toml` quote the offending input, which may be a
-        // token, so only the bare message is kept.
-        toml::from_str(&text).map_err(|e| StoreError::Corrupt {
-            path: path.display().to_string(),
-            reason: e.message().to_string(),
-        })
-    }
-
-    /// Read for rewriting: a file with loose permissions is still refused,
-    /// but a corrupt file is replaced rather than blocking login forever.
-    fn read_credentials_lenient(&self) -> Result<CredentialsFile, StoreError> {
-        match self.read_credentials() {
-            Err(StoreError::Corrupt { .. }) => Ok(CredentialsFile::default()),
-            other => other,
-        }
-    }
-
-    fn write_credentials(&self, creds: &CredentialsFile) -> Result<(), StoreError> {
-        let path = self.credentials_path();
-        if creds.hosts.is_empty() {
-            return match fs::remove_file(&path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                    Err(io_err(format!("removing {}", path.display()))(e))
-                }
-                _ => Ok(()),
-            };
-        }
-        let text = Zeroizing::new(toml::to_string(creds).map_err(|e| StoreError::Corrupt {
-            path: path.display().to_string(),
-            reason: e.to_string(),
-        })?);
-        write_atomic(&path, text.as_bytes())
-    }
 }
 
-/// The effective uid of this process.
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments, touches no memory we own, and
-    // cannot fail (POSIX.1-2008).
-    unsafe { libc::geteuid() }
+/// Parse a record; one saved for another origin counts as absent.
+fn parse(text: &str, origin: &str, source: &str) -> Result<Option<StoredDevice>, StoreError> {
+    // `toml` errors quote the input, which holds the key: keep none of it.
+    let record: Record = toml::from_str(text).map_err(|_| StoreError::Corrupt(source.into()))?;
+    Ok((record.origin == origin).then(|| StoredDevice {
+        device_id: record.device_id.clone(),
+        fingerprint: record.fingerprint.clone(),
+        name: record.name.clone(),
+        user_id: record.user_id.clone(),
+        user_name: record.user_name.clone(),
+        private_key: SecretString::from(record.private_key.clone()),
+    }))
 }
 
-/// Refuse a path owned by another user.
 #[cfg(unix)]
 fn check_owner(owner: u32, path: &Path) -> Result<(), StoreError> {
-    if owner != current_uid() {
-        return Err(StoreError::NotOwned {
-            path: path.display().to_string(),
-            owner,
-        });
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if owner != unsafe { libc::geteuid() } {
+        let why = format!(
+            "owned by another user (uid {owner}); set {CONFIG_DIR_ENV} to a directory you own"
+        );
+        return Err(StoreError::Insecure(path.display().to_string(), why));
     }
     Ok(())
 }
 
-/// Refuse a credentials file that another user owns, or that other users
-/// can read or write.
-#[cfg(unix)]
+/// Refuse a key file another user owns or can read or write.
 fn check_private(file: &File, path: &Path) -> Result<(), StoreError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = file
-        .metadata()
-        .map_err(io_err(format!("inspecting {}", path.display())))?;
-    check_owner(meta.uid(), path)?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(StoreError::InsecurePermissions {
-            path: path.display().to_string(),
-            mode,
-        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = file.metadata().map_err(io_err(path))?;
+        check_owner(meta.uid(), path)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let why = format!(
+                "other users can access it (mode {mode:o}); run `chmod 600` on it or log in again"
+            );
+            return Err(StoreError::Insecure(path.display().to_string(), why));
+        }
     }
+    let _ = (file, path);
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn check_private(_file: &File, _path: &Path) -> Result<(), StoreError> {
-    Ok(())
-}
-
-/// Write `contents` to `path` via a 0600 temp file in the same directory,
-/// fsync, rename, and fsync the directory, so a crash leaves either the old
-/// or the new file, never a torn one.
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
-    let dir = path.parent().ok_or(StoreError::NoConfigDir)?;
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+/// Write a 0600 temp file next to `path`, fsync, rename over `path`, so a
+/// crash leaves the old or the new file, never a torn one.
+fn write_private(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&tmp)?;
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let result = options.open(&tmp).and_then(|mut file| {
         file.write_all(contents)?;
         file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        File::open(dir)?.sync_all()?;
-        Ok(())
-    })();
+        fs::rename(&tmp, path)
+    });
     result.map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        io_err(format!("writing {}", path.display()))(e)
+        io_err(path)(e)
     })
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod keychain {
     use super::{StoreError, KEYCHAIN_SERVICE};
+    use keyring::{Entry, Error};
 
     pub const AVAILABLE: bool = true;
 
-    fn entry(origin: &str) -> Result<keyring::Entry, StoreError> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, origin)
-            .map_err(|e| StoreError::Keychain(e.to_string()))
+    fn entry(origin: &str) -> Result<Entry, StoreError> {
+        Entry::new(KEYCHAIN_SERVICE, origin).map_err(|e| StoreError::Keychain(e.to_string()))
     }
 
     pub fn get(origin: &str) -> Result<Option<String>, StoreError> {
         match entry(origin)?.get_password() {
             Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(Error::NoEntry) => Ok(None),
             Err(e) => Err(StoreError::Keychain(e.to_string())),
         }
     }
@@ -614,29 +341,28 @@ mod keychain {
 
     pub fn delete(origin: &str) -> Result<(), StoreError> {
         match entry(origin)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(StoreError::Keychain(e.to_string())),
         }
     }
 }
 
+/// No keychain: `use_keychain` is always false, so these are never called.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod keychain {
     use super::StoreError;
 
     pub const AVAILABLE: bool = false;
 
-    pub fn get(_origin: &str) -> Result<Option<String>, StoreError> {
+    pub fn get(_: &str) -> Result<Option<String>, StoreError> {
         Ok(None)
     }
 
-    pub fn set(_origin: &str, _value: &str) -> Result<(), StoreError> {
-        Err(StoreError::Keychain(
-            "no keychain backend on this platform".to_string(),
-        ))
+    pub fn set(_: &str, _: &str) -> Result<(), StoreError> {
+        Err(StoreError::Keychain("no keychain on this platform".into()))
     }
 
-    pub fn delete(_origin: &str) -> Result<(), StoreError> {
+    pub fn delete(_: &str) -> Result<(), StoreError> {
         Ok(())
     }
 }
@@ -644,22 +370,17 @@ mod keychain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    fn secret(key: &str) -> Secret {
-        Secret {
+    const API: &str = "https://api.example.com";
+
+    fn device(key: &str) -> StoredDevice {
+        StoredDevice {
+            device_id: "d".into(),
+            fingerprint: "f".into(),
+            name: "n".into(),
+            user_id: "u".into(),
+            user_name: "U".into(),
             private_key: SecretString::from(key.to_string()),
-        }
-    }
-
-    fn entry(device_id: &str) -> HostEntry {
-        HostEntry {
-            device_id: device_id.to_string(),
-            fingerprint: "9F3C-21AB-77D0-4E18".to_string(),
-            name: "videocall-cli on test".to_string(),
-            user_id: "alice@example.com".to_string(),
-            user_name: "Alice".to_string(),
-            store: StoreKind::File,
         }
     }
 
@@ -669,147 +390,64 @@ mod tests {
         (tmp, store)
     }
 
-    #[tokio::test]
-    async fn round_trip_file_store() {
-        let (_tmp, store) = file_store();
-        let lock = store.lock().await.unwrap();
-        let kind = store
-            .save(
-                "https://api.example.com",
-                entry("dev-a"),
-                &secret("seed-a1"),
-                &lock,
-            )
-            .unwrap();
-        assert_eq!(kind, StoreKind::File);
-        drop(lock);
-
-        let host = store.host("https://api.example.com").unwrap().unwrap();
-        assert_eq!(host.device_id, "dev-a");
-        assert_eq!(host.user_name, "Alice");
-        assert_eq!(host.store, StoreKind::File);
-        let loaded = store
-            .load_secret("https://api.example.com", host.store)
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.private_key.expose_secret(), "seed-a1");
-
-        // Metadata never carries the secret.
-        let hosts = fs::read_to_string(store.dir().join(HOSTS_FILE)).unwrap();
-        assert!(!hosts.contains("seed-a1"));
-
-        let lock = store.lock().await.unwrap();
-        store.remove("https://api.example.com", &lock).unwrap();
-        assert!(store.host("https://api.example.com").unwrap().is_none());
-        assert!(!store.credentials_path().exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn file_store_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_tmp, store) = file_store();
-        let lock = store.lock().await.unwrap();
-        store
-            .save("https://h", entry("u"), &secret("r"), &lock)
-            .unwrap();
-        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(store.dir()), 0o700);
-        assert_eq!(mode(&store.credentials_path()), 0o600);
-        // No temp files left behind.
-        let leftovers: Vec<_> = fs::read_dir(store.dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn tightens_an_existing_loose_config_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_tmp, store) = file_store();
-        fs::create_dir_all(store.dir()).unwrap();
-        fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
-        let _lock = store.lock().await.unwrap();
-        let mode = fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[cfg(unix)]
     #[test]
-    fn owner_check() {
-        let path = Path::new("/x");
-        assert!(check_owner(current_uid(), path).is_ok());
-        let other = current_uid().wrapping_add(1);
-        assert!(matches!(
-            check_owner(other, path),
-            Err(StoreError::NotOwned { owner, .. }) if owner == other
-        ));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn refuses_world_readable_credentials() {
-        use std::os::unix::fs::PermissionsExt;
+    fn round_trip_per_origin() {
         let (_tmp, store) = file_store();
-        let lock = store.lock().await.unwrap();
+        assert!(store.load(API).unwrap().is_none());
+        store.save(API, &device("seed-a")).unwrap();
         store
-            .save("https://h", entry("u"), &secret("r"), &lock)
+            .save("http://localhost:8081", &device("seed-b"))
             .unwrap();
-        fs::set_permissions(store.credentials_path(), fs::Permissions::from_mode(0o644)).unwrap();
-        let err = store.load_secret("https://h", StoreKind::File).unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::InsecurePermissions { mode: 0o644, .. }
-        ));
-        // Writes refuse too, rather than silently rewriting a leaked file.
-        assert!(store
-            .save("https://h", entry("u"), &secret("r2"), &lock)
-            .is_err());
-        // Logout still works and leaves nothing behind.
-        store.remove("https://h", &lock).unwrap();
-        assert!(!store.credentials_path().exists());
-    }
+        let (a, location) = store.load(API).unwrap().unwrap();
+        assert_eq!(a.private_key.expose_secret(), "seed-a");
+        assert_eq!(location, Location::File(store.path(API)));
+        assert!(!format!("{a:?}").contains("seed-a"));
+        store.remove(API).unwrap();
+        assert!(store.load(API).unwrap().is_none());
+        let (b, _) = store.load("http://localhost:8081").unwrap().unwrap();
+        assert_eq!(b.private_key.expose_secret(), "seed-b");
 
-    #[tokio::test]
-    async fn profiles_are_keyed_by_origin() {
-        let (_tmp, store) = file_store();
-        let lock = store.lock().await.unwrap();
-        store
-            .save("https://a.example", entry("ua"), &secret("ra"), &lock)
-            .unwrap();
-        store
-            .save("http://localhost:8081", entry("ub"), &secret("rb"), &lock)
-            .unwrap();
-        let a = store
-            .load_secret("https://a.example", StoreKind::File)
-            .unwrap()
-            .unwrap();
-        let b = store
-            .load_secret("http://localhost:8081", StoreKind::File)
-            .unwrap()
-            .unwrap();
-        assert_eq!(a.private_key.expose_secret(), "ra");
-        assert_eq!(b.private_key.expose_secret(), "rb");
-
-        store.remove("https://a.example", &lock).unwrap();
-        assert!(store.host("https://a.example").unwrap().is_none());
+        // Origins that map to the same file name never share a key.
         assert_eq!(
-            store
-                .host("http://localhost:8081")
-                .unwrap()
-                .unwrap()
-                .device_id,
-            "ub"
+            store.path("https://a-b.example"),
+            store.path("https_//a-b.example")
         );
+        store
+            .save("https://a-b.example", &device("seed-c"))
+            .unwrap();
+        assert!(store.load("https_//a-b.example").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissions_and_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, store) = file_store();
+        fs::create_dir_all(&store.dir).unwrap();
+        fs::set_permissions(&store.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        store.save(API, &device("seed-a")).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store.dir), 0o700, "a loose config dir is tightened");
+        assert_eq!(mode(&store.path(API)), 0o600);
+
+        fs::set_permissions(store.path(API), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(store.load(API), Err(StoreError::Insecure(..))));
+        store.remove(API).unwrap();
+        assert!(!store.path(API).exists(), "logout still works");
+
+        assert!(check_owner(unsafe { libc::geteuid() }.wrapping_add(1), Path::new("/x")).is_err());
     }
 
     #[test]
-    fn secret_debug_is_redacted() {
-        let s = format!("{:?}", secret("private-seed-value"));
-        assert!(!s.contains("private-seed-value"));
+    fn corrupt_record_error_hides_contents() {
+        let (_tmp, store) = file_store();
+        store.save(API, &device("seed-a")).unwrap();
+        fs::write(store.path(API), "private_key = \"seed-a\"\nbroken").unwrap();
+        let err = store.load(API).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(_)) && !err.to_string().contains("seed-a"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -819,33 +457,26 @@ mod tests {
                 pairs
                     .iter()
                     .find(|(key, _)| *key == k)
-                    .map(|(_, v)| OsString::from(v))
+                    .map(|(_, v)| v.to_string())
             }
         };
         let home = Some(PathBuf::from("/home/u"));
+        let at = |pairs, windows| config_dir_from(env(pairs), home.clone(), windows);
         assert_eq!(
-            config_dir_from(
-                env(&[(CONFIG_DIR_ENV, "/x"), ("XDG_CONFIG_HOME", "/y")]),
-                home.clone(),
-                false
-            ),
-            Some(PathBuf::from("/x"))
+            at(&[(CONFIG_DIR_ENV, "/x"), ("XDG_CONFIG_HOME", "/y")], false),
+            Some("/x".into())
         );
         assert_eq!(
-            config_dir_from(env(&[("XDG_CONFIG_HOME", "/y")]), home.clone(), false),
-            Some(PathBuf::from("/y/videocall"))
+            at(&[("XDG_CONFIG_HOME", "/y")], false),
+            Some("/y/videocall".into())
         );
         assert_eq!(
-            config_dir_from(env(&[("APPDATA", "C:\\AppData")]), home.clone(), true),
-            Some(PathBuf::from("C:\\AppData").join("videocall"))
+            at(&[("APPDATA", "/a")], true),
+            Some(PathBuf::from("/a").join("videocall"))
         );
         assert_eq!(
-            config_dir_from(env(&[("APPDATA", "C:\\AppData")]), home.clone(), false),
-            Some(PathBuf::from("/home/u/.config/videocall"))
-        );
-        assert_eq!(
-            config_dir_from(env(&[(CONFIG_DIR_ENV, "")]), home, false),
-            Some(PathBuf::from("/home/u/.config/videocall"))
+            at(&[("APPDATA", "/a"), (CONFIG_DIR_ENV, "")], false),
+            Some("/home/u/.config/videocall".into())
         );
         assert_eq!(config_dir_from(env(&[]), None, false), None);
     }

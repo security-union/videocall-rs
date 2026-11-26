@@ -1,6 +1,6 @@
 /**
  * The device half of `videocall-cli auth login`, reimplemented with Node
- * `crypto` so E2E tests can drive meeting-api's device pages without the CLI.
+ * `crypto` so E2E tests can drive the device login without the CLI.
  *
  * Wire formats mirror `videocall-meeting-types/src/device.rs` and
  * `meeting-api/src/device_auth.rs`:
@@ -15,14 +15,17 @@ import type { AddressInfo } from "net";
 /** meeting-api's public origin. Must equal the stack's DEVICE_TOKEN_AUDIENCE. */
 export const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 
-/** The remote-login redirect_uri: `{api origin}/cli/code`. */
-export const REMOTE_REDIRECT_URI = `${API_URL}/cli/code`;
+/** The app origin, which hosts /devices and /devices/authorize. */
+export const UI_URL = process.env.DIOXUS_UI_URL || "http://localhost:3001";
+
+/** The remote-login redirect_uri: the app shows the code instead of redirecting. */
+export const REMOTE_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob";
 
 const CLI_ISSUER = "videocall-cli";
 
 export interface DeviceKey {
   privateKey: KeyObject;
-  /** base64url of the 32 raw public key bytes, as `/cli/authorize` expects. */
+  /** base64url of the 32 raw public key bytes, as the authorize link carries it. */
   publicKey: string;
   /** `XXXX-XXXX-XXXX-XXXX`, what the consent page and /devices display. */
   fingerprint: string;
@@ -52,6 +55,11 @@ export function generatePkce(): Pkce {
   return { verifier, challenge };
 }
 
+/** The CLI's `state`: 32 random bytes, base64url. */
+export function generateState(): string {
+  return randomBytes(32).toString("base64url");
+}
+
 /** A device name inside the allowed alphabet, unique per call. */
 export function uniqueDeviceName(prefix = "e2e-cli"): string {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
@@ -66,22 +74,22 @@ export interface AuthorizeParams {
   publicKey: string;
   deviceName: string;
   codeChallenge: string;
-  state?: string;
-  redirectUri?: string;
+  state: string;
+  redirectUri: string;
 }
 
-export function authorizeUrl(params: AuthorizeParams): string {
-  const query = new URLSearchParams({
+/** The query the CLI puts on its authorize link. */
+export function authorizeQuery(params: AuthorizeParams): string {
+  return new URLSearchParams({
     response_type: "code",
     client_id: "videocall-cli",
-    redirect_uri: params.redirectUri ?? REMOTE_REDIRECT_URI,
+    redirect_uri: params.redirectUri,
     code_challenge: params.codeChallenge,
     code_challenge_method: "S256",
-    state: params.state ?? randomBytes(16).toString("base64url"),
+    state: params.state,
     public_key: params.publicKey,
     device_name: params.deviceName,
-  });
-  return `${API_URL}/cli/authorize?${query.toString()}`;
+  }).toString();
 }
 
 function signJws(

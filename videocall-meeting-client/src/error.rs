@@ -16,10 +16,7 @@
 use thiserror::Error;
 
 /// Errors returned by [`MeetingApiClient`](crate::MeetingApiClient) methods.
-///
-/// Non-exhaustive: match with a wildcard arm so new variants aren't breaking.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum ApiError {
     /// The session JWT is missing, expired, or invalid (HTTP 401).
     #[error("Not authenticated. Please log in.")]

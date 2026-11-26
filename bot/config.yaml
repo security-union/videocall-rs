@@ -2,10 +2,7 @@
 # This configuration creates multiple clients with different audio/video settings
 
 ramp_up_delay_ms: 1000  # 1 second delay between client starts
-# Local relay by default. The bot signs room tokens with JWT_SECRET from the
-# environment, so point it only at a deployment whose secret you hold.
-server_url: "https://127.0.0.1:4433"
-insecure: true  # local relay uses a self-signed certificate
+server_url: "https://webtransport-us-east.webtransport.video"
 
 clients:
   # Audio-only client

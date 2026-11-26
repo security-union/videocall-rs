@@ -95,7 +95,6 @@ videocall.rs is composed of two independent services that communicate through a 
 - Validates the room access token on every connection attempt (`/lobby?token=<JWT>` is the only connection path)
 - Extracts identity, room, and permissions from the JWT claims
 - **Rejects connections without a valid, signed token**
-- Has no login routes of its own and reads no OAuth configuration; meeting-api owns login
 - Does not create, manage, or track meetings -- it is stateless with respect to meeting lifecycle
 - Relays media via NATS pub/sub
 
@@ -135,7 +134,7 @@ The system uses two separate JWTs with different purposes and delivery mechanism
 | **Session JWT** | Authenticates user to the Meeting Backend | `Set-Cookie` (HttpOnly, Secure, SameSite=Lax) or `Authorization: Bearer` | Configurable (default: long-lived) | Yes (cookie) |
 | **Room Access JWT** | Authorizes room join on the Media Server | JSON response body | Configurable TTL (short) | N/A |
 
-`videocall-cli` uses a third kind, a **device JWT** (`alg: EdDSA`, sent as `Authorization: Bearer`). The CLI signs it for every request with a per-machine private key that the user approved in the browser; the server keeps only the public key. It is accepted on get meeting, join and status only; every other meeting endpoint returns 403 `BROWSER_SESSION_REQUIRED`, and its room token is never a host token. See [CLI Device Authentication](MEETING_API.md#cli-device-authentication).
+`videocall-cli` uses a third kind, a **device JWT** signed by a per-machine key the user approved in the web app. It works only on get meeting, join and status, and never yields a host token. See [CLI Device Authentication](MEETING_API.md#cli-device-authentication).
 
 ### Session JWT Claims
 
@@ -183,7 +182,7 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
 | `JWT_SECRET` | Yes | -- | Shared HMAC-SHA256 secret (must match Media Server) |
 | `LISTEN_ADDR` | No | `0.0.0.0:8081` | HTTP bind address |
-| `TOKEN_TTL_SECS` | No | `60` | Room access token lifetime (seconds); CLI devices get at most 300 |
+| `TOKEN_TTL_SECS` | No | `600` | Room access token lifetime (seconds) |
 | `SESSION_TTL_SECS` | No | `315360000` (~10y) | Session JWT lifetime (seconds) |
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
@@ -200,12 +199,6 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated OAuth scopes |
 | `AFTER_LOGIN_URL` | No | `/` | Redirect target after successful OAuth login |
 | `DEVICE_TOKEN_AUDIENCE` | No | -- | meeting-api's public origin (e.g. `https://api.videocall.rs`); `aud` of device JWTs. Unset disables CLI device login |
-| `TRUST_X_FORWARDED_FOR` | No | `false` | Take the requester IP from the right-most `X-Forwarded-For` entry |
-| `DEVICE_IDLE_TTL_SECS` | No | `7776000` (90d) | CLI device expires after this long unused |
-| `DEVICE_ABS_TTL_SECS` | No | `31536000` (365d) | CLI device expires this long after approval |
-| `DEVICE_MAX_PER_USER` | No | `10` | Live CLI devices per account |
-| `DEVICE_MAX_PENDING` | No | `10000` | CLI login requests still awaiting a decision, globally |
-| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | CLI login requests awaiting a decision per IPv4 address or IPv6 /64; skipped for private, loopback or unknown addresses |
 
 ---
 

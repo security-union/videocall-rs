@@ -22,15 +22,4 @@ pub trait CameraSynk {
         &self,
         data: Vec<u8>,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
-
-    /// Resolves, with a reason, once the connection behind this sink is gone
-    /// for good. Sinks without a connection never resolve.
-    fn lost(&self) -> impl std::future::Future<Output = String> + Send {
-        std::future::pending()
-    }
-
-    /// Close the connection cleanly, if there is one.
-    fn close(&self) -> impl std::future::Future<Output = ()> + Send {
-        std::future::ready(())
-    }
 }

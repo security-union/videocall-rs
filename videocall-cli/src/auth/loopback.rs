@@ -16,12 +16,14 @@
  * conditions.
  */
 
-//! Loopback browser login (RFC 8252 §7.3) with PKCE (RFC 7636).
+//! Loopback browser login (RFC 8252 section 7.3) with PKCE (RFC 7636).
 //!
-//! The CLI listens on `127.0.0.1:{ephemeral}`, opens
-//! `{api}/cli/authorize?...` in the browser, and waits for the one redirect
-//! to `http://127.0.0.1:{port}/callback?code=…&state=…`. The listener
-//! accepts exactly one `/callback` request and is closed afterwards.
+//! Rules: bind `127.0.0.1` only; only `GET /callback?…` is considered;
+//! `state` is compared first, in constant time; a request without our
+//! `state` gets a page and is otherwise ignored (it neither uses up the one
+//! callback nor ends the login); exactly one callback with our `state` is
+//! processed; `error=access_denied` means cancelled; no input is reflected;
+//! the wait ends after [`LOGIN_TIMEOUT`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,34 +38,29 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use videocall_meeting_types::device::RedirectUri;
 
 use super::random_b64url;
 
-/// How long the user has to finish the browser login.
+/// How long the human has to finish in the browser.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// Largest request head we read from the browser.
-const MAX_REQUEST_HEAD: usize = 8 * 1024;
-
-/// How long one connection may take to send its request line.
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A PKCE S256 verifier and its challenge.
 pub struct Pkce {
-    /// The secret verifier, sent only to the token endpoint.
+    /// Sent only in the code exchange.
     pub verifier: SecretString,
-    /// `BASE64URL(SHA256(verifier))`, sent to the authorize endpoint.
+    /// `BASE64URL(SHA256(verifier))`, sent in the authorize URL.
     pub challenge: String,
 }
 
 impl Pkce {
-    /// Generate a fresh verifier from 32 CSPRNG bytes (43 characters).
+    /// A verifier from 32 CSPRNG bytes (43 characters).
     pub fn generate() -> Result<Self, getrandom::Error> {
         Ok(Self::from_verifier(random_b64url(32)?))
     }
 
     fn from_verifier(verifier: String) -> Self {
-        let challenge = s256_challenge(&verifier);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         Self {
             verifier: SecretString::from(verifier),
             challenge,
@@ -71,84 +68,40 @@ impl Pkce {
     }
 }
 
-/// `BASE64URL-ENCODE(SHA256(ASCII(verifier)))` (RFC 7636 §4.2).
-pub fn s256_challenge(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
-/// Generate an OAuth `state` value: 32 CSPRNG bytes, base64url (43 chars).
-pub fn generate_state() -> Result<String, getrandom::Error> {
-    random_b64url(32)
-}
-
-/// Why the loopback login did not produce a code.
+/// Why the loopback login produced no code.
 #[derive(Debug, thiserror::Error)]
 pub enum LoopbackError {
-    /// The `state` on the callback was missing, duplicated, or not ours.
-    /// Such a request is answered with an error page and ignored; it never
-    /// ends the login (any local web page can send one).
-    #[error("callback does not belong to this login attempt (state mismatch)")]
-    StateMismatch,
-    /// Our `state`, but no `code` (or a duplicated one).
-    #[error("the browser returned an incomplete login response; try again")]
-    Malformed,
-    /// The user cancelled at the identity provider (`error=access_denied`).
-    #[error("login cancelled in the browser")]
+    #[error("login cancelled in the browser. Nothing was saved.")]
     Cancelled,
-    /// The server redirected with another OAuth `error` parameter.
-    #[error("login was refused by the server ({0})")]
-    Denied(String),
-    /// The user did not finish within [`LOGIN_TIMEOUT`].
-    #[error("timed out waiting for the browser login to finish")]
+    #[error("the browser returned a failed or incomplete login; try again")]
+    Malformed,
+    #[error("timed out waiting for the browser")]
     Timeout,
-    /// The local listener failed.
     #[error("local callback server failed: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// What a request to the loopback listener asked for.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Route<'a> {
-    /// `GET /callback?{query}`.
-    Callback(&'a str),
-    /// Anything else (favicon, scanners, other methods).
-    NotFound,
+/// What one request to the listener means.
+#[derive(Debug)]
+enum Outcome {
+    /// Not ours (wrong path, or no matching `state`): answer, keep waiting.
+    Ignored,
+    /// Ours: ends the login.
+    Done(Result<SecretString, LoopbackError>),
 }
 
-/// Parse an HTTP request line (`GET /callback?x HTTP/1.1`) into a [`Route`].
-pub(crate) fn route(request_line: &str) -> Route<'_> {
-    let mut parts = request_line.split(' ');
-    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+/// Judge one request line, e.g. `GET /callback?code=…&state=… HTTP/1.1`.
+fn judge(request_line: &str, expected_state: &str) -> Outcome {
+    let Some(query) = request_line
+        .strip_prefix("GET /callback?")
+        .and_then(|rest| {
+            rest.strip_suffix(" HTTP/1.1")
+                .or_else(|| rest.strip_suffix(" HTTP/1.0"))
+        })
     else {
-        return Route::NotFound;
+        return Outcome::Ignored;
     };
-    if method != "GET" || !version.starts_with("HTTP/1.") || parts.next().is_some() {
-        return Route::NotFound;
-    }
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path == "/callback" {
-        Route::Callback(query)
-    } else {
-        Route::NotFound
-    }
-}
-
-/// Validate the callback query and return the authorization code.
-///
-/// `state` is checked first, in constant time, before anything else in the
-/// request is honoured (including `error=`): a missing, duplicated, or wrong
-/// `state` gives [`LoopbackError::StateMismatch`]. With our `state`,
-/// `error=access_denied` is [`LoopbackError::Cancelled`], any other `error`
-/// is [`LoopbackError::Denied`] (only a short, well-formed code is echoed,
-/// to the terminal), and a missing or duplicated `code` is
-/// [`LoopbackError::Malformed`].
-pub(crate) fn parse_callback_query(
-    query: &str,
-    expected_state: &str,
-) -> Result<SecretString, LoopbackError> {
-    let mut codes = Vec::new();
-    let mut states = Vec::new();
-    let mut errors = Vec::new();
+    let (mut codes, mut states, mut errors) = (Vec::new(), Vec::new(), Vec::new());
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
             "code" => codes.push(value.into_owned()),
@@ -157,63 +110,25 @@ pub(crate) fn parse_callback_query(
             _ => {}
         }
     }
-    let [state] = states.as_slice() else {
-        return Err(LoopbackError::StateMismatch);
-    };
-    if !bool::from(state.as_bytes().ct_eq(expected_state.as_bytes())) {
-        return Err(LoopbackError::StateMismatch);
+    match states.as_slice() {
+        [state] if bool::from(state.as_bytes().ct_eq(expected_state.as_bytes())) => {}
+        _ => return Outcome::Ignored,
     }
-    if let Some(error) = errors.first() {
-        if error == "access_denied" {
-            return Err(LoopbackError::Cancelled);
-        }
-        let printable = error.len() <= 64
-            && !error.is_empty()
-            && error.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
-        return Err(LoopbackError::Denied(if printable {
-            error.clone()
-        } else {
-            "unknown error".to_string()
-        }));
-    }
-    match codes.as_slice() {
-        [code] if !code.is_empty() => Ok(SecretString::from(code.clone())),
+    Outcome::Done(match (errors.as_slice(), codes.as_slice()) {
+        ([error], _) if error == "access_denied" => Err(LoopbackError::Cancelled),
+        ([], [code]) if !code.is_empty() => Ok(SecretString::from(code.clone())),
         _ => Err(LoopbackError::Malformed),
-    }
+    })
 }
 
-const PAGE_HEAD: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
-<title>videocall-cli</title><style>body{font-family:system-ui,sans-serif;\
-max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}</style></head><body>";
-
-fn foreign_page() -> String {
-    format!(
-        "{PAGE_HEAD}<h1>Not part of a login</h1><p>This request doesn't match the \
-         login in progress and was ignored.</p></body></html>"
-    )
-}
-
-fn success_page() -> String {
-    format!(
-        "{PAGE_HEAD}<h1>Almost done</h1><p>Return to your terminal to finish logging \
-         in. You can close this tab.</p></body></html>"
-    )
-}
-
-fn error_page() -> String {
-    format!(
-        "{PAGE_HEAD}<h1>Login failed</h1><p>Go back to the terminal for details, \
-         then run <code>videocall-cli auth login</code> again.</p></body></html>"
-    )
-}
-
-async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+async fn respond(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>videocall-cli</title>\
+         <p style=\"font-family:system-ui;margin:4rem auto;max-width:32rem\">{message}</p>"
+    );
     let response = format!(
-        "HTTP/1.1 {status}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-store\r\n\
-         Referrer-Policy: no-referrer\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
@@ -222,107 +137,84 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.shutdown().await;
 }
 
-/// Read up to the end of the request line. Returns `None` on timeout,
-/// oversize, or a non-UTF-8 line.
+/// The request line, or `None` after 10 s, 8 KiB, or non-UTF-8 input.
 async fn read_request_line(stream: &mut TcpStream) -> Option<String> {
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
+    let mut buf = Vec::new();
     let read = async {
         loop {
-            let n = stream.read(&mut chunk).await.ok()?;
-            if n == 0 {
-                return None;
-            }
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.ok().filter(|&n| n > 0)?;
             buf.extend_from_slice(&chunk[..n]);
             if let Some(end) = buf.windows(2).position(|w| w == b"\r\n") {
                 return String::from_utf8(buf[..end].to_vec()).ok();
             }
-            if buf.len() > MAX_REQUEST_HEAD {
+            if buf.len() > 8 * 1024 {
                 return None;
             }
         }
     };
-    tokio::time::timeout(REQUEST_READ_TIMEOUT, read)
+    tokio::time::timeout(Duration::from_secs(10), read)
         .await
         .ok()
         .flatten()
 }
 
-/// A bound loopback listener waiting for one `/callback` request.
+/// A listener on `127.0.0.1:{ephemeral}` waiting for one callback.
 pub struct LoopbackServer {
     listener: TcpListener,
     port: u16,
 }
 
 impl LoopbackServer {
-    /// Bind `127.0.0.1` on an ephemeral port.
     pub async fn bind() -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let port = listener.local_addr()?.port();
         Ok(Self { listener, port })
     }
 
-    /// `http://127.0.0.1:{port}/callback`, the exact spelling the server
-    /// requires.
+    /// `http://127.0.0.1:{port}/callback`, the spelling the server requires.
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}/callback", self.port)
+        RedirectUri::Loopback { port: self.port }.as_uri()
     }
 
-    /// Serve until the first `/callback` request (or `timeout`), reply with a
-    /// small page, and close the listener.
-    ///
-    /// Other paths get a 404 and do not end the wait, so a browser's
-    /// speculative connection or a favicon request can't block or abort the
-    /// login. Exactly one `/callback` is processed; later ones get the error
-    /// page.
+    /// Serve until our callback arrives or `timeout` passes, then close.
     pub async fn wait_for_code(
         self,
         expected_state: &str,
         timeout: Duration,
     ) -> Result<SecretString, LoopbackError> {
-        let (tx, mut rx) = mpsc::channel::<Result<SecretString, LoopbackError>>(1);
+        let (tx, mut rx) = mpsc::channel(1);
         let claimed = Arc::new(AtomicBool::new(false));
         let state: Arc<str> = Arc::from(expected_state);
         let mut connections = JoinSet::new();
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
-
         let result = loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    let (mut stream, _) = match accepted {
-                        Ok(pair) => pair,
+                    let mut stream = match accepted {
+                        Ok((stream, _)) => stream,
                         Err(e) => break Err(LoopbackError::Io(e)),
                     };
-                    let tx = tx.clone();
-                    let claimed = claimed.clone();
-                    let state = state.clone();
+                    let (tx, claimed, state) = (tx.clone(), claimed.clone(), state.clone());
                     connections.spawn(async move {
-                        let Some(line) = read_request_line(&mut stream).await else {
-                            return;
-                        };
-                        let Route::Callback(query) = route(&line) else {
-                            respond(&mut stream, "404 Not Found", "Not found").await;
-                            return;
-                        };
-                        let outcome = parse_callback_query(query, &state);
-                        // Without our `state` the request proves nothing:
-                        // answer it, but don't let it use up the one
-                        // callback or end the login.
-                        if matches!(outcome, Err(LoopbackError::StateMismatch)) {
-                            respond(&mut stream, "400 Bad Request", &foreign_page()).await;
-                            return;
+                        let Some(line) = read_request_line(&mut stream).await else { return };
+                        match judge(&line, &state) {
+                            Outcome::Ignored => {
+                                respond(&mut stream, "404 Not Found", "This request is not part of a login in progress and was ignored.").await;
+                            }
+                            Outcome::Done(_) if claimed.swap(true, Ordering::SeqCst) => {
+                                respond(&mut stream, "400 Bad Request", "This login has already finished.").await;
+                            }
+                            Outcome::Done(outcome) => {
+                                let message = match outcome {
+                                    Ok(_) => "Return to your terminal to finish logging in. You can close this tab.",
+                                    Err(_) => "Login did not finish. Go back to your terminal for details.",
+                                };
+                                respond(&mut stream, if outcome.is_ok() { "200 OK" } else { "400 Bad Request" }, message).await;
+                                let _ = tx.send(outcome).await;
+                            }
                         }
-                        if claimed.swap(true, Ordering::SeqCst) {
-                            respond(&mut stream, "400 Bad Request", &error_page()).await;
-                            return;
-                        }
-                        let (status, page) = match outcome {
-                            Ok(_) => ("200 OK", success_page()),
-                            Err(_) => ("400 Bad Request", error_page()),
-                        };
-                        respond(&mut stream, status, &page).await;
-                        let _ = tx.send(outcome).await;
                     });
                 }
                 Some(outcome) = rx.recv() => break outcome,
@@ -330,7 +222,6 @@ impl LoopbackServer {
             }
         };
         connections.abort_all();
-        drop(self.listener);
         result
     }
 }
@@ -349,101 +240,46 @@ mod tests {
             pkce.challenge,
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+        assert_eq!(Pkce::generate().unwrap().verifier.expose_secret().len(), 43);
     }
 
     #[test]
-    fn generated_values_fit_server_limits() {
-        let pkce = Pkce::generate().unwrap();
-        let v = pkce.verifier.expose_secret();
-        assert_eq!(v.len(), 43);
-        assert!(v
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
-        assert_eq!(pkce.challenge.len(), 43);
-        let state = generate_state().unwrap();
-        assert!((16..=128).contains(&state.len()));
-        assert!(state.bytes().all(|b| b.is_ascii_graphic()));
-        assert_ne!(state, generate_state().unwrap());
-    }
-
-    #[test]
-    fn routes() {
+    fn judging_requests() {
+        let s = STATE;
+        let ignored = [
+            "GET /favicon.ico HTTP/1.1".to_string(),
+            format!("POST /callback?code=a&state={s} HTTP/1.1"),
+            format!("GET /callback/x?code=a&state={s} HTTP/1.1"),
+            "GET /callback?code=a&state=state-XXXXXXXXXXXXXXXX HTTP/1.1".into(),
+            "GET /callback?code=a HTTP/1.1".into(),
+            format!("GET /callback?code=a&state={s}&state={s} HTTP/1.1"),
+            "GET /callback?error=access_denied HTTP/1.1".into(),
+        ];
+        for line in ignored {
+            assert!(matches!(judge(&line, s), Outcome::Ignored), "{line}");
+        }
+        let done = |q: &str| match judge(&format!("GET /callback?{q} HTTP/1.1"), s) {
+            Outcome::Done(result) => result,
+            Outcome::Ignored => panic!("{q} ignored"),
+        };
         assert_eq!(
-            route("GET /callback?code=a&state=b HTTP/1.1"),
-            Route::Callback("code=a&state=b")
+            done(&format!("code=abc&state={s}"))
+                .unwrap()
+                .expose_secret(),
+            "abc"
         );
-        assert_eq!(route("GET /callback HTTP/1.1"), Route::Callback(""));
-        assert_eq!(route("GET /favicon.ico HTTP/1.1"), Route::NotFound);
-        assert_eq!(route("GET /callback/x?code=a HTTP/1.1"), Route::NotFound);
-        assert_eq!(route("POST /callback?code=a HTTP/1.1"), Route::NotFound);
-        assert_eq!(route("GET /callback"), Route::NotFound);
-        assert_eq!(route("garbage"), Route::NotFound);
-    }
-
-    #[test]
-    fn callback_accepts_matching_state() {
-        let code = parse_callback_query(&format!("code=abc123&state={STATE}"), STATE).unwrap();
-        assert_eq!(code.expose_secret(), "abc123");
-    }
-
-    #[test]
-    fn callback_rejects_wrong_or_missing_state() {
+        assert!(matches!(
+            done(&format!("error=access_denied&state={s}")),
+            Err(LoopbackError::Cancelled)
+        ));
         for q in [
-            "code=abc&state=state-XXXXXXXXXXXXXXXX".to_string(),
-            "code=abc&state=short".to_string(),
-            "code=abc".to_string(),
-            format!("code=a&state={STATE}&state={STATE}"),
-            // `error` is not honoured without our state.
-            "error=access_denied".to_string(),
-            "error=access_denied&state=wrong-state-0000000".to_string(),
+            format!("error=server_error&state={s}"),
+            format!("state={s}"),
+            format!("code=&state={s}"),
+            format!("code=a&code=b&state={s}"),
         ] {
-            assert!(
-                matches!(
-                    parse_callback_query(&q, STATE),
-                    Err(LoopbackError::StateMismatch)
-                ),
-                "{q}"
-            );
+            assert!(matches!(done(&q), Err(LoopbackError::Malformed)), "{q}");
         }
-    }
-
-    #[test]
-    fn callback_rejects_missing_or_duplicate_code() {
-        for q in [
-            format!("state={STATE}"),
-            format!("code=&state={STATE}"),
-            format!("code=a&code=b&state={STATE}"),
-        ] {
-            assert!(
-                matches!(
-                    parse_callback_query(&q, STATE),
-                    Err(LoopbackError::Malformed)
-                ),
-                "{q}"
-            );
-        }
-    }
-
-    #[test]
-    fn callback_error_param() {
-        let err =
-            parse_callback_query(&format!("error=access_denied&state={STATE}"), STATE).unwrap_err();
-        assert!(matches!(err, LoopbackError::Cancelled));
-        let err =
-            parse_callback_query(&format!("error=server_error&state={STATE}"), STATE).unwrap_err();
-        assert!(matches!(err, LoopbackError::Denied(ref e) if e == "server_error"));
-        let err =
-            parse_callback_query(&format!("error=%3Cscript%3E&state={STATE}"), STATE).unwrap_err();
-        assert!(matches!(err, LoopbackError::Denied(ref e) if e == "unknown error"));
-    }
-
-    #[test]
-    fn pages_do_not_reflect_input_or_overclaim() {
-        assert!(!error_page().contains("script"));
-        assert!(!foreign_page().contains("script"));
-        assert!(!success_page().contains("code="));
-        assert!(!success_page().contains("logged in</h1>"));
-        assert!(success_page().contains("Return to your terminal"));
     }
 
     async fn get(port: u16, target: &str) -> std::io::Result<String> {
@@ -456,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_exactly_one_callback() {
+    async fn serves_exactly_one_callback_and_ignores_foreign_requests() {
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
         assert_eq!(
@@ -466,67 +302,42 @@ mod tests {
         let wait =
             tokio::spawn(async move { server.wait_for_code(STATE, Duration::from_secs(10)).await });
 
-        // An idle speculative connection and a wrong path don't end the wait.
         let _idle = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let not_found = get(port, "/favicon.ico").await.unwrap();
-        assert!(not_found.starts_with("HTTP/1.1 404"));
+        for target in [
+            "/favicon.ico",
+            "/callback?code=c&state=state-attacker-000000",
+            "/callback?error=access_denied",
+        ] {
+            let page = get(port, target).await.unwrap();
+            assert!(
+                page.starts_with("HTTP/1.1 404") && !page.contains("attacker"),
+                "{target}"
+            );
+        }
+        assert!(!wait.is_finished());
 
         let ok = get(port, &format!("/callback?code=the-code&state={STATE}"))
             .await
             .unwrap();
-        assert!(ok.starts_with("HTTP/1.1 200"));
-        assert!(!ok.contains("the-code"));
-        let code = wait.await.unwrap().unwrap();
-        assert_eq!(code.expose_secret(), "the-code");
-
-        // The listener is gone: a second request can't be served.
-        assert!(get(port, &format!("/callback?code=x&state={STATE}"))
-            .await
-            .is_err());
+        assert!(ok.starts_with("HTTP/1.1 200") && !ok.contains("the-code"));
+        assert_eq!(wait.await.unwrap().unwrap().expose_secret(), "the-code");
+        assert!(get(port, "/callback").await.is_err(), "listener closed");
     }
 
     #[tokio::test]
-    async fn foreign_requests_do_not_end_the_login() {
+    async fn cancel_and_timeout_end_the_login() {
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
         let wait =
             tokio::spawn(async move { server.wait_for_code(STATE, Duration::from_secs(10)).await });
-        for target in [
-            "/callback?code=c&state=state-attacker-000000".to_string(),
-            "/callback?error=access_denied".to_string(),
-            "/callback?error=access_denied&state=state-attacker-000000".to_string(),
-        ] {
-            let page = get(port, &target).await.unwrap();
-            assert!(page.starts_with("HTTP/1.1 400"), "{target}");
-            assert!(!page.contains("attacker"));
-        }
-        assert!(!wait.is_finished());
-
-        let ok = get(port, &format!("/callback?code=real&state={STATE}"))
-            .await
-            .unwrap();
-        assert!(ok.starts_with("HTTP/1.1 200"));
-        assert_eq!(wait.await.unwrap().unwrap().expose_secret(), "real");
-    }
-
-    #[tokio::test]
-    async fn cancel_with_our_state_ends_the_login() {
-        let server = LoopbackServer::bind().await.unwrap();
-        let port = server.port;
-        let wait =
-            tokio::spawn(async move { server.wait_for_code(STATE, Duration::from_secs(10)).await });
-        let page = get(
+        get(
             port,
             &format!("/callback?error=access_denied&state={STATE}"),
         )
         .await
         .unwrap();
-        assert!(page.starts_with("HTTP/1.1 400"));
         assert!(matches!(wait.await.unwrap(), Err(LoopbackError::Cancelled)));
-    }
 
-    #[tokio::test]
-    async fn times_out() {
         let server = LoopbackServer::bind().await.unwrap();
         let result = server.wait_for_code(STATE, Duration::from_millis(50)).await;
         assert!(matches!(result, Err(LoopbackError::Timeout)));

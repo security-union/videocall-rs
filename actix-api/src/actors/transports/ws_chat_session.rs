@@ -449,7 +449,13 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
+        // Enable meeting management for this test
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
         let result = test_meeting_lifecycle_ws_impl().await;
+
+        // Clean up feature flag
+        videocall_types::FeatureFlags::clear_meeting_management_override();
 
         if let Err(e) = result {
             panic!("Test failed: {e}");

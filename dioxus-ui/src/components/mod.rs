@@ -26,6 +26,6 @@ pub mod traffic_shaping;
 pub mod waiting_room;
 
 mod canvas_generator;
-pub mod peer_list;
+mod peer_list;
 pub mod peer_list_item;
 mod peer_tile;

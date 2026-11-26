@@ -16,29 +16,22 @@
  * conditions.
  */
 
-//! The device's Ed25519 key and the JWTs it signs: the self-signed
-//! registration JWS (proof of possession, no `kid`) and a fresh device JWT
-//! for every request (`kid` = `sub` = device id, `aud` = the exact origin
-//! called, 120 s lifetime, random `jti`).
+//! The device's Ed25519 key, the clock it signs with, and the two tokens:
+//! the registration JWS (proof of possession, no `kid`) and a fresh device
+//! JWT per request (`kid` = `sub` = device id, `aud` = the API origin,
+//! 120 s lifetime, random `jti`).
 //!
-//! The 32-byte seed is generated from the OS CSPRNG, stored only in the
-//! credential store, and held in memory inside [`SigningKey`] (zeroized on
-//! drop). It never goes on argv, in the environment, or into logs; `Debug`
-//! shows only the public key.
-//!
-//! Copies of the private key in memory, all zeroized on drop:
-//! - the [`SigningKey`] (ed25519-dalek, `zeroize` feature);
-//! - one PKCS#8 encoding, built once per [`DeviceKey`]. `to_pkcs8_der`
-//!   returns a `SecretDocument` (zeroized on drop, and its scratch buffers
-//!   are wiped with the `ed25519/zeroize` feature enabled in Cargo.toml);
-//!   [`EncodingKey::from_ed_der`] copies it into its own buffer, which
-//!   jsonwebtoken 10 also zeroizes on drop (`ZeroizeOnDrop`);
-//! - inside each `jsonwebtoken::encode` call, jsonwebtoken re-parses that
-//!   DER into a temporary `SigningKey` (zeroized on drop). Its API takes
-//!   no pre-parsed key, so this per-signature copy can't be avoided.
-//!
-//! Like any Rust value, these may be moved (memcpy'd) on the stack before
-//! they are dropped, and zeroize can't reach those stale stack slots.
+//! The seed comes from the OS CSPRNG, lives only in the store and in
+//! zeroize-on-drop types, and never goes on argv, in the environment or in
+//! logs; `Debug` shows only the public key. In memory there are three
+//! copies, all zeroized on drop: the [`SigningKey`]; one PKCS#8 encoding
+//! inside the [`EncodingKey`] (jsonwebtoken zeroizes it; the `ed25519/zeroize`
+//! feature wipes the encoder's scratch buffers); and a temporary
+//! `SigningKey` jsonwebtoken parses on every `encode`, which its API can't
+//! avoid. Stack slots left by moves are out of zeroize's reach.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -48,24 +41,18 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use videocall_meeting_types::device::{
-    fingerprint, DeviceTokenClaims, RegistrationClaims, CLI_ISSUER,
+    fingerprint, DeviceTokenClaims, RegistrationClaims, CLI_ISSUER, DEVICE_TOKEN_TTL_SECS,
 };
 
 use super::random_b64url;
 
-/// Lifetime of every token the CLI mints (the server allows up to 300 s).
-pub const TOKEN_LIFETIME_SECS: i64 = 120;
-
-/// Errors from key handling and signing.
+/// Key generation, loading or signing failed.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
-    /// The OS random number generator failed.
     #[error("system random number generator failed: {0}")]
     Random(#[from] getrandom::Error),
-    /// The stored key isn't a base64url 32-byte seed.
     #[error("the stored device key is corrupt; run `videocall-cli auth login` again")]
     Corrupt,
-    /// PKCS#8 encoding or JWT signing failed.
     #[error("signing failed: {0}")]
     Sign(String),
 }
@@ -73,20 +60,18 @@ pub enum KeyError {
 /// An Ed25519 device key.
 pub struct DeviceKey {
     signing: SigningKey,
-    /// PKCS#8 form for jsonwebtoken, built once (zeroized on drop).
+    /// PKCS#8 form for jsonwebtoken, built once.
     encoding: EncodingKey,
 }
 
 impl std::fmt::Debug for DeviceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceKey")
-            .field("public_key", &self.public_key_b64())
-            .finish_non_exhaustive()
+        write!(f, "DeviceKey({})", self.public_key_b64())
     }
 }
 
 impl DeviceKey {
-    /// A fresh key from 32 OS CSPRNG bytes.
+    /// A new key from 32 OS CSPRNG bytes.
     pub fn generate() -> Result<Self, KeyError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut())?;
@@ -105,9 +90,7 @@ impl DeviceKey {
     }
 
     fn from_signing(signing: SigningKey) -> Result<Self, KeyError> {
-        // jsonwebtoken's rust_crypto signer takes PKCS#8 DER, not the seed.
-        // `der` is a zeroize-on-drop SecretDocument; EncodingKey copies it
-        // into its own zeroize-on-drop buffer.
+        // jsonwebtoken takes PKCS#8 DER; `der` is a zeroize-on-drop SecretDocument.
         let der = signing
             .to_pkcs8_der()
             .map_err(|e| KeyError::Sign(e.to_string()))?;
@@ -115,36 +98,41 @@ impl DeviceKey {
         Ok(Self { signing, encoding })
     }
 
-    /// The seed, base64url, for the credential store.
+    /// The seed, base64url, for the store.
     pub fn seed_b64(&self) -> SecretString {
         let seed = Zeroizing::new(self.signing.to_bytes());
         SecretString::from(URL_SAFE_NO_PAD.encode(seed.as_slice()))
     }
 
-    /// Raw 32-byte public key.
-    pub fn public_key_raw(&self) -> [u8; 32] {
-        self.signing.verifying_key().to_bytes()
-    }
-
-    /// Public key as base64url without padding (43 characters).
+    /// Public key, base64url (43 characters).
     pub fn public_key_b64(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.public_key_raw())
+        URL_SAFE_NO_PAD.encode(self.signing.verifying_key().to_bytes())
     }
 
     /// `XXXX-XXXX-XXXX-XXXX` fingerprint of the public key.
     pub fn fingerprint(&self) -> String {
-        fingerprint(&self.public_key_raw())
+        fingerprint(&self.signing.verifying_key().to_bytes())
     }
 
-    fn sign<T: serde::Serialize>(&self, header: &Header, claims: &T) -> Result<String, KeyError> {
+    fn sign(&self, header: &Header, claims: &impl serde::Serialize) -> Result<String, KeyError> {
         jsonwebtoken::encode(header, claims, &self.encoding)
             .map_err(|e| KeyError::Sign(e.to_string()))
     }
 
-    /// A per-request device JWT: header `{"alg":"EdDSA","typ":"JWT","kid"}`,
-    /// claims `iss`, `sub = kid`, `aud`, `iat = now`, `exp = now + 120`,
-    /// fresh `jti`. `aud` must be the exact origin being called.
+    /// A device JWT for one request to `aud`.
     pub fn device_token(&self, device_id: &str, aud: &str, now: i64) -> Result<String, KeyError> {
+        self.device_token_with_jti(device_id, aud, now, random_b64url(16)?)
+    }
+
+    /// [`Self::device_token`] with a given `jti`, so tests can compare
+    /// against the shared vectors.
+    fn device_token_with_jti(
+        &self,
+        device_id: &str,
+        aud: &str,
+        now: i64,
+        jti: String,
+    ) -> Result<String, KeyError> {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(device_id.to_string());
         let claims = DeviceTokenClaims {
@@ -152,134 +140,136 @@ impl DeviceKey {
             sub: device_id.to_string(),
             aud: aud.to_string(),
             iat: now,
-            exp: now + TOKEN_LIFETIME_SECS,
-            jti: random_b64url(16)?,
+            exp: now + DEVICE_TOKEN_TTL_SECS,
+            jti,
         };
         self.sign(&header, &claims)
     }
 
-    /// The self-signed registration JWS (proof of possession): header with
-    /// no `kid`; claims `iss`, `aud` = auth origin, `iat`, `exp`,
-    /// `public_key`, `name`.
+    /// The registration JWS for `aud`, naming the device `name`.
     pub fn registration_jws(&self, aud: &str, name: &str, now: i64) -> Result<String, KeyError> {
-        let header = Header::new(Algorithm::EdDSA);
         let claims = RegistrationClaims {
             iss: CLI_ISSUER.to_string(),
             aud: aud.to_string(),
             iat: now,
-            exp: now + TOKEN_LIFETIME_SECS,
+            exp: now + DEVICE_TOKEN_TTL_SECS,
             public_key: self.public_key_b64(),
             name: name.to_string(),
         };
-        self.sign(&header, &claims)
+        self.sign(&Header::new(Algorithm::EdDSA), &claims)
     }
+}
+
+/// The clock tokens are signed with: local time plus a learned offset.
+///
+/// A Raspberry Pi has no RTC, so after boot its clock can be minutes off
+/// until NTP catches up, and the server (60 s leeway) would reject every
+/// token. When the server's time differs by more than 30 s, the CLI signs
+/// with the server's time for the rest of the process. Nothing is persisted.
+#[derive(Debug, Default)]
+pub struct Clock {
+    offset: AtomicI64,
+}
+
+static GLOBAL_CLOCK: Clock = Clock {
+    offset: AtomicI64::new(0),
+};
+
+impl Clock {
+    /// The process-wide clock.
+    pub fn global() -> &'static Clock {
+        &GLOBAL_CLOCK
+    }
+
+    /// Unix time to sign with.
+    pub fn now(&self) -> i64 {
+        local_now() + self.offset.load(Ordering::Relaxed)
+    }
+
+    /// Adopt the server's time if we are more than 30 s off it. Returns true
+    /// if the offset changed, which makes one retry worthwhile.
+    pub fn adopt_server_time(&self, server_now: i64) -> bool {
+        let wanted = server_now - local_now();
+        if (wanted - self.offset.load(Ordering::Relaxed)).abs() <= 30 {
+            return false;
+        }
+        self.offset.store(wanted, Ordering::Relaxed);
+        eprintln!("warning: this machine's clock is {wanted:+} s off the server's; using the server's time. Fix NTP.");
+        true
+    }
+}
+
+/// Local Unix time in seconds, uncorrected.
+pub fn local_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{DecodingKey, Validation};
 
-    const DEVICE_ID: &str = "aB3dE5fG7hI9jK1lM3nO5p";
-
-    fn decode_parts(token: &str) -> (serde_json::Value, serde_json::Value) {
-        let mut parts = token.split('.');
-        let mut part = || {
-            let bytes = URL_SAFE_NO_PAD.decode(parts.next().unwrap()).unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        (part(), part())
-    }
-
+    /// Shared with meeting-api's `device_token_vectors` test; read by
+    /// relative path so neither crate depends on the other.
     #[test]
-    fn keygen_shapes() {
-        let key = DeviceKey::generate().unwrap();
-        let pk = key.public_key_b64();
-        assert_eq!(pk.len(), 43);
-        assert!(pk
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
-        assert_eq!(key.fingerprint(), fingerprint(&key.public_key_raw()));
-        assert_eq!(key.fingerprint().len(), 19);
-        assert_ne!(
-            key.public_key_b64(),
-            DeviceKey::generate().unwrap().public_key_b64()
+    fn signing_matches_the_shared_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../videocall-meeting-types/tests/vectors/device_tokens.json"
         );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let s = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap().to_string();
+        let key = DeviceKey::from_seed_b64(&SecretString::from(s(&v, "seed_b64url"))).unwrap();
+        assert_eq!(key.public_key_b64(), s(&v, "public_key"));
+        assert_eq!(key.fingerprint(), s(&v, "fingerprint"));
+
+        let (d, r) = (&v["device_token"], &v["registration"]);
+        assert_eq!(
+            d["exp"].as_i64().unwrap(),
+            d["iat"].as_i64().unwrap() + DEVICE_TOKEN_TTL_SECS
+        );
+        let token = key.device_token_with_jti(
+            &s(d, "device_id"),
+            &s(d, "aud"),
+            d["iat"].as_i64().unwrap(),
+            s(d, "jti"),
+        );
+        assert_eq!(token.unwrap(), s(d, "token"), "device JWT");
+        let jws = key.registration_jws(&s(r, "aud"), &s(r, "name"), r["iat"].as_i64().unwrap());
+        assert_eq!(jws.unwrap(), s(r, "token"), "registration JWS");
     }
 
     #[test]
-    fn seed_round_trip_and_redaction() {
+    fn seed_round_trip_redaction_and_fresh_jti() {
         let key = DeviceKey::generate().unwrap();
         let seed = key.seed_b64();
         let again = DeviceKey::from_seed_b64(&seed).unwrap();
-        assert_eq!(again.public_key_raw(), key.public_key_raw());
-        // The cached PKCS#8 signing key belongs to the same seed: Ed25519 is
-        // deterministic, so the same claims give the same signature.
-        assert_eq!(
-            again
-                .registration_jws("https://api.example.com", "n", 1)
-                .unwrap(),
-            key.registration_jws("https://api.example.com", "n", 1)
-                .unwrap()
-        );
-        let printed = format!("{key:?} {seed:?}");
-        assert!(!printed.contains(seed.expose_secret()));
-        assert!(printed.contains(&key.public_key_b64()));
+        assert_eq!(again.public_key_b64(), key.public_key_b64());
+        assert!(!format!("{key:?} {seed:?}").contains(seed.expose_secret()));
         assert!(DeviceKey::from_seed_b64(&SecretString::from("short".to_string())).is_err());
+        let a = key
+            .device_token("aB3dE5fG7hI9jK1lM3nO5p", "https://a.example", 1)
+            .unwrap();
+        let b = key
+            .device_token("aB3dE5fG7hI9jK1lM3nO5p", "https://a.example", 1)
+            .unwrap();
+        assert_ne!(a, b, "every token has its own jti");
     }
 
     #[test]
-    fn device_token_header_and_claims() {
-        let key = DeviceKey::generate().unwrap();
-        let token = key
-            .device_token(DEVICE_ID, "https://api.example.com", 1_764_000_000)
-            .unwrap();
-        let (header, claims) = decode_parts(&token);
-        assert_eq!(
-            header,
-            serde_json::json!({"alg": "EdDSA", "typ": "JWT", "kid": DEVICE_ID})
+    fn clock_adopts_a_large_skew_once() {
+        let clock = Clock::default();
+        assert!(
+            !clock.adopt_server_time(local_now() + 5),
+            "small skew ignored"
         );
-        assert_eq!(claims["iss"], "videocall-cli");
-        assert_eq!(claims["sub"], DEVICE_ID);
-        assert_eq!(claims["aud"], "https://api.example.com");
-        assert_eq!(claims["iat"], 1_764_000_000);
-        assert_eq!(claims["exp"], 1_764_000_120);
-        assert_eq!(claims["jti"].as_str().unwrap().len(), 22);
-
-        let other = key
-            .device_token(DEVICE_ID, "https://api.example.com", 1_764_000_000)
-            .unwrap();
-        assert_ne!(decode_parts(&other).1["jti"], claims["jti"]);
-
-        // Verifies with the public key, and only for its audience.
-        let decoding = DecodingKey::from_ed_der(&key.public_key_raw());
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.validate_exp = false;
-        validation.set_audience(&["https://api.example.com"]);
-        assert!(jsonwebtoken::decode::<DeviceTokenClaims>(&token, &decoding, &validation).is_ok());
-        validation.set_audience(&["https://auth.example.com"]);
-        assert!(jsonwebtoken::decode::<DeviceTokenClaims>(&token, &decoding, &validation).is_err());
-    }
-
-    #[test]
-    fn registration_jws_shape() {
-        let key = DeviceKey::generate().unwrap();
-        let jws = key
-            .registration_jws(
-                "https://auth.example.com",
-                "videocall-cli on pi4",
-                1_764_000_000,
-            )
-            .unwrap();
-        let (header, claims) = decode_parts(&jws);
-        assert_eq!(header, serde_json::json!({"alg": "EdDSA", "typ": "JWT"}));
-        assert!(header.get("kid").is_none());
-        assert_eq!(claims["iss"], "videocall-cli");
-        assert_eq!(claims["aud"], "https://auth.example.com");
-        assert_eq!(claims["iat"], 1_764_000_000);
-        assert_eq!(claims["exp"], 1_764_000_120);
-        assert_eq!(claims["public_key"], key.public_key_b64());
-        assert_eq!(claims["name"], "videocall-cli on pi4");
-        assert!(claims.get("sub").is_none());
+        assert!(clock.adopt_server_time(local_now() + 3600));
+        assert!((clock.now() - (local_now() + 3600)).abs() <= 1);
+        assert!(
+            !clock.adopt_server_time(local_now() + 3600),
+            "already applied"
+        );
     }
 }

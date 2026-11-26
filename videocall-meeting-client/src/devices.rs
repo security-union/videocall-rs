@@ -23,22 +23,26 @@
 //!   [`delete_device_me`](MeetingApiClient::delete_device_me): status and
 //!   self-revoke for the calling device, authenticated with a device JWT
 //!   (normally [`AuthMode::Signed`](crate::AuthMode::Signed)).
+//! - [`server_time`](MeetingApiClient::server_time): the server's clock, so
+//!   a device with a wrong clock can still sign tokens the server accepts.
 //!
 //! A 401 is [`ApiError::NotAuthenticated`]; errors in the device endpoints'
 //! `{"error","error_description"}` shape are [`ApiError::Device`].
 
 use videocall_meeting_types::device::{
     DeviceErrorResponse, DeviceStatusResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    CLI_AUTHORIZE_PATH, CLI_CLIENT_ID, CLI_REMOTE_CODE_PATH, DEVICES_ME_PATH, DEVICES_PATH,
+    CLI_AUTHORIZE_PATH, CLI_CLIENT_ID, CODE_CHALLENGE_METHOD_S256, DEVICES_ME_PATH, DEVICES_PATH,
 };
 
 use crate::error::ApiError;
 use crate::MeetingApiClient;
+use videocall_meeting_types::{APIError, APIResponse};
 
 /// Inputs of [`MeetingApiClient::cli_authorize_url`].
 #[derive(Debug, Clone, Copy)]
 pub struct CliAuthorizeParams<'a> {
-    /// `http://127.0.0.1:{port}/callback`, or `{api origin}/cli/code`.
+    /// `http://127.0.0.1:{port}/callback`, or
+    /// [`CLI_REMOTE_REDIRECT_URI`](videocall_meeting_types::device::CLI_REMOTE_REDIRECT_URI).
     pub redirect_uri: &'a str,
     /// `BASE64URL(SHA256(code_verifier))`.
     pub code_challenge: &'a str,
@@ -61,16 +65,11 @@ impl MeetingApiClient {
             .append_pair("client_id", CLI_CLIENT_ID)
             .append_pair("redirect_uri", params.redirect_uri)
             .append_pair("code_challenge", params.code_challenge)
-            .append_pair("code_challenge_method", "S256")
+            .append_pair("code_challenge_method", CODE_CHALLENGE_METHOD_S256)
             .append_pair("state", params.state)
             .append_pair("public_key", params.public_key)
             .append_pair("device_name", params.device_name);
         Ok(url.into())
-    }
-
-    /// `{base}/cli/code`, the `redirect_uri` of a `--remote` login.
-    pub fn cli_code_redirect_uri(&self) -> String {
-        self.url(CLI_REMOTE_CODE_PATH)
     }
 
     fn register_request(&self, request: &RegisterDeviceRequest) -> reqwest::RequestBuilder {
@@ -94,6 +93,21 @@ impl MeetingApiClient {
         parse_device_json(response).await
     }
 
+    /// The server's clock in Unix seconds, from the `Date` header of an
+    /// unauthenticated `GET /version`. `None` if the server can't be reached
+    /// or sent no usable `Date`.
+    pub async fn server_time(&self) -> Option<i64> {
+        let response = self.http.get(self.url("/version")).send().await.ok()?;
+        let date = response
+            .headers()
+            .get(reqwest::header::DATE)?
+            .to_str()
+            .ok()?;
+        let time = httpdate::parse_http_date(date).ok()?;
+        let secs = time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        i64::try_from(secs).ok()
+    }
+
     /// Revoke the calling device (`DELETE /api/v1/devices/me`, `204`).
     pub async fn delete_device_me(&self) -> Result<(), ApiError> {
         let response = self.delete(DEVICES_ME_PATH).send().await?;
@@ -115,7 +129,8 @@ async fn parse_device_json<T: serde::de::DeserializeOwned>(
     Ok(response.json().await?)
 }
 
-async fn device_error(status: u16, response: reqwest::Response) -> ApiError {
+/// Map a failed device or device-browser response to [`ApiError`].
+pub(crate) async fn device_error(status: u16, response: reqwest::Response) -> ApiError {
     if status == 401 {
         return ApiError::NotAuthenticated;
     }
@@ -123,15 +138,27 @@ async fn device_error(status: u16, response: reqwest::Response) -> ApiError {
     device_error_from_body(status, &text)
 }
 
-fn device_error_from_body(status: u16, text: &str) -> ApiError {
-    match serde_json::from_str::<DeviceErrorResponse>(text) {
-        Ok(body) => ApiError::Device {
+/// Any 404 is [`ApiError::NotFound`] whatever the body says (callers treat
+/// it as "already gone"). Otherwise the code comes from either shape the
+/// server uses: `{"success":false,"result":{"code","message"}}` or
+/// `{"error","error_description"}`.
+pub(crate) fn device_error_from_body(status: u16, text: &str) -> ApiError {
+    if status == 404 {
+        return ApiError::NotFound(text.to_string());
+    }
+    let parsed = serde_json::from_str::<APIResponse<APIError>>(text)
+        .map(|body| (body.result.code, body.result.message))
+        .or_else(|_| {
+            serde_json::from_str::<DeviceErrorResponse>(text)
+                .map(|body| (body.error, body.error_description))
+        });
+    match parsed {
+        Ok((error, error_description)) => ApiError::Device {
             status,
-            error: body.error,
-            error_description: body.error_description,
+            error,
+            error_description,
         },
         Err(_) if status == 403 => ApiError::Forbidden(text.to_string()),
-        Err(_) if status == 404 => ApiError::NotFound(text.to_string()),
         Err(_) => ApiError::ServerError {
             status,
             body: text.to_string(),
@@ -194,10 +221,6 @@ mod tests {
         assert_eq!(get("code_challenge_method"), Some("S256"));
         assert_eq!(get("state"), Some("st&ate=x"));
         assert_eq!(get("device_name"), Some("videocall-cli on pi4"));
-        assert_eq!(
-            client.cli_code_redirect_uri(),
-            "https://api.example.com/cli/code"
-        );
     }
 
     #[test]

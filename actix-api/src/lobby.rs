@@ -13,39 +13,30 @@
 
 //! WebSocket lobby handler for the Media Server.
 //!
-//! The only way in is **`GET /lobby?token=<JWT>`**. Identity and room come
-//! from the claims of a room access token signed by meeting-api. There is no
-//! unauthenticated path: a request without a valid token is refused before the
-//! WebSocket upgrade.
-//!
-//! Status codes:
-//! - `401 Unauthorized`: no token, or the token has expired (fetch a new one).
-//! - `403 Forbidden`: the token is invalid, forged, or does not grant joining.
-//! - `500 Internal Server Error`: `JWT_SECRET` is not configured.
+//! The only endpoint is **`GET /lobby?token=<JWT>`**: identity and room are
+//! extracted from the room access token's claims. The old unauthenticated
+//! `GET /lobby/{user_id}/{room}` form is gone and gets a 404.
 
 use actix::prelude::Stream;
 use actix::Actor;
 use actix::StreamHandler;
 use actix_http::error::PayloadError;
 use actix_http::ws::{Codec, Message, ProtocolError};
-use actix_web::http::StatusCode;
 use actix_web::web::Bytes;
 use actix_web::{get, web, Error, HttpRequest, HttpResponse};
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
 use crate::constants::MAX_FRAME_SIZE;
 use crate::models::AppState;
-use crate::token_validator::{self, TokenError};
+use crate::token_validator;
 
-/// Query parameters for the lobby endpoint.
-///
-/// `token` is optional at the extractor level so a missing token gets the same
-/// explicit `401` as an expired one instead of actix's generic `400`.
-#[derive(serde::Deserialize)]
+/// Query parameters for the token-based lobby endpoint.
+#[derive(Debug, serde::Deserialize)]
 pub struct LobbyTokenQuery {
     /// JWT room access token. Identity and room are extracted from the claims.
+    /// A missing or empty token gets 401.
     pub token: Option<String>,
 }
 
@@ -64,10 +55,11 @@ where
     Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
 }
 
-/// WebSocket connection endpoint (token-based, the only one).
+/// WebSocket connection endpoint (token-based).
 ///
 /// Identity (user_id) and room are extracted from the JWT claims.
-/// No user_id or room in the URL path.
+/// No user_id or room in the URL path. 401 when the token is missing or
+/// expired, 403 when it is invalid.
 #[get("/lobby")]
 pub async fn ws_connect_authenticated(
     query: web::Query<LobbyTokenQuery>,
@@ -81,16 +73,20 @@ pub async fn ws_connect_authenticated(
         return Ok(HttpResponse::InternalServerError().body("Server misconfigured"));
     }
 
-    let claims = match query.token.as_deref().filter(|t| !t.is_empty()) {
-        None => Err(TokenError::Missing),
-        Some(token) => token_validator::decode_room_token(&jwt_secret, token),
+    let Some(token) = query.token.as_deref().filter(|t| !t.is_empty()) else {
+        info!("WS connection rejected: no room access token");
+        return Ok(HttpResponse::Unauthorized().body("room access token is required"));
     };
-    let claims = match claims {
+    let claims = match token_validator::decode_room_token(&jwt_secret, token) {
         Ok(c) => c,
         Err(e) => {
             e.log("WS");
-            let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::FORBIDDEN);
-            return Ok(HttpResponse::build(status).body(e.client_message().to_string()));
+            let body = e.client_message().to_string();
+            return if e.is_retryable() {
+                Ok(HttpResponse::Unauthorized().body(body))
+            } else {
+                Ok(HttpResponse::Forbidden().body(body))
+            };
         }
     };
 

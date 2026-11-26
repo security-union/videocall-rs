@@ -13,15 +13,7 @@ Enhanced bot that streams synthetic audio and video to videocall-rs for load tes
 
 ## Authentication
 
-The relay only lets you in with a room access token: `/lobby?token=<JWT>`. The bot signs its own tokens with the same secret the relay checks, so it only works against a deployment whose `JWT_SECRET` you hold. In practice that means your local dev stack or infrastructure you run.
-
-Set the secret in the environment before you start the bot:
-
-```bash
-export JWT_SECRET=dev-jwt-secret-change-me   # the dev stack's default
-```
-
-The bot reads `JWT_SECRET` from the environment only, never from `config.yaml`, and it exits with an error if the variable is missing. It also never logs the connection URL, because the token rides in the query string.
+The relay only accepts `/lobby?token=<JWT>`. The bot signs its own room tokens with `JWT_SECRET` from the environment, so it only works against a deployment whose secret you hold, and it exits if the variable is missing.
 
 ## Configuration
 
@@ -31,8 +23,7 @@ Create a `config.yaml` file:
 
 ```yaml
 ramp_up_delay_ms: 1000
-server_url: "https://127.0.0.1:4433"
-insecure: true   # the local relay uses a self-signed certificate
+server_url: "https://webtransport-us-east.webtransport.video"
 clients:
   - user_id: "bot001"
     meeting_id: "test-room"
@@ -46,16 +37,14 @@ clients:
 
 Then run:
 ```bash
-JWT_SECRET=... BOT_CONFIG_PATH=config.yaml cargo run
+BOT_CONFIG_PATH=config.yaml cargo run
 ```
 
 ### Option 2: Environment Variables (Backwards Compatible)
 
 ```bash
-JWT_SECRET=...
 N_CLIENTS=3
-SERVER_URL="https://127.0.0.1:4433"
-INSECURE=true
+SERVER_URL="https://webtransport-us-east.webtransport.video"
 ROOM="test-room"
 CLIENT_0_ENABLE_AUDIO=true
 CLIENT_0_ENABLE_VIDEO=false
@@ -77,12 +66,12 @@ The bot includes pre-loaded media assets:
 
 ### Test Audio-Only Clients
 ```bash
-JWT_SECRET=... BOT_CONFIG_PATH=config.yaml RUST_LOG=info cargo run
+BOT_CONFIG_PATH=config.yaml RUST_LOG=info cargo run
 ```
 
 ### Quick 10-Client Test
 ```bash
-JWT_SECRET=... INSECURE=true N_CLIENTS=10 ROOM="load-test" cargo run
+N_CLIENTS=10 ROOM="load-test" cargo run
 ```
 
 ### Docker Build

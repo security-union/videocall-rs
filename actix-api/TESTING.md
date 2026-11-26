@@ -82,6 +82,16 @@ async fn cleanup_room(pool: &sqlx::PgPool, room_id: &str) {
 }
 ```
 
+### Feature flag testing
+
+Tests toggle feature flags explicitly and clean up after themselves:
+
+```rust
+FeatureFlags::set_meeting_management_override(true);
+// ... test logic ...
+FeatureFlags::clear_meeting_management_override();
+```
+
 ### Test isolation
 
 Each test uses a unique room ID (e.g. `"test-room-create-1"`,

@@ -34,44 +34,22 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
--- Name: cli_auth_requests; Type: TABLE; Schema: public; Owner: -
+-- Name: device_auth_codes; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.cli_auth_requests (
-    id text NOT NULL,
-    code_challenge text NOT NULL,
-    redirect_kind text NOT NULL,
-    redirect_host text,
-    redirect_port integer,
-    client_state text NOT NULL,
+CREATE TABLE public.device_auth_codes (
+    code_hash text NOT NULL,
+    user_id text NOT NULL,
+    user_name text NOT NULL,
     public_key text NOT NULL,
     device_name text NOT NULL,
-    requester_ip text,
-    requester_cap_key text,
-    created_at timestamp with time zone NOT NULL,
+    code_challenge text NOT NULL,
+    redirect_uri text NOT NULL,
     expires_at timestamp with time zone NOT NULL,
-    approval_nonce_hash text,
-    approval_nonce_user_id text,
-    approval_nonce_expires_at timestamp with time zone,
-    decided_at timestamp with time zone,
-    decision text,
-    user_id text,
-    user_name text,
-    code_hash text,
-    code_expires_at timestamp with time zone,
-    consumed_at timestamp with time zone,
-    CONSTRAINT cli_auth_requests_check CHECK (((redirect_kind = 'loopback'::text) = ((redirect_host IS NOT NULL) AND (redirect_port IS NOT NULL)))),
-    CONSTRAINT cli_auth_requests_check1 CHECK (((decision IS NULL) OR ((decided_at IS NOT NULL) AND (user_id IS NOT NULL)))),
-    CONSTRAINT cli_auth_requests_check2 CHECK (((code_hash IS NULL) OR ((decision = 'approved'::text) AND (code_expires_at IS NOT NULL)))),
-    CONSTRAINT cli_auth_requests_client_state_check CHECK (((length(client_state) >= 16) AND (length(client_state) <= 128))),
-    CONSTRAINT cli_auth_requests_code_challenge_check CHECK (((length(code_challenge) >= 43) AND (length(code_challenge) <= 128))),
-    CONSTRAINT cli_auth_requests_decision_check CHECK (((decision IS NULL) OR (decision = ANY (ARRAY['approved'::text, 'denied'::text])))),
-    CONSTRAINT cli_auth_requests_device_name_check CHECK (((length(device_name) >= 1) AND (length(device_name) <= 64))),
-    CONSTRAINT cli_auth_requests_id_check CHECK ((length(id) = 22)),
-    CONSTRAINT cli_auth_requests_public_key_check CHECK ((length(public_key) = 43)),
-    CONSTRAINT cli_auth_requests_redirect_host_check CHECK (((redirect_host IS NULL) OR (redirect_host = '127.0.0.1'::text))),
-    CONSTRAINT cli_auth_requests_redirect_kind_check CHECK ((redirect_kind = ANY (ARRAY['loopback'::text, 'remote'::text]))),
-    CONSTRAINT cli_auth_requests_redirect_port_check CHECK (((redirect_port IS NULL) OR ((redirect_port >= 1024) AND (redirect_port <= 65535))))
+    CONSTRAINT device_auth_codes_code_challenge_check CHECK (((length(code_challenge) >= 43) AND (length(code_challenge) <= 128))),
+    CONSTRAINT device_auth_codes_code_hash_check CHECK ((length(code_hash) = 64)),
+    CONSTRAINT device_auth_codes_device_name_check CHECK (((length(device_name) >= 1) AND (length(device_name) <= 64))),
+    CONSTRAINT device_auth_codes_public_key_check CHECK ((length(public_key) = 43))
 );
 
 
@@ -86,9 +64,7 @@ CREATE TABLE public.devices (
     name text NOT NULL,
     user_id text NOT NULL,
     user_name text NOT NULL,
-    requester_ip text,
     created_at timestamp with time zone NOT NULL,
-    decided_at timestamp with time zone NOT NULL,
     last_used_at timestamp with time zone NOT NULL,
     idle_expires_at timestamp with time zone NOT NULL,
     abs_expires_at timestamp with time zone NOT NULL,
@@ -196,9 +172,7 @@ CREATE TABLE public.oauth_requests (
     pkce_verifier text,
     csrf_state text,
     return_to text,
-    nonce character varying(255),
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    browser_binding_hash text
+    nonce character varying(255)
 );
 
 
@@ -281,19 +255,11 @@ ALTER TABLE ONLY public.session_participants ALTER COLUMN id SET DEFAULT nextval
 
 
 --
--- Name: cli_auth_requests cli_auth_requests_code_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: device_auth_codes device_auth_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.cli_auth_requests
-    ADD CONSTRAINT cli_auth_requests_code_hash_key UNIQUE (code_hash);
-
-
---
--- Name: cli_auth_requests cli_auth_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.cli_auth_requests
-    ADD CONSTRAINT cli_auth_requests_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.device_auth_codes
+    ADD CONSTRAINT device_auth_codes_pkey PRIMARY KEY (code_hash);
 
 
 --
@@ -369,31 +335,17 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: idx_cli_auth_requests_cap_key; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_device_auth_codes_expires_at; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_cli_auth_requests_cap_key ON public.cli_auth_requests USING btree (requester_cap_key, expires_at) WHERE (decided_at IS NULL);
-
-
---
--- Name: idx_cli_auth_requests_expires_at; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_cli_auth_requests_expires_at ON public.cli_auth_requests USING btree (expires_at);
+CREATE INDEX idx_device_auth_codes_expires_at ON public.device_auth_codes USING btree (expires_at);
 
 
 --
--- Name: idx_devices_idle_expires; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_device_auth_codes_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_devices_idle_expires ON public.devices USING btree (idle_expires_at);
-
-
---
--- Name: idx_devices_revoked_at; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_devices_revoked_at ON public.devices USING btree (revoked_at) WHERE (revoked_at IS NOT NULL);
+CREATE INDEX idx_device_auth_codes_user_id ON public.device_auth_codes USING btree (user_id);
 
 
 --
@@ -450,20 +402,6 @@ CREATE UNIQUE INDEX idx_meetings_room_id_unique_active ON public.meetings USING 
 --
 
 CREATE INDEX idx_meetings_state ON public.meetings USING btree (state);
-
-
---
--- Name: idx_oauth_requests_created_at; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_oauth_requests_created_at ON public.oauth_requests USING btree (created_at);
-
-
---
--- Name: idx_oauth_requests_csrf_state; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX idx_oauth_requests_csrf_state ON public.oauth_requests USING btree (csrf_state);
 
 
 --

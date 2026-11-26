@@ -37,6 +37,7 @@
 //! ```
 
 pub mod auth;
+pub mod device_browser;
 pub mod devices;
 pub mod error;
 pub mod meetings;

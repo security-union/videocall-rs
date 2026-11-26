@@ -391,7 +391,6 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
 - **CLI devices** never host: a missing meeting returns 404 instead of being created, an idle meeting is never activated, and the `room_token` always has `is_host: false` and lasts at most 300 seconds. The creator joining their own active meeting from the CLI skips the waiting room.
-- A CLI's `display_name` goes only into its own room token; it never renames the participant row it shares with the same account's browser session. Without one, the CLI uses the name already stored for the account in that meeting, or the account's name.
 
 ```
 POST /api/v1/meetings/{meeting_id}/join
@@ -807,182 +806,46 @@ GET /api/v1/meetings/{meeting_id}/participants
 
 ## CLI Device Authentication
 
-`videocall-cli` logs in with a per-machine Ed25519 key, the way `aws login` works:
+`videocall-cli` logs in with a per-machine Ed25519 key, approved once by a signed-in user in the web app:
 
-1. The CLI generates a key pair and opens `/cli/authorize` with a PKCE challenge and the public key.
-2. The user signs in with their normal browser session and approves on the consent page, which shows the device name and the key's fingerprint.
-3. The browser hands a one-time code to the CLI: a redirect to `http://127.0.0.1:{port}/callback` (loopback), or a page at `/cli/code` the user copies it from (remote, for headless machines).
-4. The CLI exchanges the code, the PKCE verifier and a registration JWS signed by the new key at `POST /api/v1/devices`.
+1. The CLI makes a key pair and opens `GET /cli/authorize` with a PKCE challenge, `state`, the public key and a device name.
+2. meeting-api answers `302` to `{AFTER_LOGIN_URL origin}/devices/authorize?request=<base64url (no padding) of the raw query>`. It validates and stores nothing.
+3. The app shows the device name and the key fingerprint; on approve it calls `POST /api/v1/devices/authorizations`. A loopback login is sent to `http://127.0.0.1:{port}/callback?code=…&state=…`; a remote login shows the code to paste into the terminal.
+4. The CLI exchanges the code at `POST /api/v1/devices`.
 
-The server stores only the public key. From then on the CLI signs a short-lived device JWT for every request (`alg: EdDSA`, `kid` = `device_id`, `iss: videocall-cli`, `aud` = `DEVICE_TOKEN_AUDIENCE`, lifetime 120 s, at most 300 s accepted). A revoked or expired device gets 401 on its next request.
+The server stores only the public key. After that the CLI signs a 120 s device JWT for every request (`alg: EdDSA`, `kid` = device id, `aud` = `DEVICE_TOKEN_AUDIENCE`). Devices are listed and revoked at `{app}/devices`. A revoked device gets 401 on its next request; revoking stops new joins within five minutes (the longest a CLI room token lives) but does not cut a relay session that is already connected.
 
-Devices expire after 90 days unused and 365 days after approval, and an account can have 10 live devices (defaults, see [Configuration](#device-auth-configuration)). Users list and revoke their devices at `GET /devices`.
+Browser routes use the standard envelope and refuse device JWTs with 403 `BROWSER_SESSION_REQUIRED`. State-changing browser routes also need an `Origin` in `CORS_ALLOWED_ORIGIN` or the `AFTER_LOGIN_URL` origin. CLI routes return `{"error": …, "error_description": …}`.
 
-The browser pages (`/cli/*`, `/devices`) are server-rendered HTML on the API origin, outside CORS. Form POSTs must be `application/x-www-form-urlencoded` with an `Origin` exactly equal to `DEVICE_TOKEN_AUDIENCE`. When `DEVICE_TOKEN_AUDIENCE` is unset, the login and devices pages return 503 and device JWTs get 401. When OAuth is not configured, a page that would send the user to sign in returns 503 ("no sign-in configured") instead.
+> **Rust types**: `videocall-meeting-types/src/device.rs`
 
-> **Rust types**: `videocall-meeting-types/src/device.rs` (`RegisterDeviceRequest`, `RegisterDeviceResponse`, `DeviceStatusResponse`, `DeviceErrorResponse`, `DeviceTokenClaims`, `RegistrationClaims`)
+| Method | Path | Auth | Success |
+|--------|------|------|---------|
+| GET | `/cli/authorize` | none | 302 to the app's `/devices/authorize` |
+| POST | `/api/v1/devices/authorizations` | browser session | 200 `{redirect_to}` (loopback) or `{code, expires_in}` (remote) |
+| POST | `/api/v1/devices` | none (code + PKCE verifier + registration JWS) | 201 device |
+| GET | `/api/v1/devices` | browser session | 200 `[{id, name, fingerprint, created_at, last_used_at, expires_at}]` |
+| DELETE | `/api/v1/devices/{id}` | browser session | 204 |
+| GET, DELETE | `/api/v1/devices/me` | device JWT | 200 device, 204 |
 
----
+`POST /api/v1/devices/authorizations` body: `{redirect_uri, code_challenge, code_challenge_method: "S256", state, public_key, device_name, confirm}`. `redirect_uri` is `http://127.0.0.1:{port}/callback` (port 1024-65535) or `urn:ietf:wg:oauth:2.0:oob` for a remote login, which also needs `confirm: true`. The code lasts 60 s (loopback) or 300 s (remote), works once, and replaces any earlier unused code of the same user.
 
-### Start CLI Login
+**Errors, browser routes:**
 
-```
-GET /cli/authorize?response_type=code&client_id=videocall-cli&redirect_uri={uri}&code_challenge={S256}&code_challenge_method=S256&state={state}&public_key={key}&device_name={name}
-```
+| Status | Code | Description |
+|--------|------|-------------|
+| 400 | `INVALID_REQUEST` | Malformed body or field, or `/cli/authorize` query over 2048 bytes |
+| 400 | `CONFIRMATION_REQUIRED` | Remote login without `confirm: true` |
+| 403 | `ORIGIN_NOT_ALLOWED` | Missing, `null` or unlisted `Origin` |
+| 404 | `DEVICE_NOT_FOUND` | Unknown device, or another user's |
+| 409 | `KEY_ALREADY_REGISTERED` | Public key is already a device |
+| 409 | `TOO_MANY_DEVICES` | Account already has 10 live devices |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | POST without `Content-Type: application/json` |
+| 503 | `NOT_CONFIGURED` | `DEVICE_TOKEN_AUDIENCE` unset, or `AFTER_LOGIN_URL` not an absolute URL |
 
-| Parameter | Constraint |
-|-----------|------------|
-| `redirect_uri` | `http://127.0.0.1:{port}/callback` (port 1024-65535; `[::1]` and `localhost` are rejected), or `{api origin}/cli/code` for a remote login |
-| `code_challenge` | PKCE S256 challenge |
-| `state` | 16-128 visible ASCII characters |
-| `public_key` | Raw Ed25519 public key, base64url without padding (43 characters) |
-| `device_name` | Up to 64 characters: letters, digits, spaces and `. _ ( ) @ : + -` |
+**Errors, CLI routes:** `invalid_request` (400, 413, 415), `invalid_grant` (400: code unknown, expired or used, or verifier, `redirect_uri`, key or name mismatch), `key_already_registered` (409), `too_many_devices` (409), `not_configured` (503), `server_error` (500). `/api/v1/devices/me` answers 401 with `WWW-Authenticate: Bearer error="invalid_token"` for any rejected device JWT.
 
-Stores the request (valid 10 minutes) and redirects (302) to the consent page.
-
-**Errors** (HTML page, no redirect):
-
-| Status | Description |
-|--------|-------------|
-| 400 | A parameter is missing or invalid, or the request is not a top-level navigation (`Sec-Fetch-Mode` other than `navigate` or `Sec-Fetch-Dest` other than `document`; requests without these headers are allowed) |
-| 409 | This public key is already registered |
-| 429 | Too many pending logins, globally or from this IP |
-| 503 | Device login is not configured |
-
----
-
-### Consent Page
-
-```
-GET /cli/consent?request={id}
-POST /cli/consent
-```
-
-Browser session (cookie) only; a signed-out user is sent through login first. The page shows the device name and the key fingerprint. The POST carries `request`, a per-render `nonce` and `decision`.
-
-"Not you? Sign out" is a form `POST /cli/sign-out` (same CSRF checks as the other page POSTs). It clears the session cookie and renders a signed-out page whose sign-in link returns to the same consent request.
-
-On approval it mints a one-time code. A loopback login is redirected (303) to `{redirect_uri}?code=...&state=...` (code valid 60 s). A remote login gets the code on the response page (valid 5 minutes); the code never appears in a URL. `GET /cli/code` is the remote `redirect_uri` and only renders instructions.
-
----
-
-### Register Device
-
-```
-POST /api/v1/devices
-```
-
-**Request Body** (`application/json`, at most 4 KiB):
-```json
-{
-  "code": "...",
-  "code_verifier": "...",
-  "redirect_uri": "http://127.0.0.1:53682/callback",
-  "registration": "eyJhbGciOiJFZERTQSIs..."
-}
-```
-
-`registration` is a JWS signed by the new key with claims `iss`, `aud`, `iat`, `exp`, `public_key` and `name`; `public_key` and `name` must match the `/cli/authorize` request. The code is burned on first use, whether or not the exchange succeeds.
-
-**Response (201 Created):**
-```json
-{
-  "device_id": "q3V9mXc0Rk2b7yYt1nWZpA",
-  "fingerprint": "9F3C-21AB-77D0-4E18",
-  "name": "videocall-cli on raspberrypi",
-  "user_id": "alice@example.com",
-  "user_name": "Alice",
-  "idle_expires_at": 1714694400,
-  "abs_expires_at": 1738454400
-}
-```
-
-> **Rust type**: `RegisterDeviceResponse` (bare JSON, no envelope)
-
-**Errors** (`{"error": ..., "error_description": ...}`):
-
-| Status | Error | Description |
-|--------|-------|-------------|
-| 400 | `invalid_request` | Malformed body or `code_verifier` |
-| 400 | `invalid_grant` | Code unknown, expired or used; or verifier, `redirect_uri`, key or name mismatch (one message for all) |
-| 409 | `too_many_devices` | Account is at `DEVICE_MAX_PER_USER`; revoke one at `/devices` |
-| 409 | `key_already_registered` | This public key is already a device |
-| 413 | `invalid_request` | Body too large |
-| 415 | `invalid_request` | `Content-Type` is not `application/json` |
-| 500 | `server_error` | Database error |
-| 503 | `not_configured` | `DEVICE_TOKEN_AUDIENCE` is unset |
-
----
-
-### Get My Device
-
-```
-GET /api/v1/devices/me
-Authorization: Bearer <device_jwt>
-```
-
-**Response (200 OK):**
-```json
-{
-  "device_id": "q3V9mXc0Rk2b7yYt1nWZpA",
-  "status": "approved",
-  "name": "videocall-cli on raspberrypi",
-  "fingerprint": "9F3C-21AB-77D0-4E18",
-  "user_id": "alice@example.com",
-  "user_name": "Alice",
-  "created_at": 1706918400,
-  "decided_at": 1706918400,
-  "last_used_at": 1706918400,
-  "idle_expires_at": 1714694400,
-  "abs_expires_at": 1738454400
-}
-```
-
-> **Rust type**: `DeviceStatusResponse`
-
-**Errors:**
-
-| Status | Description |
-|--------|-------------|
-| 401 | Device JWT missing, invalid, revoked or expired. The usual `UNAUTHORIZED` envelope plus `WWW-Authenticate: Bearer error="invalid_token"`; never says why |
-
----
-
-### Revoke My Device
-
-```
-DELETE /api/v1/devices/me
-Authorization: Bearer <device_jwt>
-```
-
-**Response:** 204 No Content. Errors as for Get My Device.
-
----
-
-### Devices Page
-
-```
-GET /devices
-POST /devices/{device_id}/revoke
-```
-
-Browser session (cookie) only. Lists the user's live devices (name, fingerprint, last use, the IP it was approved from); the revoke form POSTs and redirects (303) back to `/devices`. A revoked device fails on its next request. Revoking stops new joins within five minutes (the longest a CLI room token lives) but does not cut a relay session that is already connected.
-
----
-
-### Device Auth Configuration
-
-Optional meeting-api environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEVICE_TOKEN_AUDIENCE` | unset | meeting-api's public origin, e.g. `https://api.videocall.rs`. The `aud` of every device JWT and the only accepted form `Origin`. Unset disables device login |
-| `TRUST_X_FORWARDED_FOR` | `false` | Take the requester IP from the right-most `X-Forwarded-For` entry instead of the TCP peer |
-| `DEVICE_IDLE_TTL_SECS` | `7776000` (90 days) | A device expires after this long unused |
-| `DEVICE_ABS_TTL_SECS` | `31536000` (365 days) | A device expires this long after approval |
-| `DEVICE_MAX_PER_USER` | `10` | Live devices per account |
-| `DEVICE_MAX_PENDING` | `10000` | Login requests still awaiting a decision, globally |
-| `DEVICE_MAX_PENDING_PER_IP` | `5` | Login requests still awaiting a decision per client: per IPv4 address or IPv6 /64. Not applied to private, loopback or unknown addresses |
+**Configuration:** `DEVICE_TOKEN_AUDIENCE` is meeting-api's public origin, e.g. `https://api.videocall.rs`; unset disables device login. A device expires after 90 days unused or 365 days after approval, and an account can have at most 10 live devices.
 
 ---
 

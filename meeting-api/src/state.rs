@@ -49,7 +49,7 @@ pub struct AppState {
     pub service_version_urls: Vec<String>,
     /// Shared HTTP client for outbound requests (e.g. version fan-out).
     pub http_client: reqwest::Client,
-    /// CLI device-key settings (audience, lifetimes, caps).
+    /// CLI device sign-in: API audience and allowed app origins.
     pub device: DeviceAuthConfig,
 }
 

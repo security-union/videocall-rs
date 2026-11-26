@@ -80,29 +80,11 @@ env:
     value: "https://app.videocall.rs"
   # --- CLI device login (videocall-cli) ---
   # DEVICE_TOKEN_AUDIENCE (public origin of THIS service, scheme + host, no
-  # path) and TRUST_X_FORWARDED_FOR are NOT listed here on purpose: the
-  # deployment template adds them when the ingress is enabled, so they survive
-  # deployments that replace this whole `env` list (PR previews do).
-  #   DEVICE_TOKEN_AUDIENCE   = https://<ingress.hosts[0].host>  (http:// when
-  #                             ingress.tls is empty)
-  #   TRUST_X_FORWARDED_FOR   = "true"  (the pod sits behind the ingress)
-  # Add an entry with the same name below to override either. Unset audience
-  # disables device login (pages return 503); a non-origin value fails startup.
-  # Optional tuning, defaults shown.
-  # An approved device dies after this many seconds unused (90 days).
-  # - name: DEVICE_IDLE_TTL_SECS
-  #   value: "7776000"
-  # An approved device dies this many seconds after approval (365 days).
-  # - name: DEVICE_ABS_TTL_SECS
-  #   value: "31536000"
-  # Live approved devices per user.
-  # - name: DEVICE_MAX_PER_USER
-  #   value: "10"
-  # Unexpired login requests, globally / per requester IP.
-  # - name: DEVICE_MAX_PENDING
-  #   value: "10000"
-  # - name: DEVICE_MAX_PENDING_PER_IP
-  #   value: "5"
+  # path) is NOT listed here on purpose: the deployment template derives it
+  # from the ingress (https://<ingress.hosts[0].host>, http:// when
+  # ingress.tls is empty), so it survives deployments that replace this whole
+  # `env` list (PR previews do). Add an entry with that name to override it.
+  # Unset disables device login; a non-origin value fails startup.
   # Comma-separated internal URLs for the aggregated /api/v1/versions endpoint.
   # Adjust service names per region/deployment.
   - name: SERVICE_VERSION_URLS

@@ -99,7 +99,7 @@ fn camera_compatible_formats(cam: &mut Camera) {
             for (resolution, fps) in compatible {
                 formats.push((resolution, fps));
             }
-            formats.sort_by_key(|a| a.0);
+            formats.sort_by(|a, b| a.0.cmp(&b.0));
             for fmt in formats {
                 let (resolution, res) = fmt;
                 println!(" - {resolution}: {res:?}")

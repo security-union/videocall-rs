@@ -80,7 +80,7 @@ impl SessionManager {
 
     /// Called when a user connects to a room.
     ///
-    /// JWT validation happens at the handler level (ws_connect_authenticated / WebTransport)
+    /// JWT validation happens at the handler level (ws_connect / WebTransport)
     /// before this method is called. By the time we get here the token has
     /// already been verified.
     ///

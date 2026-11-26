@@ -21,18 +21,16 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use chrono::{Duration, Utc};
-use ed25519_dalek::SigningKey;
 use meeting_api::db::{self, DbPool};
 use meeting_api::routes::devices_api::MAX_DEVICES_PER_USER;
-use meeting_api::secrets::{random_base64url, sha256_hex};
 use meeting_api::state::AppState;
 use serde_json::{json, Value};
 use serial_test::serial;
 use test_helpers::*;
 use url::Url;
 use videocall_meeting_types::device::{
-    self, base64url_decode, base64url_encode, crypto, decode_authorize_request, fingerprint,
-    CLI_REMOTE_REDIRECT_URI,
+    self, base64url_decode, base64url_encode, crypto, crypto::DeviceKey, decode_authorize_request,
+    RegistrationClaims, CLI_ISSUER, CLI_REMOTE_REDIRECT_URI,
 };
 
 const AUD: &str = TEST_DEVICE_AUDIENCE;
@@ -40,7 +38,7 @@ const APPROVE: &str = "/api/v1/devices/authorizations";
 
 /// The CLI side of one login.
 struct Cli {
-    key: SigningKey,
+    key: DeviceKey,
     verifier: String,
     state: String,
     redirect_uri: String,
@@ -50,8 +48,8 @@ impl Cli {
     fn new(redirect_uri: &str) -> Self {
         Self {
             key: new_key(),
-            verifier: random_base64url(32),
-            state: random_base64url(32),
+            verifier: crypto::random_b64url(32).unwrap(),
+            state: crypto::random_b64url(32).unwrap(),
             redirect_uri: redirect_uri.to_string(),
         }
     }
@@ -71,16 +69,23 @@ impl Cli {
             "code_challenge": device::code_challenge_s256(&self.verifier),
             "code_challenge_method": "S256",
             "state": self.state,
-            "public_key": public_key_of(&self.key),
+            "public_key": self.key.public_key_b64(),
             "device_name": "laptop",
             "confirm": confirm,
         })
     }
 
-    fn registration(&self, signer: &SigningKey, aud: &str, public_key: &str, name: &str) -> String {
-        let key = crypto::encoding_key(signer).expect("encoding key");
-        crypto::sign_registration(&key, public_key, aud, name, Utc::now().timestamp())
-            .expect("sign")
+    fn registration(&self, signer: &DeviceKey, aud: &str, public_key: &str, name: &str) -> String {
+        let now = Utc::now().timestamp();
+        let claims = RegistrationClaims {
+            iss: CLI_ISSUER.into(),
+            aud: aud.into(),
+            iat: now,
+            exp: now + 120,
+            public_key: public_key.into(),
+            name: name.into(),
+        };
+        sign_eddsa(signer, None, &claims)
     }
 
     fn exchange_body(&self, code: &str) -> Value {
@@ -88,7 +93,7 @@ impl Cli {
             "code": code,
             "code_verifier": self.verifier,
             "redirect_uri": self.redirect_uri,
-            "registration": self.registration(&self.key, AUD, &public_key_of(&self.key), "laptop"),
+            "registration": self.registration(&self.key, AUD, &self.key.public_key_b64(), "laptop"),
         })
     }
 }
@@ -257,15 +262,14 @@ async fn loopback_approve_and_exchange() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(stored, sha256_hex(code));
+    assert_eq!(stored, crypto::sha256_hex(code));
 
     let resp = exchange(&state, &cli.exchange_body(code)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let device: Value = response_json(resp).await;
     assert_eq!(device["user_id"], user.as_str());
     assert_eq!(device["name"], "laptop");
-    let raw_key = cli.key.verifying_key().to_bytes();
-    assert_eq!(device["fingerprint"], fingerprint(&raw_key));
+    assert_eq!(device["fingerprint"], cli.key.fingerprint());
     let device_id = device["device_id"].as_str().unwrap();
     assert_eq!(me(&state, &cli, device_id).await, StatusCode::OK);
     assert_eq!(codes_of(&pool, &user).await, 0, "the code is consumed");
@@ -459,12 +463,12 @@ async fn every_invalid_grant_burns_the_code() {
     let state = build_state(pool.clone());
     let user = unique_user();
     let stranger = new_key();
-    let stranger_pk = public_key_of(&stranger);
+    let stranger_pk = stranger.public_key_b64();
 
-    type Tamper = fn(&Cli, &mut Value, &SigningKey, &str);
+    type Tamper = fn(&Cli, &mut Value, &DeviceKey, &str);
     let tampers: Vec<(&str, Tamper)> = vec![
         ("wrong verifier", |_, body, _, _| {
-            body["code_verifier"] = json!(random_base64url(32));
+            body["code_verifier"] = json!(crypto::random_b64url(32).unwrap());
         }),
         ("wrong redirect_uri", |_, body, _, _| {
             body["redirect_uri"] = json!("http://127.0.0.1:53683/callback");
@@ -473,16 +477,16 @@ async fn every_invalid_grant_burns_the_code() {
             body["registration"] = json!(cli.registration(key, AUD, pk, "laptop"));
         }),
         ("registration with another name", |cli, body, _, _| {
-            let pk = public_key_of(&cli.key);
+            let pk = cli.key.public_key_b64();
             body["registration"] = json!(cli.registration(&cli.key, AUD, &pk, "desktop"));
         }),
         ("registration for another audience", |cli, body, _, _| {
-            let pk = public_key_of(&cli.key);
+            let pk = cli.key.public_key_b64();
             let other_aud = "http://localhost:9999";
             body["registration"] = json!(cli.registration(&cli.key, other_aud, &pk, "laptop"));
         }),
         ("registration signed by another key", |cli, body, key, _| {
-            let pk = public_key_of(&cli.key);
+            let pk = cli.key.public_key_b64();
             body["registration"] = json!(cli.registration(key, AUD, &pk, "laptop"));
         }),
         ("expired code", |_, _, _, _| {}),
@@ -509,7 +513,11 @@ async fn every_invalid_grant_burns_the_code() {
 
     // Unknown and reused codes.
     let cli = Cli::loopback();
-    let resp = exchange(&state, &cli.exchange_body(&random_base64url(32))).await;
+    let resp = exchange(
+        &state,
+        &cli.exchange_body(&crypto::random_b64url(32).unwrap()),
+    )
+    .await;
     assert_cli_error(resp, StatusCode::BAD_REQUEST, "invalid_grant").await;
     let code = approved_code(&state, &user, &cli).await;
     let resp = exchange(&state, &cli.exchange_body(&code)).await;
@@ -566,11 +574,11 @@ async fn device_cap_holds_under_concurrent_inserts() {
         .map(|_| {
             let (pool, user) = (pool.clone(), user.clone());
             tokio::spawn(async move {
-                let raw = new_key().verifying_key().to_bytes();
+                let key = new_key();
                 let device = db::devices::NewDevice {
-                    id: &random_base64url(16),
-                    public_key: &base64url_encode(&raw),
-                    fingerprint: &fingerprint(&raw),
+                    id: &crypto::random_b64url(16).unwrap(),
+                    public_key: &key.public_key_b64(),
+                    fingerprint: &key.fingerprint(),
                     name: "racer",
                     user_id: &user,
                     user_name: "Racer",
@@ -623,10 +631,7 @@ async fn list_shows_only_own_live_devices() {
     let item = &items[0];
     assert_eq!(item["id"], live.as_str());
     assert_eq!(item["name"], "laptop");
-    assert_eq!(
-        item["fingerprint"],
-        fingerprint(&cli.key.verifying_key().to_bytes())
-    );
+    assert_eq!(item["fingerprint"], cli.key.fingerprint());
     let now = Utc::now().timestamp();
     assert!((item["created_at"].as_i64().unwrap() - now).abs() < 60);
     assert!((item["last_used_at"].as_i64().unwrap() - now).abs() < 60);
@@ -660,7 +665,7 @@ async fn revoke_own_device_is_immediate_and_others_are_404() {
     let mut bodies = Vec::new();
     for id in [
         their_device.as_str(),
-        &random_base64url(16),
+        &crypto::random_b64url(16).unwrap(),
         "not-a-device-id",
     ] {
         let resp = send(&state, delete(id)).await;

@@ -204,6 +204,7 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		cargo test -p meeting-api -- --nocapture --test-threads=1 && \
 		cargo test -p videocall-meeting-types && \
 		cargo test -p videocall-meeting-types --features device-crypto && \
+		cargo test -p videocall-meeting-client --features device-session && \
 		cargo test -p videocall-cli --lib auth::"
 
 check-backend-down: ensure-nix ## Stop the check-backend middleware and delete its state

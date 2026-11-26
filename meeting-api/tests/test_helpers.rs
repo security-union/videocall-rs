@@ -20,18 +20,15 @@ use axum::http;
 use axum::response::Response;
 use axum::Router;
 use chrono::{Duration, Utc};
-use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
 use meeting_api::config::DeviceAuthConfig;
 use meeting_api::db::{self, DbPool};
-use meeting_api::secrets::random_base64url;
 use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tower::ServiceExt;
-use videocall_meeting_types::device::{
-    base64url_encode, crypto, fingerprint, DeviceTokenClaims, CLI_ISSUER,
-};
+use videocall_meeting_types::device::crypto::{self, DeviceKey};
+use videocall_meeting_types::device::{DeviceTokenClaims, CLI_ISSUER};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -137,21 +134,19 @@ pub fn bearer(method: &str, uri: &str, token: &str) -> http::request::Builder {
 // ---------------------------------------------------------------------------
 
 pub fn unique_user() -> String {
-    format!("dev-{}@test.local", random_base64url(16).to_lowercase())
+    format!(
+        "dev-{}@test.local",
+        crypto::random_b64url(16).unwrap().to_lowercase()
+    )
 }
 
-pub fn new_key() -> SigningKey {
-    SigningKey::from_bytes(&rand::random())
-}
-
-pub fn public_key_of(key: &SigningKey) -> String {
-    base64url_encode(&key.verifying_key().to_bytes())
+pub fn new_key() -> DeviceKey {
+    DeviceKey::generate().expect("key")
 }
 
 /// Sign `claims` as an EdDSA JWT, the way the CLI does.
-pub fn sign_eddsa<T: Serialize>(key: &SigningKey, kid: Option<&str>, claims: &T) -> String {
-    let key = crypto::encoding_key(key).expect("encoding key");
-    crypto::sign(&key, kid, claims).expect("sign")
+pub fn sign_eddsa<T: Serialize>(key: &DeviceKey, kid: Option<&str>, claims: &T) -> String {
+    key.sign_claims(kid, claims).expect("sign")
 }
 
 pub fn device_claims(sub: &str, aud: &str, iat: i64, exp: i64) -> DeviceTokenClaims {
@@ -161,12 +156,12 @@ pub fn device_claims(sub: &str, aud: &str, iat: i64, exp: i64) -> DeviceTokenCla
         aud: aud.to_string(),
         iat,
         exp,
-        jti: random_base64url(16),
+        jti: crypto::random_b64url(16).unwrap(),
     }
 }
 
 /// A valid 120 s device JWT for `device_id`.
-pub fn device_jwt(key: &SigningKey, device_id: &str) -> String {
+pub fn device_jwt(key: &DeviceKey, device_id: &str) -> String {
     let now = Utc::now().timestamp();
     let claims = device_claims(device_id, TEST_DEVICE_AUDIENCE, now, now + 120);
     sign_eddsa(key, Some(device_id), &claims)
@@ -174,7 +169,7 @@ pub fn device_jwt(key: &SigningKey, device_id: &str) -> String {
 
 pub struct TestDevice {
     pub id: String,
-    pub key: SigningKey,
+    pub key: DeviceKey,
     pub user_id: String,
 }
 
@@ -197,8 +192,7 @@ pub enum Fixture {
 /// `Name of {user_id}`.
 pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> TestDevice {
     let key = new_key();
-    let raw = key.verifying_key().to_bytes();
-    let id = random_base64url(16);
+    let id = crypto::random_b64url(16).unwrap();
     let now = Utc::now();
     let day = Duration::days(1);
     let (last_used, idle, abs) = match fixture {
@@ -211,8 +205,8 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
     };
     let device = db::devices::NewDevice {
         id: &id,
-        public_key: &base64url_encode(&raw),
-        fingerprint: &fingerprint(&raw),
+        public_key: &key.public_key_b64(),
+        fingerprint: &key.fingerprint(),
         name: "fixture",
         user_id,
         user_name: &format!("Name of {user_id}"),

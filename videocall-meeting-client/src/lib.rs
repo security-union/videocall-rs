@@ -38,6 +38,8 @@
 
 pub mod auth;
 pub mod device_browser;
+#[cfg(feature = "device-session")]
+pub mod device_session;
 pub mod devices;
 pub mod error;
 pub mod meetings;
@@ -151,6 +153,11 @@ impl MeetingApiClient {
     /// Build a PATCH request with auth applied.
     pub(crate) fn patch(&self, path: &str) -> reqwest::RequestBuilder {
         self.apply_auth(self.http.patch(self.url(path)))
+    }
+
+    #[cfg(feature = "device-session")]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn url(&self, path: &str) -> String {

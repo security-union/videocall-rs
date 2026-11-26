@@ -26,38 +26,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use videocall_meeting_types::device::{code_challenge_s256, RedirectUri};
-
-use super::random_b64url;
+use videocall_meeting_client::device_session::ct_eq;
+use videocall_meeting_types::device::RedirectUri;
 
 /// How long the human has to finish in the browser.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// A PKCE S256 verifier and its challenge.
-pub struct Pkce {
-    pub verifier: SecretString,
-    pub challenge: String,
-}
-
-impl Pkce {
-    /// A verifier from 32 CSPRNG bytes (43 characters).
-    pub fn generate() -> Result<Self, getrandom::Error> {
-        Ok(Self::from_verifier(random_b64url(32)?))
-    }
-
-    fn from_verifier(verifier: String) -> Self {
-        let challenge = code_challenge_s256(&verifier);
-        Self {
-            verifier: SecretString::from(verifier),
-            challenge,
-        }
-    }
-}
 
 /// Why the loopback login produced no code.
 #[derive(Debug, thiserror::Error)]
@@ -102,7 +79,7 @@ fn judge(request_line: &str, expected_state: &str) -> Outcome {
         }
     }
     match states.as_slice() {
-        [state] if bool::from(state.as_bytes().ct_eq(expected_state.as_bytes())) => {}
+        [state] if ct_eq(state, expected_state) => {}
         _ => return Outcome::Ignored,
     }
     Outcome::Done(match (errors.as_slice(), codes.as_slice()) {
@@ -223,16 +200,6 @@ mod tests {
     use secrecy::ExposeSecret;
 
     const STATE: &str = "state-0123456789abcdef";
-
-    #[test]
-    fn pkce_matches_rfc7636_appendix_b() {
-        let pkce = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into());
-        assert_eq!(
-            pkce.challenge,
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        assert_eq!(Pkce::generate().unwrap().verifier.expose_secret().len(), 43);
-    }
 
     #[test]
     fn judging_requests() {

@@ -17,46 +17,14 @@
 
 use videocall_meeting_types::device::{
     DeviceErrorResponse, DeviceStatusResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    CLI_AUTHORIZE_PATH, CLI_CLIENT_ID, CODE_CHALLENGE_METHOD_S256, DEVICES_ME_PATH, DEVICES_PATH,
+    DEVICES_ME_PATH, DEVICES_PATH,
 };
 
 use crate::error::ApiError;
 use crate::MeetingApiClient;
 use videocall_meeting_types::{APIError, APIResponse};
 
-/// Inputs of [`MeetingApiClient::cli_authorize_url`].
-#[derive(Debug, Clone, Copy)]
-pub struct CliAuthorizeParams<'a> {
-    /// `http://127.0.0.1:{port}/callback`, or
-    /// [`CLI_REMOTE_REDIRECT_URI`](videocall_meeting_types::device::CLI_REMOTE_REDIRECT_URI).
-    pub redirect_uri: &'a str,
-    /// `BASE64URL(SHA256(code_verifier))`.
-    pub code_challenge: &'a str,
-    /// Random `state`, checked on the loopback callback.
-    pub state: &'a str,
-    /// The new device's Ed25519 public key, base64url (43 chars).
-    pub public_key: &'a str,
-    /// Device name shown on the consent page.
-    pub device_name: &'a str,
-}
-
 impl MeetingApiClient {
-    /// The browser URL that starts the login (`{base}/cli/authorize?…`).
-    pub fn cli_authorize_url(&self, params: &CliAuthorizeParams<'_>) -> Result<String, ApiError> {
-        let mut url = reqwest::Url::parse(&self.url(CLI_AUTHORIZE_PATH))
-            .map_err(|e| ApiError::Config(format!("bad base URL: {e}")))?;
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", CLI_CLIENT_ID)
-            .append_pair("redirect_uri", params.redirect_uri)
-            .append_pair("code_challenge", params.code_challenge)
-            .append_pair("code_challenge_method", CODE_CHALLENGE_METHOD_S256)
-            .append_pair("state", params.state)
-            .append_pair("public_key", params.public_key)
-            .append_pair("device_name", params.device_name);
-        Ok(url.into())
-    }
-
     fn register_request(&self, request: &RegisterDeviceRequest) -> reqwest::RequestBuilder {
         // Unauthenticated by design: the code, verifier and registration JWS
         // are the proof.
@@ -81,6 +49,7 @@ impl MeetingApiClient {
     /// The server's clock in Unix seconds, from the `Date` header of an
     /// unauthenticated `GET /version`, so a device with a wrong clock can
     /// still sign tokens the server accepts.
+    #[cfg(feature = "device-session")]
     pub async fn server_time(&self) -> Option<i64> {
         let response = self.http.get(self.url("/version")).send().await.ok()?;
         let date = response
@@ -163,39 +132,6 @@ mod tests {
             AuthMode::Signed(counter.clone()),
         );
         (counter, client)
-    }
-
-    #[test]
-    fn authorize_url_shape() {
-        let (_, client) = signed();
-        let url = client
-            .cli_authorize_url(&CliAuthorizeParams {
-                redirect_uri: "http://127.0.0.1:5000/callback",
-                code_challenge: "challenge",
-                state: "st&ate=x",
-                public_key: "pk",
-                device_name: "videocall-cli on pi4",
-            })
-            .unwrap();
-        let url = reqwest::Url::parse(&url).unwrap();
-        assert_eq!(
-            url.origin().ascii_serialization(),
-            "https://api.example.com"
-        );
-        assert_eq!(url.path(), "/cli/authorize");
-        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        let get = |k: &str| {
-            pairs
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get("response_type"), Some("code"));
-        assert_eq!(get("client_id"), Some("videocall-cli"));
-        assert_eq!(get("redirect_uri"), Some("http://127.0.0.1:5000/callback"));
-        assert_eq!(get("code_challenge_method"), Some("S256"));
-        assert_eq!(get("state"), Some("st&ate=x"));
-        assert_eq!(get("device_name"), Some("videocall-cli on pi4"));
     }
 
     #[test]

@@ -23,11 +23,11 @@ use axum::http::{self, Request, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Duration, Utc};
 use meeting_api::db::{self, meetings as db_meetings, DbPool};
-use meeting_api::secrets::random_base64url;
 use meeting_api::state::AppState;
 use serde_json::{json, Value};
 use serial_test::serial;
 use test_helpers::*;
+use videocall_meeting_types::device::{crypto, decode_public_key};
 use videocall_meeting_types::RoomAccessTokenClaims;
 
 async fn create_meeting(pool: &DbPool, room: &str, creator: &str, active: bool) {
@@ -92,10 +92,12 @@ async fn rejected_credentials_get_401() {
             ..jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256)
         },
         &own_claims,
-        &jsonwebtoken::EncodingKey::from_secret(&device.key.verifying_key().to_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(
+            &decode_public_key(&device.key.public_key_b64()).unwrap(),
+        ),
     )
     .unwrap();
-    let unknown = random_base64url(16);
+    let unknown = crypto::random_b64url(16).unwrap();
     let room_token = meeting_api::token::generate_room_token(
         TEST_JWT_SECRET,
         600,
@@ -192,7 +194,7 @@ async fn device_token_forbidden_on_browser_only_routes() {
         "code_challenge": "A".repeat(43),
         "code_challenge_method": "S256",
         "state": "s".repeat(16),
-        "public_key": public_key_of(&new_key()),
+        "public_key": new_key().public_key_b64(),
         "device_name": "next",
         "confirm": true,
     })

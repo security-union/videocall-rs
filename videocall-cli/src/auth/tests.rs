@@ -17,11 +17,14 @@
  */
 
 use super::*;
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
+use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use videocall_meeting_client::device_session::DeviceKey;
 use videocall_meeting_types::device::{base64url_decode, code_challenge_s256};
 
 const OLD_ID: &str = "oLdDeViCe0123456789abc";
@@ -193,7 +196,7 @@ async fn mock(
                     body: serde_json::from_str(&body).unwrap_or(Value::Null),
                 };
                 log.lock().unwrap().push(seen.clone());
-                let server_now = keys::local_now() + skew;
+                let server_now = videocall_meeting_client::device_session::local_now() + skew;
                 let (status, body) = handler(&seen, server_now);
                 let body = if body.is_null() {
                     String::new()
@@ -228,7 +231,7 @@ fn ctx_with(
     Ctx {
         store: Store::with_dir(tmp.path().join("videocall"), false),
         http: reqwest::Client::new(),
-        clock: Box::leak(Box::default()),
+        clock: Box::leak(Box::new(Clock::new(|_| {}))),
         show_url: Arc::new(open),
         read_code: Arc::new(move || Ok(format!("{pasted}\n"))),
     }
@@ -271,12 +274,9 @@ async fn a_401_is_retried_once_only_if_the_clock_explains_it() {
         .await;
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(&tmp, |_, _| false, "");
-        let creds = Credentials::new(
-            DeviceKey::generate().unwrap(),
-            OLD_ID.into(),
-            &server.api,
-            &ctx,
-        );
+        save_device(&ctx, &server.api, OLD_ID);
+        let (device, _) = ctx.store.load(server.api.as_str()).unwrap().unwrap();
+        let creds = Credentials::new(&device, &ctx).unwrap();
         let result = creds
             .call(|client| async move { client.device_me().await })
             .await;

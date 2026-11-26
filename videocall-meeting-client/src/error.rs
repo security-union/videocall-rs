@@ -60,4 +60,9 @@ pub enum ApiError {
     /// A configuration error (e.g. missing base URL).
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// The device key couldn't be generated, loaded or used to sign.
+    #[cfg(feature = "device-session")]
+    #[error(transparent)]
+    Key(#[from] videocall_meeting_types::device::crypto::KeyError),
 }

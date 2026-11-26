@@ -38,7 +38,6 @@ use crate::device_auth::{
     self, is_valid_code_verifier, verify_device_jwt, AllowedStates, DeviceAuthError,
 };
 use crate::error::AppError;
-use crate::secrets::{ct_eq, random_base64url, sha256_hex};
 use crate::state::AppState;
 
 /// Largest accepted body on the two POST routes.
@@ -75,8 +74,8 @@ fn invalid_grant() -> Response {
     )
 }
 
-fn server_error(e: sqlx::Error) -> Response {
-    tracing::error!("database error: {e}");
+fn server_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!("device API error: {e}");
     error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "server_error",
@@ -125,7 +124,8 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
     // Burn the code first, in its own autocommitted statement: whatever
     // fails below, it cannot be tried again.
     let now = Utc::now();
-    let row = match db_codes::consume_code(&state.db, &sha256_hex(&request.code), now).await {
+    let row = match db_codes::consume_code(&state.db, &crypto::sha256_hex(&request.code), now).await
+    {
         Ok(Some(row)) => row,
         Ok(None) => {
             tracing::info!("device registration rejected: unknown, used or expired code");
@@ -138,7 +138,7 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         if request.redirect_uri != row.redirect_uri {
             return Err("redirect_uri mismatch");
         }
-        if !ct_eq(
+        if !crypto::ct_eq(
             &codes::code_challenge_s256(&request.code_verifier),
             &row.code_challenge,
         ) {
@@ -160,7 +160,10 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     };
 
-    let device_id = random_base64url(16);
+    let device_id = match crypto::random_b64url(16) {
+        Ok(device_id) => device_id,
+        Err(e) => return server_error(e),
+    };
     let fingerprint = fingerprint(&raw_key);
     let abs_expires_at = now + Duration::seconds(DEVICE_ABS_TTL_SECS);
     let idle_expires_at = now + Duration::seconds(DEVICE_IDLE_TTL_SECS);
@@ -391,13 +394,17 @@ pub async fn create_authorization(
         ));
     }
 
-    let code = random_base64url(32);
+    // Logged, like `register`; the response carries no detail.
+    let code = crypto::random_b64url(32).map_err(|e| {
+        tracing::error!("device API error: {e}");
+        AppError::internal("internal error")
+    })?;
     let ttl = match target {
         RedirectUri::Loopback { .. } => LOOPBACK_CODE_TTL_SECS,
         RedirectUri::Remote => REMOTE_CODE_TTL_SECS,
     };
     let row = DeviceCodeRow {
-        code_hash: sha256_hex(&code),
+        code_hash: crypto::sha256_hex(&code),
         user_id: user.user_id,
         user_name: user.name,
         public_key: request.public_key,

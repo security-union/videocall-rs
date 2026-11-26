@@ -426,7 +426,8 @@ mod tests {
         )
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn good_queries_parse() {
         let loopback = parse_authorize_query(&query("http://127.0.0.1:5000/callback", "")).unwrap();
         assert_eq!(loopback.redirect, RedirectUri::Loopback { port: 5000 });
@@ -438,7 +439,8 @@ mod tests {
         assert_eq!(remote.body.state, "");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn bad_queries_are_rejected() {
         let good = query("http://127.0.0.1:5000/callback", "");
         for bad in [
@@ -469,7 +471,8 @@ mod tests {
             )
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn raw_query_keeps_plus_and_percent() {
         let request = parse_authorize_query(&plus_query()).unwrap();
         assert_eq!(request.body.device_name, "C++ rig");
@@ -478,7 +481,8 @@ mod tests {
 
     /// The API's `request=` form survives the router untouched, so the
     /// router's percent-decoding cannot reach `+` or `%`.
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn encoded_request_survives_the_router() {
         use videocall_meeting_types::device::encode_authorize_request;
         let encoded = encode_authorize_request(&plus_query());
@@ -497,7 +501,8 @@ mod tests {
         assert_eq!(parsed.body.state, "abcdefghijklmnop+qrs%tu");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn denied_url_is_built_from_the_port() {
         assert_eq!(
             loopback_denied_url(5000, "a&b=c d"),
@@ -505,7 +510,8 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn redirect_to_must_hit_the_same_listener() {
         let good = "http://127.0.0.1:5000/callback?code=x&state=y";
         assert_eq!(checked_redirect_to(5000, good), Some(good));

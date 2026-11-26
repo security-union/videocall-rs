@@ -22,8 +22,12 @@ let
   stacks = import ./nix/dev-stack.nix { inherit p packages; };
   inherit (stacks) devStack e2eStack;
   shells = import ./nix/shells.nix { inherit p rust devStack e2eStack packages; };
+  # NixOS VM tests (Linux only, need KVM): nix-build release.nix -A tests.<name>
+  tests = {
+    cli-device-enrollment = import ./nix/tests/cli-device-enrollment.nix { inherit p packages; };
+  };
 in
 {
-  inherit shells packages images devStack e2eStack;
+  inherit shells packages images tests devStack e2eStack;
   inherit (p) pkgs pkgsLinux pkgsLinuxStatic muslTarget;
 }

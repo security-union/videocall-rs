@@ -13,5 +13,5 @@ let
   d = import ./default.nix { inherit system gitSha gitBranch buildTimestamp; };
 in
 {
-  inherit (d) packages images;
+  inherit (d) packages images tests;
 }

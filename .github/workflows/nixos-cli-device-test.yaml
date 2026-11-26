@@ -1,0 +1,52 @@
+name: NixOS CLI Device Test
+
+# PR gate: boot a NixOS VM and drive `videocall-cli auth login --remote` /
+# `status` / `logout` against a mock meeting-api (nix/tests/mock-meeting-api.py),
+# with the test script acting as the human who approves the login. No database,
+# no real server, no browser, no network. The test is defined in
+# nix/tests/cli-device-enrollment.nix. The CLI is the same `packages.videocall-cli`
+# derivation docker-build-check builds, so it comes from the cachix cache.
+on:
+  pull_request:
+    paths:
+      - 'videocall-cli/**'
+      - 'videocall-meeting-types/**'
+      - 'videocall-meeting-client/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/nixos-cli-device-test.yaml'
+      # Nix build system
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
+
+jobs:
+  device-enrollment:
+    name: videocall-cli device enrollment (NixOS VM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      # NixOS VM tests need hardware virtualization (the derivation requires the
+      # `kvm` system feature, which nix grants only when /dev/kvm exists).
+      # GitHub-hosted x64 Linux runners expose it once the device is made
+      # accessible. Fail early and loudly if it is not there.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: videocall-rs
+          # pull works tokenless (public cache); push activates once the
+          # CACHIX_AUTH_TOKEN repo secret exists
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Run the device enrollment VM test
+        run: nix-build release.nix -A tests.cli-device-enrollment --no-out-link --print-build-logs

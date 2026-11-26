@@ -33,16 +33,18 @@ export VIDEOCALL_CONFIG_DIR=$CFG
 export RUST_LOG=warn
 
 tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }
-say() { printf '\n== %s\n' "$*"; }
+say() { printf '\n== %s (%s)\n' "$*" "$(date +%T)"; }
 die() { printf '\nFAIL: %s\n' "$*" >&2; [ -f "$WORK/login.out" ] && sed 's/^/  login.out: /' "$WORK/login.out" >&2; exit 1; }
 check() { local what=$1; shift; "$@" || die "$what"; }
 wait_for() { local n=$(($2 * 4)); while [ $n -gt 0 ]; do eval "$1" && return 0; sleep 0.25; n=$((n - 1)); done; return 1; }
 
 # ---- mock backend ---------------------------------------------------------
+echo "start $(date +%T)"
 "$MOCK_PYTHON" "$MOCK" "$PORT" >"$WORK/mock.log" 2>&1 &
 MOCK_PID=$!
 trap 'kill $MOCK_PID 2>/dev/null' EXIT
-wait_for "curl -sf $API/version >/dev/null" 15 || die "mock did not start"
+wait_for "curl -sf --max-time 2 $API/version >/dev/null" 90 || { cat "$WORK/mock.log"; die "mock did not start"; }
+echo "mock up $(date +%T)"
 mock_state() { curl -sf "$API/_mock/state" | "$MOCK_PYTHON" -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 
 # ---- the keychain -----------------------------------------------------------

@@ -322,9 +322,10 @@ mod keychain {
 
     pub const AVAILABLE: bool = true;
 
-    /// Run a keychain call; if it takes over 2 s, say why on stderr. macOS
-    /// asks before a rebuilt binary may use the item, and the call blocks
-    /// until someone answers that dialog on the Mac's screen.
+    /// Run a keychain call; if it takes over 2 s, say why on stderr. On
+    /// macOS a read, write or delete blocks with no error until someone
+    /// answers the access dialog a rebuilt binary gets, or forever while
+    /// the keychain is locked (typical over SSH).
     fn with_notice<T>(call: impl FnOnce() -> T) -> T {
         let (done, waiting) = mpsc::channel::<()>();
         std::thread::spawn(move || {
@@ -333,8 +334,9 @@ mod keychain {
             {
                 #[cfg(target_os = "macos")]
                 eprintln!(
-                    "Waiting for keychain access. If this Mac shows a dialog, choose Always \
-                     Allow. Over SSH, answer it at the Mac's screen once."
+                    "Waiting for the macOS keychain. If a dialog is open on this Mac's screen, \
+                     choose Always Allow.\nIf the keychain is locked (typical over SSH), press \
+                     Ctrl-C, run `security unlock-keychain`, and try again."
                 );
                 #[cfg(target_os = "windows")]
                 eprintln!("Waiting for Windows Credential Manager...");
@@ -359,13 +361,13 @@ mod keychain {
     }
 
     pub fn set(origin: &str, value: &str) -> Result<(), StoreError> {
-        entry(origin)?
-            .set_password(value)
-            .map_err(|e| StoreError::Keychain(e.to_string()))
+        let entry = entry(origin)?;
+        with_notice(|| entry.set_password(value)).map_err(|e| StoreError::Keychain(e.to_string()))
     }
 
     pub fn delete(origin: &str) -> Result<(), StoreError> {
-        match entry(origin)?.delete_credential() {
+        let entry = entry(origin)?;
+        match with_notice(|| entry.delete_credential()) {
             Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(StoreError::Keychain(e.to_string())),
         }

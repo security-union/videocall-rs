@@ -137,7 +137,7 @@ videocall-cli auth login --remote --name "Garage Pi"
 
 Each machine has its own key. You can see and revoke them all at [app.videocall.rs/devices](https://app.videocall.rs/devices); `videocall-cli auth logout` revokes this one. Revoking stops new joins within five minutes but doesn't cut a relay session that's already connected.
 
-The private key never leaves the machine. It lives in the OS keychain on macOS and Windows, and on Linux in a 0600 file under `~/.config/videocall/` (`VIDEOCALL_CONFIG_DIR` moves it). On macOS, a newly built binary has to be allowed into the keychain once: if the CLI says it's waiting for keychain access, answer the dialog on the Mac's screen. A machine expires after 90 days unused or a year after approval; then run `auth login` again.
+The private key never leaves the machine. It lives in the OS keychain on macOS and Windows, and on Linux in a 0600 file under `~/.config/videocall/` (`VIDEOCALL_CONFIG_DIR` moves it). On macOS, if the CLI says it's waiting for the keychain, either a newly built binary needs the dialog on the Mac's screen answered once, or the keychain is locked (typical over SSH): run `security unlock-keychain` and try again. A machine expires after 90 days unused or a year after approval; then run `auth login` again.
 
 ## ⬆️ Upgrading from a version with `--user-id`
 

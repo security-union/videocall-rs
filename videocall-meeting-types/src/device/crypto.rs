@@ -43,6 +43,7 @@ pub fn encoding_key(signing: &SigningKey) -> Result<EncodingKey, String> {
 
 /// Sign `claims` with the one device header shape: EdDSA, `typ: JWT`, and
 /// `kid` when given.
+#[doc(hidden)] // Public only so meeting-api's tests can sign arbitrary claims.
 pub fn sign(
     key: &EncodingKey,
     kid: Option<&str>,
@@ -166,6 +167,9 @@ pub fn verify_device_token(
     expected_aud: &str,
     now: i64,
 ) -> Result<DeviceTokenClaims, &'static str> {
+    if token.len() > MAX_DEVICE_TOKEN_LEN {
+        return Err("token too long");
+    }
     // Only ever build a DecodingKey from exactly 32 bytes: the EdDSA verifier
     // slices [..32] and would panic on a shorter key.
     let raw = decode_public_key(public_key_b64).ok_or("stored key")?;

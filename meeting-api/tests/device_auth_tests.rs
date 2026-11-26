@@ -84,6 +84,17 @@ async fn rejected_credentials_get_401() {
     );
 
     let now = Utc::now().timestamp();
+    let own_claims = device_claims(&device.id, TEST_DEVICE_AUDIENCE, now, now + 120);
+    // Keyed with the device's public key: the classic algorithm-confusion token.
+    let hs256_with_kid = jsonwebtoken::encode(
+        &jsonwebtoken::Header {
+            kid: Some(device.id.clone()),
+            ..jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256)
+        },
+        &own_claims,
+        &jsonwebtoken::EncodingKey::from_secret(&device.key.verifying_key().to_bytes()),
+    )
+    .unwrap();
     let unknown = random_base64url(16);
     let room_token = meeting_api::token::generate_room_token(
         TEST_JWT_SECRET,
@@ -107,6 +118,16 @@ async fn rejected_credentials_get_401() {
             true,
         ),
         ("room token as bearer".into(), get(&room_token), false),
+        (
+            "EdDSA without kid".into(),
+            get(&sign_eddsa(&device.key, None, &own_claims)),
+            false,
+        ),
+        (
+            "HS256 with a device-shaped kid".into(),
+            get(&hs256_with_kid),
+            false,
+        ),
         (
             "device token in the session cookie".into(),
             Request::builder()

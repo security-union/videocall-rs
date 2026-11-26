@@ -11,9 +11,9 @@
  * at your option.
  */
 
-//! Device-JWT and registration-JWS verification on the server: the token
-//! length limit, the `devices` row lookup and its state. The token format
-//! and the signature checks are shared with the CLI in
+//! Device-JWT verification on the server: the `devices` row lookup and its
+//! state. The token format, length limit and signature checks are shared
+//! with the CLI in
 //! [`videocall_meeting_types::device::crypto`].
 
 use chrono::{DateTime, Duration, Utc};

@@ -57,7 +57,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2.2", features = ["pkcs8", "alloc"] }
+ed25519-dalek = "2.2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serial_test = "3"

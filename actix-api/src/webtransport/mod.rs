@@ -1475,6 +1475,10 @@ mod tests {
     fn authorize_connect_decisions() {
         let token = token_for("alice", "room-1");
         let token = Some(token.as_str());
+        let expired = meeting_api::token::generate_room_token(
+            JWT_SECRET, -120, "alice", "room-1", false, "Alice",
+        )
+        .expect("generate token");
         let refused = [
             (
                 "/lobby/alice/room-1",
@@ -1500,6 +1504,12 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             ("/lobby", token, "another-secret", StatusCode::FORBIDDEN),
+            (
+                "/lobby",
+                Some(&expired),
+                JWT_SECRET,
+                StatusCode::UNAUTHORIZED,
+            ),
             ("/lobby", token, "", StatusCode::INTERNAL_SERVER_ERROR),
         ];
         for (path, token, secret, status) in refused {

@@ -58,6 +58,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
 }
 
 /// One registered device, as stored. `Debug` redacts the key.
+// Serialize writes the seed in clear: only `Store::save` may serialize this.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredDevice {
     /// The API origin. Checked on load, so two origins can never share a key.
@@ -155,39 +156,47 @@ impl Store {
         self.dir.join(format!("{name}.toml"))
     }
 
-    /// The device for `origin` and where it was found, if any.
+    /// The device for `origin` and where it was found, if any. The file
+    /// comes first: it exists only if the keychain refused the last save,
+    /// so any keychain item is older.
     pub fn load(&self, origin: &str) -> Result<Option<(StoredDevice, Location)>, StoreError> {
-        if self.use_keychain {
-            // A keychain that refuses to answer may be why `save` fell back
-            // to the file, so look there next.
-            match keychain::get(origin).map(|text| text.map(Zeroizing::new)) {
-                Ok(Some(text)) => {
-                    return Ok(
-                        parse(&text, origin, "keychain item")?.map(|d| (d, Location::Keychain))
-                    )
+        let path = self.path(origin);
+        match File::open(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&path)(e)),
+            Ok(mut file) => {
+                check_private(&file, &path)?;
+                let mut text = Zeroizing::new(String::new());
+                file.read_to_string(&mut text).map_err(io_err(&path))?;
+                let source = path.display().to_string();
+                if let Some(device) = parse(&text, origin, &source)? {
+                    return Ok(Some((device, Location::File(path))));
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("{e}; looking for a key file instead"),
             }
         }
-        let path = self.path(origin);
-        let mut file = match File::open(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            other => other.map_err(io_err(&path))?,
-        };
-        check_private(&file, &path)?;
-        let mut text = Zeroizing::new(String::new());
-        file.read_to_string(&mut text).map_err(io_err(&path))?;
-        Ok(parse(&text, origin, &path.display().to_string())?.map(|d| (d, Location::File(path))))
+        if !self.use_keychain {
+            return Ok(None);
+        }
+        match keychain::get(origin) {
+            Ok(Some(text)) => {
+                let text = Zeroizing::new(text);
+                Ok(parse(&text, origin, "keychain item")?.map(|d| (d, Location::Keychain)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                tracing::warn!("{e}; no key file either");
+                Ok(None)
+            }
+        }
     }
 
     /// Save `device` for its origin, in the keychain if possible, else in
     /// the file, and remove any copy in the other place.
     pub fn save(&self, device: &StoredDevice) -> Result<Location, StoreError> {
         let origin = device.origin.as_str();
-        let text = Zeroizing::new(
-            toml::to_string(device).map_err(|e| StoreError::Corrupt(e.to_string()))?,
-        );
+        let text = Zeroizing::new(toml::to_string(device).map_err(|e| {
+            StoreError::Io("encoding the device record".into(), io::Error::other(e))
+        })?);
         if self.use_keychain {
             match keychain::set(origin, &text) {
                 Ok(()) => return self.remove_file(origin).map(|()| Location::Keychain),
@@ -198,29 +207,21 @@ impl Store {
         let path = self.path(origin);
         write_private(&path, text.as_bytes())?;
         if self.use_keychain {
-            let _ = keychain::delete(origin);
+            if let Err(e) = keychain::delete(origin) {
+                tracing::warn!("{e}; an older key may remain in the keychain");
+            }
         }
         Ok(Location::File(path))
     }
 
-    /// Delete everything stored for `origin`. A keychain error is returned
-    /// only when there was no file to delete either.
+    /// Delete everything stored for `origin`: the file first, then the
+    /// keychain item, so a keychain error never leaves the file behind.
     pub fn remove(&self, origin: &str) -> Result<(), StoreError> {
-        let keychain = if self.use_keychain {
-            keychain::delete(origin)
-        } else {
-            Ok(())
-        };
-        let path = self.path(origin);
-        match fs::remove_file(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => keychain,
-            result => {
-                if let Err(e) = keychain {
-                    tracing::warn!("{e}");
-                }
-                result.map_err(io_err(&path))
-            }
+        let file = self.remove_file(origin);
+        if self.use_keychain {
+            keychain::delete(origin)?;
         }
+        file
     }
 
     fn remove_file(&self, origin: &str) -> Result<(), StoreError> {

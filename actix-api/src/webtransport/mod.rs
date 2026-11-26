@@ -1475,6 +1475,10 @@ mod tests {
     fn authorize_connect_decisions() {
         let token = token_for("alice", "room-1");
         let token = Some(token.as_str());
+        let expired = meeting_api::token::generate_room_token(
+            JWT_SECRET, -120, "alice", "room-1", false, "Alice",
+        )
+        .expect("generate token");
         let refused = [
             (
                 "/lobby/alice/room-1",
@@ -1500,6 +1504,12 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             ("/lobby", token, "another-secret", StatusCode::FORBIDDEN),
+            (
+                "/lobby",
+                Some(&expired),
+                JWT_SECRET,
+                StatusCode::UNAUTHORIZED,
+            ),
             ("/lobby", token, "", StatusCode::INTERNAL_SERVER_ERROR),
         ];
         for (path, token, secret, status) in refused {
@@ -1520,28 +1530,8 @@ mod tests {
     #[actix_rt::test]
     async fn test_wt_refusal_status_reaches_the_client() {
         setup_jwt_wt().await;
-        let token = urlencoding::encode(&token_for("alice", "wt-jwt-room-6")).into_owned();
-        let expired = meeting_api::token::generate_room_token(
-            JWT_SECRET,
-            -120,
-            "alice@test.com",
-            "wt-jwt-room-8",
-            false,
-            "Alice",
-        )
-        .expect("generate token");
-        let expired = urlencoding::encode(&expired).into_owned();
-        for (path, status) in [
-            ("/lobby/alice/wt-jwt-room-6".to_string(), 404),
-            (format!("/lobby/alice/wt-jwt-room-6?token={token}"), 404),
-            ("/lobby".to_string(), 401),
-            ("/lobby?token=".to_string(), 401),
-            ("/lobby?token=not.a.real.jwt".to_string(), 403),
-            (format!("/lobby?token={expired}"), 401),
-        ] {
-            let err = connect_raw(&path).await.expect_err("must be refused");
-            assert_eq!(rejection_status(&err), Some(status), "{path}: got {err:?}");
-        }
+        let err = connect_raw("/lobby").await.expect_err("must be refused");
+        assert_eq!(rejection_status(&err), Some(401), "got {err:?}");
     }
 
     #[actix_rt::test]

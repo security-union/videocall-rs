@@ -14,18 +14,17 @@
 //! Secrets come from the OS CSPRNG, are stored only as SHA-256 and are
 //! compared in constant time.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use videocall_meeting_types::device::base64url_encode;
 
 /// `n` CSPRNG bytes, base64url without padding.
 pub fn random_base64url(n: usize) -> String {
     let mut buf = vec![0u8; n];
     OsRng.fill_bytes(&mut buf);
-    URL_SAFE_NO_PAD.encode(&buf)
+    base64url_encode(&buf)
 }
 
 /// Lowercase hex SHA-256, the only form in which secrets are stored.
@@ -34,11 +33,6 @@ pub fn sha256_hex(secret: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// RFC 7636 S256: `BASE64URL(SHA256(verifier))`.
-pub fn pkce_s256(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 /// Constant-time byte equality. Lengths are not secret.
@@ -56,18 +50,8 @@ mod tests {
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(
-            URL_SAFE_NO_PAD.decode(random_base64url(16)).unwrap().len(),
-            16
-        );
-    }
-
-    #[test]
-    fn rfc7636_appendix_b_vector() {
-        assert_eq!(
-            pkce_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
+        let decoded = videocall_meeting_types::device::base64url_decode(&random_base64url(16));
+        assert_eq!(decoded.unwrap().len(), 16);
     }
 
     #[test]

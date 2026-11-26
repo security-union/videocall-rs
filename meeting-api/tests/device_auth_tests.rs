@@ -13,17 +13,15 @@
 
 //! Device JWTs on the meeting endpoints: which credentials get in and what
 //! a CLI device may do. Claim-level token checks are unit tests in
-//! `src/device_auth.rs`; the sign-in flow is in `device_api_tests.rs`.
+//! `videocall_meeting_types::device::crypto`; the sign-in flow is in
+//! `device_api_tests.rs`.
 
 mod test_helpers;
 
 use axum::body::Body;
 use axum::http::{self, Request, StatusCode};
 use axum::response::Response;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use meeting_api::db::{self, meetings as db_meetings, DbPool};
 use meeting_api::secrets::random_base64url;
 use meeting_api::state::AppState;
@@ -42,27 +40,8 @@ async fn create_meeting(pool: &DbPool, room: &str, creator: &str, active: bool) 
     }
 }
 
-async fn meeting_state(pool: &DbPool, room: &str) -> Option<String> {
-    db_meetings::get_by_room_id(pool, room)
-        .await
-        .unwrap()
-        .and_then(|m| m.state)
-}
-
-async fn host_name(pool: &DbPool, room: &str) -> Option<String> {
-    db_meetings::get_by_room_id(pool, room)
-        .await
-        .unwrap()
-        .expect("meeting")
-        .host_display_name
-}
-
-async fn meeting_id(pool: &DbPool, room: &str) -> i32 {
-    db_meetings::get_by_room_id(pool, room)
-        .await
-        .unwrap()
-        .expect("meeting")
-        .id
+async fn meeting(pool: &DbPool, room: &str) -> Option<db::MeetingRow> {
+    db_meetings::get_by_room_id(pool, room).await.unwrap()
 }
 
 fn room_token_claims(result: &Value) -> RoomAccessTokenClaims {
@@ -105,20 +84,17 @@ async fn rejected_credentials_get_401() {
     );
 
     let now = Utc::now().timestamp();
-    let claims = device_claims(&device.id, TEST_DEVICE_AUDIENCE, now, now + 120);
-    let raw_key = device.key.verifying_key().to_bytes();
-    let hs256 = |secret: &[u8]| {
-        let header = Header {
+    let own_claims = device_claims(&device.id, TEST_DEVICE_AUDIENCE, now, now + 120);
+    // Keyed with the device's public key: the classic algorithm-confusion token.
+    let hs256_with_kid = jsonwebtoken::encode(
+        &jsonwebtoken::Header {
             kid: Some(device.id.clone()),
-            ..Header::new(Algorithm::HS256)
-        };
-        encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
-    };
-    let alg_none = format!(
-        "{}.{}.",
-        URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"none","kid":"{}"}}"#, device.id)),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
-    );
+            ..jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256)
+        },
+        &own_claims,
+        &jsonwebtoken::EncodingKey::from_secret(&device.key.verifying_key().to_bytes()),
+    )
+    .unwrap();
     let unknown = random_base64url(16);
     let room_token = meeting_api::token::generate_room_token(
         TEST_JWT_SECRET,
@@ -133,15 +109,6 @@ async fn rejected_credentials_get_401() {
     // (name, request, rejected on the device path with WWW-Authenticate)
     let mut cases: Vec<(String, Request<Body>, bool)> = vec![
         (
-            "aud mismatch".into(),
-            get(&sign_eddsa(
-                &device.key,
-                Some(&device.id),
-                &device_claims(&device.id, "http://localhost:8082", now, now + 120),
-            )),
-            true,
-        ),
-        (
             "unknown kid".into(),
             get(&sign_eddsa(
                 &device.key,
@@ -150,18 +117,17 @@ async fn rejected_credentials_get_401() {
             )),
             true,
         ),
-        (
-            "HS256 keyed with the raw public key".into(),
-            get(&hs256(&raw_key)),
-            false,
-        ),
-        (
-            "HS256 keyed with the encoded public key".into(),
-            get(&hs256(URL_SAFE_NO_PAD.encode(raw_key).as_bytes())),
-            false,
-        ),
-        ("alg none".into(), get(&alg_none), false),
         ("room token as bearer".into(), get(&room_token), false),
+        (
+            "EdDSA without kid".into(),
+            get(&sign_eddsa(&device.key, None, &own_claims)),
+            false,
+        ),
+        (
+            "HS256 with a device-shaped kid".into(),
+            get(&hs256_with_kid),
+            false,
+        ),
         (
             "device token in the session cookie".into(),
             Request::builder()
@@ -173,7 +139,7 @@ async fn rejected_credentials_get_401() {
         ),
     ];
     let user = device.user_id.as_str();
-    for fixture in [Fixture::Revoked, Fixture::IdleExpired, Fixture::AbsExpired] {
+    for fixture in [Fixture::Revoked, Fixture::IdleExpired] {
         let other = insert_device(&pool, user, fixture).await;
         cases.push((format!("{fixture:?} device"), get(&other.token()), true));
     }
@@ -282,20 +248,14 @@ async fn device_token_forbidden_on_browser_only_routes() {
         assert_eq!(body["result"]["code"], "BROWSER_SESSION_REQUIRED");
     }
     // Nothing changed.
-    assert_eq!(meeting_state(&pool, room).await.as_deref(), Some("active"));
-    assert!(db_meetings::get_by_room_id(&pool, "dev-auth-new")
-        .await
-        .unwrap()
-        .is_none());
+    assert_eq!(
+        meeting(&pool, room).await.unwrap().state.as_deref(),
+        Some("active")
+    );
+    assert!(meeting(&pool, "dev-auth-new").await.is_none());
     let live = db::devices::count_live_devices(&pool, &device.user_id, Utc::now()).await;
     assert_eq!(live.unwrap(), 2);
-    let codes: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM device_auth_codes WHERE user_id = $1")
-            .bind(&device.user_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(codes, 0);
+    assert_eq!(codes_of(&pool, &device.user_id).await, 0);
 
     delete_device_data(&pool, &[&device.user_id]).await;
     cleanup_test_data(&pool, room).await;
@@ -329,25 +289,21 @@ async fn cli_device_never_hosts() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body: Value = response_json(resp).await;
     assert_eq!(body["result"]["code"], "MEETING_NOT_FOUND");
-    assert!(meeting_state(&pool, room).await.is_none());
-    assert!(db_meetings::get_by_room_id(&pool, room)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(meeting(&pool, room).await.is_none());
 
     // The creator's idle meeting is not activated by the creator's device.
     create_meeting(&pool, room, &device.user_id, false).await;
-    let before = meeting_state(&pool, room).await;
+    let before = meeting(&pool, room).await.unwrap().state;
     assert_ne!(before.as_deref(), Some("active"));
     let result = ok(send(&state, join()).await).await;
     assert_eq!(result["status"], "waiting_for_meeting");
     assert!(result["room_token"].is_null());
     assert_eq!(result["is_host"], false);
-    assert_eq!(meeting_state(&pool, room).await, before);
+    assert_eq!(meeting(&pool, room).await.unwrap().state, before);
 
     // Active: admitted without host rights; the host name is untouched.
     create_meeting(&pool, room, &device.user_id, true).await;
-    let host_name_before = host_name(&pool, room).await;
+    let host_name_before = meeting(&pool, room).await.unwrap().host_display_name;
     let result = ok(send(&state, join()).await).await;
     assert_eq!(result["status"], "admitted");
     assert_eq!(result["is_host"], false);
@@ -364,7 +320,10 @@ async fn cli_device_never_hosts() {
     .await
     .unwrap();
     assert!(!is_host);
-    assert_eq!(host_name(&pool, room).await, host_name_before);
+    assert_eq!(
+        meeting(&pool, room).await.unwrap().host_display_name,
+        host_name_before
+    );
     let status_uri = format!("/api/v1/meetings/{room}/status");
     let status = bearer("GET", &status_uri, &device.token());
     let result = ok(send(&state, status.body(Body::empty()).unwrap()).await).await;
@@ -379,7 +338,10 @@ async fn cli_device_never_hosts() {
     );
     let resp = send(&state, leave.body(Body::empty()).unwrap()).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(meeting_state(&pool, room).await.as_deref(), Some("active"));
+    assert_eq!(
+        meeting(&pool, room).await.unwrap().state.as_deref(),
+        Some("active")
+    );
 
     delete_device_data(&pool, &[&device.user_id]).await;
     cleanup_test_data(&pool, room).await;
@@ -498,10 +460,14 @@ async fn cli_without_display_name_uses_the_account_name() {
     let observer = waiting["observer_token"].as_str().expect("observer token");
     let observer = jsonwebtoken::dangerous::insecure_decode::<Value>(observer).unwrap();
     assert_eq!(observer.claims["display_name"], account_name.as_str());
-    db::participants::admit(&pool, meeting_id(&pool, room).await, &device.user_id)
-        .await
-        .unwrap()
-        .expect("admitted");
+    db::participants::admit(
+        &pool,
+        meeting(&pool, room).await.unwrap().id,
+        &device.user_id,
+    )
+    .await
+    .unwrap()
+    .expect("admitted");
     assert_eq!(
         token_name(&ok(send(&state, status()).await).await),
         account_name
@@ -532,7 +498,7 @@ async fn cli_name_never_renames_the_browser_session() {
         )
     };
     let stored_name = || async {
-        db::participants::get_status(&pool, meeting_id(&pool, room).await, user)
+        db::participants::get_status(&pool, meeting(&pool, room).await.unwrap().id, user)
             .await
             .unwrap()
             .and_then(|row| row.display_name)

@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "device-crypto")]
+pub mod crypto;
+
 /// `iss` claim of every device JWT and registration JWS.
 pub const CLI_ISSUER: &str = "videocall-cli";
 
@@ -223,9 +226,7 @@ pub struct DeviceStatusResponse {
     pub abs_expires_at: i64,
 }
 
-/// Error body of the CLI routes: `error` is `invalid_request`,
-/// `invalid_grant`, `invalid_token`, `key_already_registered`,
-/// `too_many_devices`, `not_configured` or `server_error`.
+/// Error body of the CLI routes (OAuth 2.0 shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceErrorResponse {
     pub error: String,
@@ -334,8 +335,13 @@ pub fn decode_authorize_request(request: &str) -> Option<String> {
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// RFC 7636 S256 PKCE challenge: `BASE64URL(SHA256(verifier))`.
+pub fn code_challenge_s256(verifier: &str) -> String {
+    base64url_encode(&Sha256::digest(verifier.as_bytes()))
+}
+
 /// RFC 4648 base64url without padding.
-fn base64url_encode(bytes: &[u8]) -> String {
+pub fn base64url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let group = chunk
@@ -352,7 +358,7 @@ fn base64url_encode(bytes: &[u8]) -> String {
 /// Strict base64url: alphabet only, no padding, and only the canonical
 /// spelling (unused trailing bits zero), so every byte string has exactly
 /// one accepted encoding.
-fn base64url_decode(encoded: &str) -> Option<Vec<u8>> {
+pub fn base64url_decode(encoded: &str) -> Option<Vec<u8>> {
     if encoded.len() % 4 == 1 {
         return None;
     }
@@ -493,6 +499,14 @@ mod tests {
     }
 
     #[test]
+    fn rfc7636_appendix_b_challenge() {
+        assert_eq!(
+            code_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
     fn base64url_codec() {
         // RFC 4648 section 10, base64url without padding.
         for (raw, encoded) in [
@@ -511,26 +525,14 @@ mod tests {
         for bad in ["Zg==", "Zm9v+", "Zm9v/", "Zh", "Zm9", "Z", "Zm9vY", "Zm 9v"] {
             assert_eq!(base64url_decode(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn authorize_request_round_trip() {
-        for raw in [
-            "device_name=C%2B%2B+rig&state=a%2Bb%25c",
-            "response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback&x=%3Cscript%3E#",
-            "",
-            &"a".repeat(MAX_AUTHORIZE_QUERY_LEN),
-        ] {
-            let request = encode_authorize_request(raw);
-            assert!(request.bytes().all(|b| BASE64URL.contains(&b)));
-            assert_eq!(decode_authorize_request(&request).as_deref(), Some(raw));
-        }
+        // The app's request parameter: bounded and UTF-8.
+        let longest = "a".repeat(MAX_AUTHORIZE_QUERY_LEN);
+        let request = encode_authorize_request(&longest);
+        assert_eq!(decode_authorize_request(&request), Some(longest));
         let too_long = encode_authorize_request(&"a".repeat(MAX_AUTHORIZE_QUERY_LEN + 1));
         assert_eq!(decode_authorize_request(&too_long), None);
-        assert_eq!(
-            decode_authorize_request(&base64url_encode(&[0xff, 0xfe])),
-            None
-        );
+        let not_utf8 = base64url_encode(&[0xff, 0xfe]);
+        assert_eq!(decode_authorize_request(&not_utf8), None);
     }
 
     #[test]

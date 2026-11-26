@@ -201,7 +201,10 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		cargo clippy --workspace $(CLIPPY_EXCLUDES) -- -D warnings && \
 		cargo fmt --all --check && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
-		cargo test -p meeting-api -- --nocapture --test-threads=1"
+		cargo test -p meeting-api -- --nocapture --test-threads=1 && \
+		cargo test -p videocall-meeting-types && \
+		cargo test -p videocall-meeting-types --features device-crypto && \
+		cargo test -p videocall-cli --lib auth::"
 
 check-backend-down: ensure-nix ## Stop the check-backend middleware and delete its state
 	-nix-shell default.nix -A shells.dev --run "process-compose down -p $(IT_PC_PORT)"

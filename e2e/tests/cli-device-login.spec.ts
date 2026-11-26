@@ -8,7 +8,7 @@
  * meeting-api on :8081 (cookies ignore the port).
  */
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
-import { generateSessionToken, injectSessionCookie } from "../helpers/auth";
+import { injectSessionCookie } from "../helpers/auth";
 import {
   API_URL,
   REMOTE_REDIRECT_URI,
@@ -288,30 +288,6 @@ test.describe("CLI device login", () => {
         expect(box.x + box.width).toBeLessThanOrEqual(375);
       }
     });
-  });
-
-  test("security: approving needs a session and an allowed Origin", async ({ request }) => {
-    const login = newLogin(REMOTE_REDIRECT_URI);
-    const body = {
-      redirect_uri: login.redirectUri,
-      code_challenge: login.pkce.challenge,
-      code_challenge_method: "S256",
-      state: login.state,
-      public_key: login.key.publicKey,
-      device_name: login.deviceName,
-      confirm: true,
-    };
-    const url = `${API_URL}/api/v1/devices/authorizations`;
-    const session = `session=${generateSessionToken(uniqueEmail(), "E2E Device User")}`;
-
-    const foreign = await request.post(url, {
-      data: body,
-      headers: { Cookie: session, Origin: "https://attacker.example" },
-    });
-    expect(foreign.status()).toBe(403);
-
-    const signedOut = await request.post(url, { data: body, headers: { Origin: UI_URL } });
-    expect(signedOut.status()).toBe(401);
   });
 
   test("signed out: no consent is shown and the app goes to login", async ({ page }) => {

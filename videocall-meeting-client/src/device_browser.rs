@@ -11,15 +11,10 @@
  * at your option.
  */
 
-//! Device management from a signed-in browser session: approve a CLI login,
-//! list the user's devices, revoke one.
-//!
-//! These routes take the session cookie ([`AuthMode::Cookie`](crate::AuthMode))
-//! and answer in the standard `APIResponse` envelope. A failure whose body
-//! carries a machine-readable code (`too_many_devices`,
-//! `key_already_registered`, `not_configured`, ...) is
-//! [`ApiError::Device`], whichever of the two error shapes the server used,
-//! so callers match on one variant. A 401 is [`ApiError::NotAuthenticated`].
+//! Device management from a signed-in browser session. These routes answer
+//! in the standard `APIResponse` envelope; a failure with a machine-readable
+//! code is [`ApiError::Device`] whichever error shape the server used, so
+//! callers match on one variant.
 
 use videocall_meeting_types::device::{
     is_valid_device_id, CreateDeviceAuthorizationRequest, CreateDeviceAuthorizationResponse,
@@ -27,7 +22,7 @@ use videocall_meeting_types::device::{
 };
 use videocall_meeting_types::APIResponse;
 
-use crate::devices::device_error;
+use crate::devices::success;
 use crate::error::ApiError;
 use crate::MeetingApiClient;
 
@@ -45,17 +40,16 @@ impl MeetingApiClient {
             .json(request)
             .send()
             .await?;
-        parse_enveloped(response).await
+        enveloped(response).await
     }
 
-    /// The signed-in user's live devices (`GET /api/v1/devices`).
+    /// The signed-in user's live devices.
     pub async fn list_devices(&self) -> Result<Vec<DeviceListItem>, ApiError> {
         let response = self.get(DEVICES_PATH).send().await?;
-        parse_enveloped(response).await
+        enveloped(response).await
     }
 
-    /// Revoke one of the signed-in user's devices
-    /// (`DELETE /api/v1/devices/{id}`, `204`).
+    /// Revoke one of the signed-in user's devices.
     ///
     /// An id that is not device-id shaped never reaches the network, so it
     /// cannot change the request path.
@@ -67,22 +61,14 @@ impl MeetingApiClient {
             .delete(&format!("{DEVICES_PATH}/{device_id}"))
             .send()
             .await?;
-        let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            return Ok(());
-        }
-        Err(device_error(status, response).await)
+        success(response).await.map(drop)
     }
 }
 
-async fn parse_enveloped<T: serde::de::DeserializeOwned + serde::Serialize>(
+async fn enveloped<T: serde::de::DeserializeOwned + serde::Serialize>(
     response: reqwest::Response,
 ) -> Result<T, ApiError> {
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(device_error(status, response).await);
-    }
-    let wrapper: APIResponse<T> = response.json().await?;
+    let wrapper: APIResponse<T> = success(response).await?.json().await?;
     Ok(wrapper.result)
 }
 

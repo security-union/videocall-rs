@@ -15,8 +15,8 @@
 //!
 //! - [`AuthUser`]: browser session only. The signed HS256 session JWT comes
 //!   from `Cookie: <name>=<JWT>` (set by the OAuth callback as `HttpOnly`) or
-//!   from `Authorization: Bearer <JWT>`. A device JWT (header `alg: EdDSA`)
-//!   gets 403 `BROWSER_SESSION_REQUIRED`. This is the default for every route.
+//!   from `Authorization: Bearer <JWT>`. A device JWT (EdDSA header with a
+//!   device-id `kid`) gets 403 `BROWSER_SESSION_REQUIRED`. This is the default for every route.
 //! - [`CliOrBrowserUser`]: additionally accepts a device JWT as bearer,
 //!   verified against the `devices` table. Used only on get meeting, join and
 //!   status.
@@ -30,7 +30,7 @@ use axum::{
     http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use videocall_meeting_types::APIError;
+use videocall_meeting_types::{device::crypto, APIError};
 
 use crate::device_auth::{self, AllowedStates, DeviceAuthError};
 use crate::error::AppError;
@@ -75,7 +75,7 @@ impl FromRequestParts<AppState> for AuthUser {
             });
         }
         let token = extract_bearer_token(&parts.headers).ok_or_else(AppError::unauthorized)?;
-        if device_auth::is_device_token(&token) {
+        if crypto::device_token_kid(&token).is_ok() {
             return Err(AppError::new(
                 StatusCode::FORBIDDEN,
                 APIError::browser_session_required(),
@@ -91,8 +91,8 @@ impl FromRequestParts<AppState> for AuthUser {
 
 /// Extractor for routes a CLI device may call (get meeting, join, status).
 ///
-/// A browser session resolves exactly like [`AuthUser`]. A bearer whose header
-/// says `alg: EdDSA` is verified as a device JWT with
+/// A browser session resolves exactly like [`AuthUser`]. A bearer with an
+/// EdDSA header and a device-id `kid` is verified as a device JWT with
 /// `aud = DEVICE_TOKEN_AUDIENCE` and must belong to a live, approved device;
 /// `user_id` and `name` then come from the device row.
 #[derive(Debug)]
@@ -113,9 +113,9 @@ impl FromRequestParts<AppState> for CliOrBrowserUser {
             .is_none()
             .then(|| extract_bearer_token(&parts.headers))
             .flatten()
-            .filter(|token| device_auth::is_device_token(token));
+            .and_then(|token| Some((crypto::device_token_kid(&token).ok()?, token)));
 
-        let Some(token) = device_token else {
+        let Some((kid, token)) = device_token else {
             let user = AuthUser::from_request_parts(parts, state)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -150,11 +150,7 @@ impl FromRequestParts<AppState> for CliOrBrowserUser {
             }
             Err(DeviceAuthError::Db(e)) => Err(AppError::from(e).into_response()),
             Err(err) => {
-                let kid = jsonwebtoken::decode_header(&token)
-                    .ok()
-                    .and_then(|h| h.kid)
-                    .filter(|kid| videocall_meeting_types::device::is_valid_device_id(kid));
-                tracing::info!(device_id = kid.as_deref().unwrap_or("-"), "{err}");
+                tracing::info!(device_id = kid, "{err}");
                 Err(device_unauthorized())
             }
         }

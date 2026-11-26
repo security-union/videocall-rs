@@ -23,8 +23,7 @@
 //! arrives on a loopback listener or, with `--remote`, is pasted by the
 //! human, and is exchanged with a registration JWS signed by the new key at
 //! `POST /api/v1/devices`. Nothing is saved before that exchange succeeds and
-//! the server's fingerprint matches ours. All HTTP goes through
-//! `videocall-meeting-client`.
+//! the server's fingerprint matches ours.
 
 pub mod keys;
 pub mod loopback;
@@ -37,8 +36,6 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use url::{Host, Url};
 use videocall_meeting_client::devices::CliAuthorizeParams;
@@ -94,7 +91,7 @@ impl From<getrandom::Error> for AuthError {
 pub(crate) fn random_b64url(n: usize) -> Result<String, getrandom::Error> {
     let mut bytes = vec![0u8; n];
     getrandom::fill(&mut bytes)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    Ok(videocall_meeting_types::device::base64url_encode(&bytes))
 }
 
 /// A meeting-api origin: the `aud` of every token and the store key.
@@ -477,6 +474,7 @@ pub(crate) async fn login_with(
         None
     });
     let device = StoredDevice {
+        origin: api.as_str().into(),
         device_id: registered.device_id,
         fingerprint,
         name: registered.name,
@@ -484,7 +482,7 @@ pub(crate) async fn login_with(
         user_name: registered.user_name,
         private_key: key.seed_b64(),
     };
-    let location = match ctx.store.save(api.as_str(), &device) {
+    let location = match ctx.store.save(&device) {
         Ok(location) => location,
         Err(e) => {
             // Don't leave an approved device whose key is lost.

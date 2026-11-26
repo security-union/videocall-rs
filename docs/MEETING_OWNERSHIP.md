@@ -183,7 +183,7 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
 | `JWT_SECRET` | Yes | -- | Shared HMAC-SHA256 secret (must match Media Server) |
 | `LISTEN_ADDR` | No | `0.0.0.0:8081` | HTTP bind address |
-| `TOKEN_TTL_SECS` | No | `600` | Room access token lifetime (seconds) |
+| `TOKEN_TTL_SECS` | No | `60` | Room access token lifetime (seconds); CLI devices get at most 300 |
 | `SESSION_TTL_SECS` | No | `315360000` (~10y) | Session JWT lifetime (seconds) |
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
@@ -204,8 +204,8 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `DEVICE_IDLE_TTL_SECS` | No | `7776000` (90d) | CLI device expires after this long unused |
 | `DEVICE_ABS_TTL_SECS` | No | `31536000` (365d) | CLI device expires this long after approval |
 | `DEVICE_MAX_PER_USER` | No | `10` | Live CLI devices per account |
-| `DEVICE_MAX_PENDING` | No | `10000` | Unfinished CLI login requests, globally |
-| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | Unfinished CLI login requests per IP |
+| `DEVICE_MAX_PENDING` | No | `10000` | CLI login requests still awaiting a decision, globally |
+| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | CLI login requests awaiting a decision per IPv4 address or IPv6 /64; skipped for private, loopback or unknown addresses |
 
 ---
 

@@ -19,7 +19,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::db::{begin_write_tx, Db, DbPool, SWEEP_BATCH};
+use crate::db::{begin_write_tx, Db, DbPool, SWEEP_BATCH, SWEEP_SKIP_LOCKED};
 
 /// Columns selected into [`DeviceRow`].
 const DEVICE_COLUMNS: &str = "id, public_key, fingerprint, name, user_id, user_name, \
@@ -64,7 +64,8 @@ pub struct NewDevice<'a> {
     pub user_id: &'a str,
     pub user_name: &'a str,
     pub requester_ip: Option<&'a str>,
-    /// Used for `created_at`, `decided_at` and `last_used_at`.
+    /// Used for `created_at` and `last_used_at` (and for `decided_at` in
+    /// [`insert_approved_device`]).
     pub now: DateTime<Utc>,
     pub idle_expires_at: DateTime<Utc>,
     pub abs_expires_at: DateTime<Utc>,
@@ -83,14 +84,18 @@ pub fn is_duplicate_public_key(err: &sqlx::Error) -> bool {
             .unwrap_or_else(|| db.message().contains("devices.public_key"))
 }
 
-async fn insert_device<'c, E>(executor: E, device: &NewDevice<'_>) -> Result<(), sqlx::Error>
+async fn insert_device<'c, E>(
+    executor: E,
+    device: &NewDevice<'_>,
+    decided_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error>
 where
     E: sqlx::Executor<'c, Database = Db>,
 {
     sqlx::query(
         "INSERT INTO devices (id, public_key, fingerprint, name, user_id, user_name, \
            requester_ip, created_at, decided_at, last_used_at, idle_expires_at, abs_expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8, $9, $10)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $11, $8, $9, $10)",
     )
     .bind(device.id)
     .bind(device.public_key)
@@ -102,18 +107,21 @@ where
     .bind(device.now)
     .bind(device.idle_expires_at)
     .bind(device.abs_expires_at)
+    .bind(decided_at)
     .execute(executor)
     .await?;
     Ok(())
 }
 
-/// Insert an approved device with no cap check. For tests and fixtures;
-/// the login path uses [`insert_device_capped`].
+/// Insert an approved device, **skipping the per-user device cap** and
+/// recording `device.now` as the decision time. Test fixtures only (it is
+/// public for the CLI's interop test); every real registration goes through
+/// [`insert_device_capped`].
 pub async fn insert_approved_device(
     pool: &DbPool,
     device: &NewDevice<'_>,
 ) -> Result<(), sqlx::Error> {
-    insert_device(pool, device).await
+    insert_device(pool, device, device.now).await
 }
 
 /// Outcome of [`insert_device_capped`].
@@ -125,14 +133,17 @@ pub enum CappedInsert {
 }
 
 /// Insert an approved device unless the user is at `max_per_user` live
-/// devices. Race-free: on Postgres a transaction-scoped advisory lock keyed
-/// on the user serializes concurrent logins of the same user; on SQLite the
-/// write transaction (`BEGIN IMMEDIATE`) already serializes all writers.
+/// devices. `decided_at` is when the user approved the login (from the
+/// consumed `cli_auth_requests` row). Race-free: on Postgres a
+/// transaction-scoped advisory lock keyed on the user serializes concurrent
+/// logins of the same user; on SQLite the write transaction
+/// (`BEGIN IMMEDIATE`) already serializes all writers.
 /// A duplicate public key surfaces as the sqlx error (see
 /// [`is_duplicate_public_key`]).
 pub async fn insert_device_capped(
     pool: &DbPool,
     device: &NewDevice<'_>,
+    decided_at: DateTime<Utc>,
     max_per_user: i64,
 ) -> Result<CappedInsert, sqlx::Error> {
     let mut tx = begin_write_tx(pool).await?;
@@ -141,12 +152,17 @@ pub async fn insert_device_capped(
         .bind(device.user_id)
         .execute(&mut *tx)
         .await?;
+    // This relies on READ COMMITTED (the Postgres default; begin_write_tx
+    // issues a plain BEGIN): the COUNT below takes a fresh snapshot after the
+    // lock is granted, so it sees the previous holder's committed insert.
+    // Under REPEATABLE READ the snapshot would predate the wait and the cap
+    // could be exceeded.
     let live = count_live_devices(&mut *tx, device.user_id, device.now).await?;
     if live >= max_per_user {
         tx.rollback().await?;
         return Ok(CappedInsert::TooManyDevices(live));
     }
-    insert_device(&mut *tx, device).await?;
+    insert_device(&mut *tx, device, decided_at).await?;
     tx.commit().await?;
     Ok(CappedInsert::Inserted)
 }
@@ -192,7 +208,8 @@ pub async fn find_device(pool: &DbPool, id: &str) -> Result<Option<DeviceRow>, s
 }
 
 /// Record use of a live device, at most one write per device per hour.
-/// Slides `idle_expires_at` to `idle_new`, capped at `abs_expires_at`.
+/// Slides `idle_expires_at` to `idle_new`, capped at `abs_expires_at`. Only
+/// a live device is touched, so a race can never revive an expired one.
 /// Returns whether a row was written.
 pub async fn touch_device(
     pool: &DbPool,
@@ -203,7 +220,8 @@ pub async fn touch_device(
     let res = sqlx::query(
         "UPDATE devices SET last_used_at = $2, \
            idle_expires_at = CASE WHEN $3 < abs_expires_at THEN $3 ELSE abs_expires_at END \
-         WHERE id = $1 AND revoked_at IS NULL AND last_used_at < $4",
+         WHERE id = $1 AND revoked_at IS NULL AND last_used_at < $4 \
+           AND idle_expires_at > $2 AND abs_expires_at > $2",
     )
     .bind(id)
     .bind(now)
@@ -269,15 +287,15 @@ pub async fn list_live_devices(
 }
 
 /// Bounded sweep of devices revoked or expired more than 30 days ago (kept
-/// that long for the device list and audit). Deletes at most
-/// [`SWEEP_BATCH`] rows. Returns rows deleted.
+/// that long for audit and support). Deletes at most [`SWEEP_BATCH`] rows.
+/// `idle_expires_at <= abs_expires_at` is a schema CHECK, so the idle test
+/// covers absolute expiry too. Returns rows deleted.
 pub async fn sweep_devices(pool: &DbPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(
+    let res = sqlx::query(&format!(
         "DELETE FROM devices WHERE id IN (SELECT id FROM devices \
-           WHERE (revoked_at IS NOT NULL AND revoked_at < $1) \
-              OR abs_expires_at < $1 OR idle_expires_at < $1 \
-           LIMIT $2)",
-    )
+           WHERE (revoked_at IS NOT NULL AND revoked_at < $1) OR idle_expires_at < $1 \
+           LIMIT $2{SWEEP_SKIP_LOCKED})"
+    ))
     .bind(now - Duration::days(30))
     .bind(SWEEP_BATCH)
     .execute(pool)

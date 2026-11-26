@@ -33,8 +33,9 @@ pub const AUTH_CSS: &str = include_str!("../static/auth.css");
 pub const CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self'; \
      form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
-/// Fixed phishing warning (contract section 5.4, "code" changed to "link"
-/// because the human now opens a link instead of typing a code).
+/// Fixed phishing warning shown on every consent page. It names the one
+/// safe situation (you just ran the command yourself) and the attack (a
+/// link someone else sent you).
 pub const WARNING_COPY: &str = "Only approve if you just ran videocall-cli auth login yourself, \
      on a device you own. If someone sent you this link or asked you to open it, choose Deny: \
      approving lets that device join meetings as you.";
@@ -147,8 +148,6 @@ pub struct ConfirmView<'a> {
     pub request: &'a CliAuthRequestRow,
     pub nonce: &'a str,
     pub fingerprint: &'a str,
-    pub viewer_ip: Option<&'a str>,
-    pub logout_url: &'a str,
     pub now: DateTime<Utc>,
 }
 
@@ -162,15 +161,10 @@ fn minutes_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 /// The consent page for one CLI login request.
 pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
+    // No "request came from <IP>" line: the address is the browser that
+    // opened the link, which in a phishing attempt is the victim's own, so
+    // it would only reassure them.
     let request = view.request;
-    let requester_ip = display_ip(request.requester_ip.as_deref());
-    let viewer_ip = display_ip(view.viewer_ip);
-    let different_network = if requester_ip != "unknown" && requester_ip != viewer_ip {
-        "<p class=\"notice notice-warning\">This request came from a different network \
-         than the one you are on now.</p>"
-    } else {
-        ""
-    };
     let (kind_text, checkbox) = if request.is_remote() {
         (
             "Remote sign-in: after you approve, this page shows a code. You paste it into the \
@@ -190,18 +184,15 @@ pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
     let body = format!(
         "<section class=\"card\">\n\
          <h1>Sign in videocall-cli?</h1>\n\
-         <p class=\"signed-in\">Signed in as <strong>{viewer_name}</strong> ({viewer_user_id}). \
-         <a href=\"{logout}\">Not you? Sign out</a></p>\n\
+         <p class=\"signed-in\">Signed in as <strong>{viewer_name}</strong> ({viewer_user_id}).</p>\n\
+         {sign_out}\
          <dl class=\"facts\">\n\
          <dt>Device name</dt><dd>{name}</dd>\n\
          <dt>Key fingerprint</dt><dd><span class=\"mono fingerprint\">{fingerprint}</span> \
          <span class=\"hint\">Check this matches your terminal.</span></dd>\n\
          <dt>Kind</dt><dd>{kind_text}</dd>\n\
          <dt>Requested</dt><dd>{age}</dd>\n\
-         <dt>Request came from</dt><dd>{requester_ip} \
-         <span class=\"hint\">(reported by the network, not verified)</span></dd>\n\
          </dl>\n\
-         {different_network}\n\
          <p class=\"notice notice-danger\" role=\"note\">{warning}</p>\n\
          <form method=\"post\" action=\"/cli/consent\" class=\"stack\">\n\
          <input type=\"hidden\" name=\"request\" value=\"{request_id}\">\n\
@@ -215,17 +206,49 @@ pub fn confirm_page(view: &ConfirmView<'_>) -> Response {
          </section>",
         viewer_name = html_escape(view.viewer_name),
         viewer_user_id = html_escape(view.viewer_user_id),
-        logout = html_escape(view.logout_url),
+        sign_out = sign_out_form(Some(&request.id), "Not you? Sign out"),
         name = html_escape(&request.device_name),
         fingerprint = html_escape(view.fingerprint),
         kind_text = html_escape(kind_text),
         age = minutes_ago(request.created_at, view.now),
-        requester_ip = html_escape(&requester_ip),
         request_id = html_escape(&request.id),
         nonce = html_escape(view.nonce),
         warning = html_escape(WARNING_COPY),
     );
     html(StatusCode::OK, "Sign in videocall-cli?", &body)
+}
+
+/// A POST form to `/cli/sign-out`. With `request_id` the "sign in again"
+/// link afterwards leads back to that consent page, otherwise to /devices.
+fn sign_out_form(request_id: Option<&str>, label: &str) -> String {
+    let hidden = request_id
+        .map(|id| {
+            format!(
+                "<input type=\"hidden\" name=\"request\" value=\"{}\">\n",
+                html_escape(id)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<form method=\"post\" action=\"/cli/sign-out\" class=\"sign-out\">\n\
+         {hidden}<button type=\"submit\" class=\"button button-secondary\">{label}</button>\n\
+         </form>\n",
+        label = html_escape(label),
+    )
+}
+
+/// After `/cli/sign-out`: the session cookie is cleared. `sign_in_url` is
+/// a `/login` link back to the page the user came from.
+pub fn signed_out_by_user_page(sign_in_url: &str) -> Response {
+    let body = format!(
+        "<section class=\"card\">\n\
+         <h1>Signed out</h1>\n\
+         <p class=\"lead\">You are signed out on this browser.</p>\n\
+         <p><a class=\"button button-primary\" href=\"{href}\">Sign in again</a></p>\n\
+         </section>",
+        href = html_escape(sign_in_url),
+    );
+    html(StatusCode::OK, "Signed out", &body)
 }
 
 /// The remote-login code, shown exactly once in the POST response.
@@ -350,6 +373,16 @@ pub fn not_found_page() -> Response {
     )
 }
 
+/// A signed-out visitor on a server with no OAuth provider configured.
+pub fn sign_in_unavailable_page() -> Response {
+    message(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sign-in not available",
+        "This server has no sign-in configured, so it cannot approve devices.",
+        None,
+    )
+}
+
 pub fn not_configured_page() -> Response {
     message(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -418,8 +451,10 @@ pub fn devices_page(viewer_name: &str, devices: &[DeviceRow]) -> Response {
          <p class=\"lead\">Signed in as <strong>{viewer}</strong>. These devices can join meetings as you. \
          Revoke any you do not recognise.</p>\n\
          {content}\n\
+         {sign_out}\
          </section>",
         viewer = html_escape(viewer_name),
+        sign_out = sign_out_form(None, "Sign out"),
     );
     html(StatusCode::OK, "Your devices", &body)
 }

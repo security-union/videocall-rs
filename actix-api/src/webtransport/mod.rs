@@ -119,6 +119,14 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 /// before the session is accepted, never to a running session.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most connections that may be between QUIC accept and either an accepted
+/// session or the end of their refusal linger at once. Each one holds a
+/// permit for its handshake (at most `HANDSHAKE_TIMEOUT`) and, if refused,
+/// for `REJECT_LINGER`; an accepted session gives its permit back before it
+/// starts, so live calls never count. When all permits are taken a new
+/// connection is refused at the QUIC layer right away, with no linger.
+const MAX_PENDING_HANDSHAKES: usize = 2048;
+
 /// Videocall WebTransport API
 ///
 /// This module contains the implementation of the Videocall WebTransport API.
@@ -239,8 +247,14 @@ pub async fn start(
     //
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
     // actor requires the actix LocalSet context for spawn_local.
+    let handshake_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
         trace_span!("New connection being attempted");
+        let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+            debug!("refusing connection: {MAX_PENDING_HANDSHAKES} handshakes already pending");
+            incoming.refuse();
+            continue;
+        };
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
@@ -271,6 +285,7 @@ pub async fn start(
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
                 conn,
+                handshake_permit,
                 chat_server,
                 nats_client,
                 tracker_sender,
@@ -333,6 +348,7 @@ fn authorize_connect(
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     conn: quinn::Connection,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
@@ -358,13 +374,17 @@ async fn run_webtransport_connection_from_request(
                 ConnectRejection::Misconfigured => error!("JWT_SECRET not set"),
                 ConnectRejection::Token(e) => e.log("WT"),
             }
+            // The permit is held through the linger and released on return.
             reject_connect(request, conn, rejection.status()).await;
+            drop(handshake_permit);
             return Ok(());
         }
     };
     // Only the refusal path needs our extra handle; let the session own the
-    // connection from here on, exactly as before.
+    // connection from here on, exactly as before. An accepted connection
+    // stops counting toward MAX_PENDING_HANDSHAKES now.
     drop(conn);
+    drop(handshake_permit);
 
     info!(
         "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
@@ -1632,11 +1652,27 @@ mod tests {
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config"),
         ));
 
-        let mut endpoint =
-            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+        // Same server as the other tests: honour WEBTRANSPORT_URL.
+        let server: std::net::SocketAddr = {
+            let base = std::env::var("WEBTRANSPORT_URL")
+                .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+            url::Url::parse(&base)
+                .expect("valid WEBTRANSPORT_URL")
+                .socket_addrs(|| Some(443))
+                .expect("resolve WEBTRANSPORT_URL")
+                .into_iter()
+                .next()
+                .expect("WEBTRANSPORT_URL resolves")
+        };
+        let mut endpoint = quinn::Endpoint::client(if server.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        })
+        .expect("client endpoint");
         endpoint.set_default_client_config(client_config);
         let conn = endpoint
-            .connect("127.0.0.1:4433".parse().unwrap(), "localhost")
+            .connect(server, "localhost")
             .expect("start QUIC connect")
             .await
             .expect("QUIC handshake completes");

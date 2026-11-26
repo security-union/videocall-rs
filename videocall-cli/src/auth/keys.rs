@@ -16,12 +16,29 @@
  * conditions.
  */
 
-//! The device's Ed25519 key and the JWTs it signs (contract 2.4, 2.5, 11.3).
+//! The device's Ed25519 key and the JWTs it signs: the self-signed
+//! registration JWS (proof of possession, no `kid`) and a fresh device JWT
+//! for every request (`kid` = `sub` = device id, `aud` = the exact origin
+//! called, 120 s lifetime, random `jti`).
 //!
 //! The 32-byte seed is generated from the OS CSPRNG, stored only in the
 //! credential store, and held in memory inside [`SigningKey`] (zeroized on
 //! drop). It never goes on argv, in the environment, or into logs; `Debug`
 //! shows only the public key.
+//!
+//! Copies of the private key in memory, all zeroized on drop:
+//! - the [`SigningKey`] (ed25519-dalek, `zeroize` feature);
+//! - one PKCS#8 encoding, built once per [`DeviceKey`]. `to_pkcs8_der`
+//!   returns a `SecretDocument` (zeroized on drop, and its scratch buffers
+//!   are wiped with the `ed25519/zeroize` feature enabled in Cargo.toml);
+//!   [`EncodingKey::from_ed_der`] copies it into its own buffer, which
+//!   jsonwebtoken 10 also zeroizes on drop (`ZeroizeOnDrop`);
+//! - inside each `jsonwebtoken::encode` call, jsonwebtoken re-parses that
+//!   DER into a temporary `SigningKey` (zeroized on drop). Its API takes
+//!   no pre-parsed key, so this per-signature copy can't be avoided.
+//!
+//! Like any Rust value, these may be moved (memcpy'd) on the stack before
+//! they are dropped, and zeroize can't reach those stale stack slots.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -56,6 +73,8 @@ pub enum KeyError {
 /// An Ed25519 device key.
 pub struct DeviceKey {
     signing: SigningKey,
+    /// PKCS#8 form for jsonwebtoken, built once (zeroized on drop).
+    encoding: EncodingKey,
 }
 
 impl std::fmt::Debug for DeviceKey {
@@ -71,9 +90,7 @@ impl DeviceKey {
     pub fn generate() -> Result<Self, KeyError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut())?;
-        Ok(Self {
-            signing: SigningKey::from_bytes(&seed),
-        })
+        Self::from_signing(SigningKey::from_bytes(&seed))
     }
 
     /// Load from the stored base64url seed.
@@ -84,9 +101,18 @@ impl DeviceKey {
                 .map_err(|_| KeyError::Corrupt)?,
         );
         let seed: &[u8; 32] = bytes.as_slice().try_into().map_err(|_| KeyError::Corrupt)?;
-        Ok(Self {
-            signing: SigningKey::from_bytes(seed),
-        })
+        Self::from_signing(SigningKey::from_bytes(seed))
+    }
+
+    fn from_signing(signing: SigningKey) -> Result<Self, KeyError> {
+        // jsonwebtoken's rust_crypto signer takes PKCS#8 DER, not the seed.
+        // `der` is a zeroize-on-drop SecretDocument; EncodingKey copies it
+        // into its own zeroize-on-drop buffer.
+        let der = signing
+            .to_pkcs8_der()
+            .map_err(|e| KeyError::Sign(e.to_string()))?;
+        let encoding = EncodingKey::from_ed_der(der.as_bytes());
+        Ok(Self { signing, encoding })
     }
 
     /// The seed, base64url, for the credential store.
@@ -111,13 +137,8 @@ impl DeviceKey {
     }
 
     fn sign<T: serde::Serialize>(&self, header: &Header, claims: &T) -> Result<String, KeyError> {
-        // jsonwebtoken's rust_crypto signer takes PKCS#8 DER, not the seed.
-        let der = self
-            .signing
-            .to_pkcs8_der()
-            .map_err(|e| KeyError::Sign(e.to_string()))?;
-        let key = EncodingKey::from_ed_der(der.as_bytes());
-        jsonwebtoken::encode(header, claims, &key).map_err(|e| KeyError::Sign(e.to_string()))
+        jsonwebtoken::encode(header, claims, &self.encoding)
+            .map_err(|e| KeyError::Sign(e.to_string()))
     }
 
     /// A per-request device JWT: header `{"alg":"EdDSA","typ":"JWT","kid"}`,
@@ -192,6 +213,15 @@ mod tests {
         let seed = key.seed_b64();
         let again = DeviceKey::from_seed_b64(&seed).unwrap();
         assert_eq!(again.public_key_raw(), key.public_key_raw());
+        // The cached PKCS#8 signing key belongs to the same seed: Ed25519 is
+        // deterministic, so the same claims give the same signature.
+        assert_eq!(
+            again
+                .registration_jws("https://api.example.com", "n", 1)
+                .unwrap(),
+            key.registration_jws("https://api.example.com", "n", 1)
+                .unwrap()
+        );
         let printed = format!("{key:?} {seed:?}");
         assert!(!printed.contains(seed.expose_secret()));
         assert!(printed.contains(&key.public_key_b64()));

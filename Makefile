@@ -185,7 +185,6 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		nix-shell default.nix -A shells.dev --run "dev-stack -D postgres postgres-init nats"
 	NATS_URL=localhost:$(IT_NATS_PORT) \
 	DATABASE_URL="postgres://postgres:docker@localhost:$(IT_PG_PORT)/actix-api-db?sslmode=disable" \
-	DATABASE_ENABLED=true \
 	WEBTRANSPORT_URL=https://127.0.0.1:4433 \
 	HEALTH_URL=http://127.0.0.1:5321/healthz \
 	INSECURE=true \

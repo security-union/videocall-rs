@@ -41,10 +41,10 @@ let
         Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
         Pragma "no-cache"
         -ETag
-        # Never frameable: the /device page approves CLI logins, so a framed
-        # copy would be a clickjacking target. Nothing in this repo embeds the
-        # UI in a frame. X-Frame-Options covers old browsers, frame-ancestors
-        # is the modern equivalent.
+        # Never frameable: the app has authenticated, state-changing screens
+        # (a framed copy is a clickjacking target) and nothing in this repo
+        # embeds it in a frame. X-Frame-Options covers old browsers,
+        # frame-ancestors is the modern equivalent.
         X-Frame-Options "DENY"
         Content-Security-Policy "frame-ancestors 'none'"
       }

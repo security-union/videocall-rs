@@ -435,7 +435,8 @@ pub(crate) fn browser_expected(env: impl Fn(&str) -> Option<OsString>, os: &str)
 }
 
 /// `videocall-cli on <hostname>` with the hostname filtered to
-/// `[A-Za-z0-9._-]`, truncated to 64 characters (contract 6.1).
+/// `[A-Za-z0-9._-]`, truncated to 64 characters, so it always passes the
+/// server's name rule.
 pub(crate) fn default_device_name(hostname: &str) -> String {
     let host: String = hostname
         .trim()
@@ -464,8 +465,9 @@ fn hostname() -> String {
         .unwrap_or_default()
 }
 
-/// The device name to register: `--name` validated per contract 6.1, or
-/// the default.
+/// The device name to register: `--name` trimmed and checked against the
+/// server's rule (`^[A-Za-z0-9][A-Za-z0-9 ._()@:+-]{0,63}$`, ASCII only),
+/// or the default.
 pub(crate) fn device_name(requested: Option<&str>, hostname: &str) -> Result<String, AuthError> {
     match requested {
         Some(name) => normalize_device_name(name).ok_or_else(|| {
@@ -759,9 +761,30 @@ pub(crate) async fn login_with(
     let secret = Secret {
         private_key: key.seed_b64(),
     };
-    let lock = ctx.store.lock().await?;
     let (store, origin, saved) = (ctx.store.clone(), api.as_str().to_string(), entry.clone());
-    let kind = run_blocking(move || store.save(&origin, saved, &secret, &lock)).await?;
+    let save = async move {
+        let lock = store.lock().await?;
+        run_blocking(move || store.save(&origin, saved, &secret, &lock)).await
+    };
+    let kind = match save.await {
+        Ok(kind) => kind,
+        Err(e) => {
+            // The server has an approved device whose key we couldn't keep:
+            // revoke it (signed with that key) rather than leave it orphaned.
+            let revoked = ctx
+                .credentials(key, entry.device_id.clone(), api)
+                .call(|client| async move { client.delete_device_me().await })
+                .await;
+            if let Err(revoke_error) = revoked {
+                eprintln!(
+                    "warning: also couldn't revoke the new device {} [{}] ({revoke_error}); \
+                     revoke it on the devices page.",
+                    entry.name, entry.fingerprint
+                );
+            }
+            return Err(AuthError::Store(e));
+        }
+    };
 
     if let Some((old, old_key)) = previous {
         if old.device_id != entry.device_id {

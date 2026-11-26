@@ -19,9 +19,14 @@
 use anyhow::{bail, Error};
 use protobuf::Message;
 use secrecy::ExposeSecret;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        watch,
+    },
     time::{self, Duration},
 };
 use tracing::info;
@@ -39,10 +44,87 @@ use crate::room::RoomSession;
 
 use super::camera_synk::CameraSynk;
 
+/// Consecutive failed sends after which the relay connection counts as
+/// lost even if QUIC hasn't reported it closed yet (a few seconds of media).
+const MAX_CONSECUTIVE_SEND_FAILURES: u32 = 100;
+
+/// How long a clean shutdown waits for the close to reach the relay.
+pub const CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Records why the relay connection ended. The first reason wins.
+#[derive(Clone)]
+struct LossSignal {
+    reason: Arc<watch::Sender<Option<String>>>,
+    consecutive_failures: Arc<AtomicU32>,
+}
+
+impl LossSignal {
+    fn new() -> Self {
+        Self {
+            reason: Arc::new(watch::Sender::new(None)),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn mark_lost(&self, reason: String) {
+        self.reason.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reason);
+            true
+        });
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.borrow().clone()
+    }
+
+    /// Count a send result. Failures on a closed session, or too many in a
+    /// row, mark the connection lost. Returns false if it is lost.
+    fn record_send(
+        &self,
+        session: &web_transport_quinn::Session,
+        result: anyhow::Result<()>,
+    ) -> bool {
+        match result {
+            Ok(()) => {
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+            }
+            Err(e) => {
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(closed) = session.close_reason() {
+                    self.mark_lost(closed.to_string());
+                } else if failures >= MAX_CONSECUTIVE_SEND_FAILURES {
+                    self.mark_lost(format!("{failures} sends in a row failed, last: {e}"));
+                } else {
+                    tracing::warn!("Failed to send to the relay: {e}");
+                }
+            }
+        }
+        self.reason().is_none()
+    }
+
+    async fn wait(&self) -> String {
+        let mut rx = self.reason.subscribe();
+        let reason = match rx.wait_for(Option::is_some).await {
+            Ok(reason) => reason.clone(),
+            // The sender lives in `self`, so this can't happen.
+            Err(_) => None,
+        };
+        match reason {
+            Some(reason) => reason,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 pub struct WebTransportClient {
     options: Stream,
     room: RoomSession,
     sender: Option<Sender<Vec<u8>>>,
+    session: Option<web_transport_quinn::Session>,
+    loss: LossSignal,
 }
 
 impl WebTransportClient {
@@ -52,6 +134,8 @@ impl WebTransportClient {
             options,
             room,
             sender: None,
+            session: None,
+            loss: LossSignal::new(),
         }
     }
 
@@ -78,6 +162,9 @@ impl WebTransportClient {
     }
 
     async fn queue_message(&self, message: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(reason) = self.loss.reason() {
+            bail!("relay connection lost: {reason}");
+        }
         if let Some(sender) = &self.sender {
             sender
                 .send(message)
@@ -96,9 +183,10 @@ impl WebTransportClient {
         // unmuted while it sends no audio — and vice-versa, a streamed mic would
         // be shown muted. Video is always on in stream mode.
         let audio_enabled = options.audio_device.is_some();
+        let loss = self.loss.clone();
         tokio::spawn(async move {
             let mut interval = interval;
-            loop {
+            while loss.reason().is_none() {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
@@ -124,9 +212,7 @@ impl WebTransportClient {
                     ..Default::default()
                 };
                 let data = packet.write_to_bytes().unwrap();
-                if let Err(e) = Self::send(&session, data).await {
-                    tracing::error!("Failed to send heartbeat: {}", e);
-                }
+                loss.record_send(&session, Self::send(&session, data).await);
             }
         });
     }
@@ -187,7 +273,9 @@ fn parse_rejection_status(debug_text: &str) -> Option<u16> {
         })
 }
 
-/// Connect to the relay, minting a fresh room token for every attempt.
+/// Connect to the relay, minting a fresh room token for every initial
+/// connect attempt. Once a session is established this returns; a later
+/// drop ends the stream (see [`CameraSynk::lost`]) instead of reconnecting.
 ///
 /// Transient failures back off exponentially (1 s to 30 s, jittered).
 /// A 401/403/404 from the relay, or a non-retryable meeting-api error (not
@@ -287,16 +375,24 @@ impl CameraSynk for WebTransportClient {
         let session = connect_to_server(&self.options, &mut self.room).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
+        self.session = Some(session.clone());
+
+        // The relay (or the network) closed the session.
+        let (watched, loss) = (session.clone(), self.loss.clone());
+        tokio::spawn(async move {
+            let reason = watched.closed().await;
+            loss.mark_lost(reason.to_string());
+        });
 
         // Spawn a task to handle sending messages via the WebTransport session
-        let session_clone = session.clone();
+        let (session_clone, loss) = (session.clone(), self.loss.clone());
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let session_clone_inner = session_clone.clone();
+                let loss = loss.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = WebTransportClient::send(&session_clone_inner, message).await {
-                        tracing::error!("Failed to send message: {}", e);
-                    }
+                    let result = WebTransportClient::send(&session_clone_inner, message).await;
+                    loss.record_send(&session_clone_inner, result);
                 });
             }
         });
@@ -311,11 +407,50 @@ impl CameraSynk for WebTransportClient {
     async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
     }
+
+    async fn lost(&self) -> String {
+        if self.session.is_none() {
+            return std::future::pending().await;
+        }
+        self.loss.wait().await
+    }
+
+    /// Close with code 0 and give the close frame up to [`CLOSE_GRACE`] to
+    /// leave, so the relay drops us now instead of at the QUIC idle timeout.
+    async fn close(&self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        self.loss.mark_lost("closed by this client".to_string());
+        session.close(0, b"client shutting down");
+        // `closed()` resolves once the local close is applied; the short
+        // sleep after it lets quinn's connection driver put CONNECTION_CLOSE
+        // on the wire before the runtime shuts down. Bounded either way.
+        let _ = time::timeout(CLOSE_GRACE, async {
+            session.closed().await;
+            time::sleep(Duration::from_millis(100)).await;
+        })
+        .await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loss_signal_keeps_the_first_reason_and_wakes_waiters() {
+        let loss = LossSignal::new();
+        assert!(loss.reason().is_none());
+        let waiter = tokio::spawn({
+            let loss = loss.clone();
+            async move { loss.wait().await }
+        });
+        loss.mark_lost("relay closed the session".into());
+        loss.mark_lost("later reason".into());
+        assert_eq!(waiter.await.unwrap(), "relay closed the session");
+        assert_eq!(loss.reason().as_deref(), Some("relay closed the session"));
+    }
 
     #[test]
     fn lobby_url_construction() {

@@ -20,15 +20,16 @@
 //!
 //! Flow: `GET /meetings/{id}` (the CLI never creates meetings) →
 //! `POST /meetings/{id}/join` → wait in the waiting room if needed →
-//! `GET /meetings/{id}/status` for a fresh room token on every relay
-//! connect attempt.
+//! `GET /meetings/{id}/status` for a fresh room token on every initial
+//! relay connect attempt. Once connected, a dropped relay session ends the
+//! stream; the CLI does not reconnect.
 
 use secrecy::SecretString;
 use videocall_meeting_client::ApiError;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
 
 use crate::auth::{AuthError, Credentials};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backoff::{poll_delay, Backoff};
 
@@ -77,9 +78,15 @@ pub struct RoomSession {
     creds: Credentials,
     meeting_id: String,
     user_id: String,
-    /// Room token from the admission response, used for the first connect.
-    pending: Option<SecretString>,
+    /// Room token from the admission response and when it arrived, used
+    /// for the first connect if it is still young (see [`PENDING_MAX_AGE`]).
+    pending: Option<(SecretString, Instant)>,
 }
+
+/// The admission token is used for the first connect attempt only if it
+/// is younger than this. meeting-api expires CLI room tokens after 300 s;
+/// anything older is dropped and a new one minted.
+const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
 
 impl RoomSession {
     /// Join `meeting_id`, waiting for the host to start the meeting or admit
@@ -132,7 +139,7 @@ impl RoomSession {
             creds,
             meeting_id,
             user_id: status.user_id,
-            pending: Some(token),
+            pending: Some((token, Instant::now())),
         })
     }
 
@@ -147,15 +154,26 @@ impl RoomSession {
     }
 
     /// A room token for one relay connect attempt. The first call returns
-    /// the token from admission; later calls mint a new one. Never reuse a
-    /// token across attempts.
+    /// the token from admission if it is younger than [`PENDING_MAX_AGE`];
+    /// every other call mints a new one. A token is never used for more
+    /// than one attempt.
     pub async fn next_room_token(&mut self) -> Result<SecretString, RoomError> {
-        if let Some(token) = self.pending.take() {
+        if let Some(token) = take_if_young(&mut self.pending, Instant::now()) {
             return Ok(token);
         }
         let status = current_status(&self.creds, &self.meeting_id).await?;
         room_token_from(&self.meeting_id, &status)
     }
+}
+
+/// Take the admission token out (so it is never reused) and return it
+/// only if it is still younger than [`PENDING_MAX_AGE`] at `now`.
+fn take_if_young(
+    pending: &mut Option<(SecretString, Instant)>,
+    now: Instant,
+) -> Option<SecretString> {
+    let (token, issued) = pending.take()?;
+    (now.saturating_duration_since(issued) < PENDING_MAX_AGE).then_some(token)
 }
 
 fn room_token_from(
@@ -236,7 +254,8 @@ pub(crate) fn meeting_phase(state: &str) -> MeetingPhase {
 }
 
 /// Poll cadence: about every 3 s while things are healthy; after a
-/// retryable failure, back off 3 s → 30 s until a request succeeds again.
+/// retryable failure, back off from about 6 s (never sooner than the
+/// healthy cadence) up to 30 s until a request succeeds again.
 pub(crate) struct Poller {
     backoff: Backoff,
     failing: bool,
@@ -245,7 +264,9 @@ pub(crate) struct Poller {
 impl Poller {
     pub(crate) fn new() -> Self {
         Self {
-            backoff: Backoff::new(Duration::from_secs(3), Duration::from_secs(30)),
+            // Equal jitter halves the nominal delay: the first retry lands
+            // in 6..12 s, above the 2.5..3.5 s healthy cadence.
+            backoff: Backoff::new(Duration::from_secs(12), Duration::from_secs(30)),
             failing: false,
         }
     }
@@ -358,6 +379,22 @@ mod tests {
     }
 
     #[test]
+    fn admission_token_is_used_once_and_only_while_young() {
+        let issued = Instant::now();
+        let token = || Some((SecretString::from("jwt".to_string()), issued));
+
+        let mut pending = token();
+        let first = take_if_young(&mut pending, issued + Duration::from_secs(1));
+        assert_eq!(first.unwrap().expose_secret(), "jwt");
+        assert!(pending.is_none(), "taken, never reused");
+        assert!(take_if_young(&mut pending, issued).is_none());
+
+        let mut pending = token();
+        assert!(take_if_young(&mut pending, issued + PENDING_MAX_AGE).is_none());
+        assert!(pending.is_none(), "a stale token is dropped, not kept");
+    }
+
+    #[test]
     fn retryable_errors() {
         assert!(RoomError::Auth(AuthError::Timeout).is_retryable());
         assert!(RoomError::Auth(AuthError::Api(ApiError::ServerError {
@@ -410,7 +447,8 @@ mod tests {
         let mut nominal_max = Duration::ZERO;
         for _ in 0..10 {
             let d = poller.next_delay();
-            assert!(d >= Duration::from_millis(1500) && d <= Duration::from_secs(30));
+            // Never sooner than the healthy cadence's upper bound.
+            assert!(d >= Duration::from_secs(6) && d <= Duration::from_secs(30));
             nominal_max = nominal_max.max(d);
         }
         assert!(nominal_max >= Duration::from_secs(15), "{nominal_max:?}");
@@ -419,6 +457,10 @@ mod tests {
         let d = poller.next_delay();
         assert!(d >= Duration::from_millis(2500) && d < Duration::from_millis(3500));
         poller.failed();
-        assert!(poller.next_delay() <= Duration::from_secs(3));
+        let first_retry = poller.next_delay();
+        assert!(
+            first_retry >= Duration::from_secs(6) && first_retry <= Duration::from_secs(12),
+            "{first_retry:?}"
+        );
     }
 }

@@ -92,6 +92,11 @@ pub async fn upsert_creator_via_cli(
 /// Atomically join a meeting as an attendee, respecting the current
 /// `waiting_room_enabled` setting.
 ///
+/// `keep_stored_name`: when true (CLI callers) a display name already on
+/// the row is never replaced, so the same account's browser session keeps
+/// its name; `display_name` only fills an empty one. When false (browser)
+/// the requested name replaces the stored one, as before.
+///
 /// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where
 /// `auto_admitted` is `true` when the participant was immediately admitted
 /// (waiting room disabled). The third element is the `waiting_room_enabled`
@@ -107,8 +112,10 @@ pub async fn join_attendee(
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
+    keep_stored_name: bool,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
-    with_busy_retry(|| join_attendee_tx(pool, meeting_id, user_id, display_name)).await
+    with_busy_retry(|| join_attendee_tx(pool, meeting_id, user_id, display_name, keep_stored_name))
+        .await
 }
 
 async fn join_attendee_tx(
@@ -116,7 +123,13 @@ async fn join_attendee_tx(
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
+    keep_stored_name: bool,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    let name_update = if keep_stored_name {
+        "COALESCE(meeting_participants.display_name, $3)"
+    } else {
+        "COALESCE($3, meeting_participants.display_name)"
+    };
     let mut tx = begin_write_tx(pool).await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
@@ -135,7 +148,7 @@ async fn join_attendee_tx(
             VALUES ($1, $2, 'waiting', FALSE, $3)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL, updated_at = {SQL_NOW},
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = {name_update}
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );
@@ -153,7 +166,7 @@ async fn join_attendee_tx(
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = {SQL_NOW}, left_at = NULL,
                           updated_at = {SQL_NOW},
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = {name_update}
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );

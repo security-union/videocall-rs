@@ -780,3 +780,27 @@ fn exchange_errors_are_explained() {
         .to_string()
         .contains("Check the browser page"));
 }
+
+#[tokio::test]
+async fn failed_local_save_revokes_the_new_device() {
+    let server = login_server(Exchange::Ok, "code").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with(&tmp, |_, _| false, "code");
+    // The config directory can't be created: its parent is a regular file.
+    let blocker = tmp.path().join("not-a-dir");
+    std::fs::write(&blocker, b"").unwrap();
+    ctx.store = Store::with_dir(blocker.join("videocall"), false);
+    let api = server.origin();
+
+    let err = login_with(&ctx, &api, "n", true).await.unwrap_err();
+    assert!(matches!(err, AuthError::Store(_)), "{err}");
+
+    let seen = server.seen();
+    let post = seen.iter().position(|s| s.method == "POST").unwrap();
+    let delete = seen
+        .iter()
+        .position(|s| s.method == "DELETE")
+        .expect("new device revoked");
+    assert!(post < delete);
+    assert_eq!(seen[delete].kid.as_deref(), Some(NEW_ID));
+}

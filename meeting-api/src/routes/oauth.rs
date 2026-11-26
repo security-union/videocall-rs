@@ -19,7 +19,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
@@ -58,8 +58,49 @@ fn build_session_cookie(
     cookie
 }
 
+/// Lifetime of the pre-login cookie: the same as the stored OAuth request.
+const LOGIN_COOKIE_TTL_SECS: i64 = db_oauth::OAUTH_REQUEST_TTL_SECS;
+
+/// Name of the pre-login cookie, derived from the session cookie name so
+/// environments that share a parent domain (PR previews) never collide.
+/// With `Secure` it carries the `__Host-` prefix, so the browser only
+/// accepts it from this exact host with `Path=/` and no `Domain`: a sibling
+/// subdomain cannot plant a value of its choosing.
+pub(crate) fn login_cookie_name(state: &AppState) -> String {
+    if state.cookie_secure {
+        format!("__Host-{}-login", state.cookie_name)
+    } else {
+        format!("{}-login", state.cookie_name)
+    }
+}
+
+/// `Set-Cookie` for the pre-login cookie: host-only (never a `Domain`),
+/// HttpOnly, SameSite=Lax (it must ride the top-level redirect back from
+/// the IdP), short-lived.
+fn build_login_cookie(name: &str, value: &str, secure: bool) -> String {
+    let mut cookie =
+        format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LOGIN_COOKIE_TTL_SECS}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// The pre-login value is 32 random bytes, base64url: 43 characters.
+fn is_valid_binding(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The value of cookie `name` from the request, if present.
+fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    crate::auth::extract_cookie_token(headers, name)
+}
+
 /// Build a `Set-Cookie` header that clears the session cookie.
-fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
+pub(crate) fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
     let mut cookie = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
@@ -92,6 +133,7 @@ pub struct CallbackQuery {
 /// redirects to the identity provider.
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, AppError> {
     let oauth_cfg = state
@@ -120,6 +162,15 @@ pub async fn login(
     });
     let return_to = return_to.as_deref();
 
+    // Bind this login to the browser that started it (login CSRF): the
+    // callback only completes where this cookie is present. A browser that
+    // already holds a valid one keeps it, so a login started in a second tab
+    // does not break one still running in the first.
+    let login_cookie = login_cookie_name(&state);
+    let binding = extract_cookie_value(&headers, &login_cookie)
+        .filter(|value| is_valid_binding(value))
+        .unwrap_or_else(|| crate::secrets::random_base64url(32));
+
     db_oauth::store_oauth_request(
         &state.db,
         pkce_challenge.as_str(),
@@ -127,6 +178,7 @@ pub async fn login(
         csrf_token.secret(),
         return_to,
         Some(nonce.secret()),
+        Some(&crate::secrets::sha256_hex(&binding)),
     )
     .await?;
 
@@ -140,7 +192,14 @@ pub async fn login(
         Some(nonce.secret()),
     );
 
-    Ok(Redirect::to(&auth_url).into_response())
+    let mut response = Redirect::to(&auth_url).into_response();
+    let cookie = build_login_cookie(&login_cookie, &binding, state.cookie_secure);
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie)
+            .map_err(|_| AppError::internal("failed to build login cookie header"))?,
+    );
+    Ok(response)
 }
 
 /// GET /login/callback?state=...&code=...
@@ -150,6 +209,7 @@ pub async fn login(
 /// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
 pub async fn callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, AppError> {
     let oauth_cfg = state
@@ -165,6 +225,25 @@ pub async fn callback(
                 videocall_meeting_types::APIError::internal_error("invalid OAuth state"),
             )
         })?;
+
+    // The row is consumed above, so a failed binding check also burns the
+    // state. Rows from before the binding existed carry no hash and are
+    // accepted for their (10-minute) TTL only, which fetch_oauth_request
+    // already enforces.
+    if let Some(expected) = oauth_req.browser_binding_hash.as_deref() {
+        let presented = extract_cookie_value(&headers, &login_cookie_name(&state))
+            .map(|value| crate::secrets::sha256_hex(&value));
+        let matches = presented.is_some_and(|hash| crate::secrets::ct_eq(&hash, expected));
+        if !matches {
+            tracing::info!("OAuth callback rejected: sign-in was started in another browser");
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                videocall_meeting_types::APIError::internal_error(
+                    "sign-in was started in a different browser; start it again here",
+                ),
+            ));
+        }
+    }
 
     let pkce_verifier = oauth_req
         .pkce_verifier
@@ -264,7 +343,7 @@ pub async fn callback(
     );
 
     // Log only the redirect origin: the returnTo path and query can carry
-    // values such as a device user code.
+    // identifiers such as a CLI sign-in request id.
     let redirect_origin = url::Url::parse(&redirect_url)
         .map(|u| u.origin().ascii_serialization())
         .unwrap_or_else(|_| "(relative)".to_string());
@@ -280,6 +359,19 @@ pub async fn callback(
         header::SET_COOKIE,
         HeaderValue::from_str(&session_cookie)
             .map_err(|_| AppError::internal("failed to build session cookie header"))?,
+    );
+    // The binding has done its job. A login still running in another tab of
+    // this browser now fails at its callback; that browser is signed in, so
+    // reloading the page that asked for sign-in is enough.
+    let clear_login = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        login_cookie_name(&state),
+        if state.cookie_secure { "; Secure" } else { "" }
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_login)
+            .map_err(|_| AppError::internal("failed to build login cookie header"))?,
     );
     Ok(response)
 }

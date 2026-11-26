@@ -164,7 +164,9 @@ impl Cli {
 // ---------------------------------------------------------------------------
 
 fn state(pool: &DbPool) -> AppState {
-    build_state(pool.clone())
+    let mut state = build_state(pool.clone());
+    state.oauth = Some(test_oauth_config());
+    state
 }
 
 async fn send(state: &AppState, req: Request<Body>) -> Response {
@@ -367,11 +369,7 @@ async fn authorize_accepts_loopback_and_remote_redirects() {
     let pool = get_test_pool().await;
     reset(&pool).await;
     let st = state(&pool);
-    for cli in [
-        Cli::loopback(),
-        Cli::with_redirect(format!("http://[::1]:{PORT}/callback")),
-        Cli::remote(),
-    ] {
+    for cli in [Cli::loopback(), Cli::remote()] {
         let id = authorize(&st, &cli).await;
         let (kind, host): (String, Option<String>) = sqlx::query_as(
             "SELECT redirect_kind, redirect_host FROM cli_auth_requests WHERE id = $1",
@@ -401,6 +399,7 @@ async fn authorize_never_redirects_on_invalid_input() {
     let cases: Vec<(&str, String)> = vec![
         ("redirect_uri", "https://evil.example/cli/code".into()),
         ("redirect_uri", "http://localhost:53682/callback".into()),
+        ("redirect_uri", "http://[::1]:53682/callback".into()),
         ("redirect_uri", "http://127.0.0.1:53682/callback?x=1".into()),
         ("redirect_uri", "http://127.0.0.1:80/callback".into()),
         ("redirect_uri", "http://evil.example:53682/callback".into()),
@@ -549,6 +548,168 @@ async fn request_sweep_is_bounded() {
     assert_eq!(second, 5);
 }
 
+#[tokio::test]
+#[serial]
+async fn per_client_cap_counts_only_requests_awaiting_a_decision() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let mut st = state(&pool);
+    st.device.max_pending_per_ip = 2;
+    st.device.max_pending = 100;
+    let from = |ip: &str| {
+        get(&Cli::loopback().authorize_uri())
+            .header("X-Forwarded-For", ip)
+            .body(Body::empty())
+            .unwrap()
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            send(&st, from("198.51.100.9")).await.status(),
+            StatusCode::FOUND
+        );
+    }
+    assert_eq!(
+        send(&st, from("198.51.100.9")).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Decided (approved, denied or consumed) rows no longer hold a slot,
+    // for the per-client cap or the global one.
+    sqlx::query(
+        "UPDATE cli_auth_requests SET decided_at = $1, decision = 'denied', user_id = 'someone'",
+    )
+    .bind(Utc::now())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        send(&st, from("198.51.100.9")).await.status(),
+        StatusCode::FOUND
+    );
+    let open = db::cli_auth::count_open_requests(&pool, Utc::now(), None)
+        .await
+        .unwrap();
+    assert_eq!(open, 1);
+    reset(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn per_client_cap_skips_infrastructure_addresses_and_groups_ipv6_by_64() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let mut st = state(&pool);
+    st.device.max_pending_per_ip = 2;
+    st.device.max_pending = 100;
+    let from = |ip: Option<&str>| {
+        let mut req = get(&Cli::loopback().authorize_uri());
+        if let Some(ip) = ip {
+            req = req.header("X-Forwarded-For", ip);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    // An ingress hiding client addresses must not turn the per-client cap
+    // into a global one: loopback, RFC 1918, CGNAT, link-local, ULA and a
+    // missing address are all exempt (the global cap still applies).
+    for ip in [
+        Some("127.0.0.1"),
+        Some("10.0.0.5"),
+        Some("192.168.1.4"),
+        Some("100.64.3.2"),
+        Some("169.254.0.9"),
+        Some("fd00::7"),
+        None,
+    ] {
+        for _ in 0..3 {
+            assert_eq!(
+                send(&st, from(ip)).await.status(),
+                StatusCode::FOUND,
+                "{ip:?}"
+            );
+        }
+    }
+    let exempt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cli_auth_requests WHERE requester_cap_key IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(exempt, 21);
+
+    // Two addresses in one IPv6 /64 share an allowance; another /64 does not.
+    assert_eq!(
+        send(&st, from(Some("2001:db8:5:6::1"))).await.status(),
+        StatusCode::FOUND
+    );
+    assert_eq!(
+        send(&st, from(Some("2001:db8:5:6:ffff::2"))).await.status(),
+        StatusCode::FOUND
+    );
+    assert_eq!(
+        send(&st, from(Some("2001:db8:5:6:abcd::3"))).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        send(&st, from(Some("2001:db8:5:7::1"))).await.status(),
+        StatusCode::FOUND
+    );
+
+    // The global cap still counts exempt rows.
+    st.device.max_pending = 24;
+    assert_eq!(
+        send(&st, from(Some("10.0.0.5"))).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    reset(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authorize_refuses_subresource_and_script_requests() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let st = state(&pool);
+    let cli = Cli::loopback();
+    // An <img>, a fetch() and an iframe on another site: 400, nothing stored.
+    for (mode, dest) in [
+        (Some("no-cors"), Some("image")),
+        (Some("cors"), Some("empty")),
+        (Some("navigate"), Some("iframe")),
+        (Some("no-cors"), None),
+        (None, Some("image")),
+    ] {
+        let mut req = get(&cli.authorize_uri());
+        if let Some(mode) = mode {
+            req = req.header("Sec-Fetch-Mode", mode);
+        }
+        if let Some(dest) = dest {
+            req = req.header("Sec-Fetch-Dest", dest);
+        }
+        let resp = send(&st, req.body(Body::empty()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{mode:?} {dest:?}");
+        assert!(header(&resp, "location").is_none());
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cli_auth_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    // A top-level navigation, and a client without Fetch Metadata, are fine.
+    let resp = send(
+        &st,
+        get(&cli.authorize_uri())
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Site", "none")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    authorize(&st, &Cli::loopback()).await;
+    reset(&pool).await;
+}
+
 // ---------------------------------------------------------------------------
 // /cli/consent: session, return target, CSRF
 // ---------------------------------------------------------------------------
@@ -600,6 +761,93 @@ async fn consent_requires_a_browser_session_cookie() {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(body_text(resp).await.contains("signed out"));
     }
+    reset(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn consent_page_shows_no_requester_address() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let st = state(&pool);
+    let user = unique_user();
+    let id = authorize(&st, &Cli::remote()).await;
+    let resp = send(
+        &st,
+        cookie_get(&format!("/cli/consent?request={id}"), &user),
+    )
+    .await;
+    let html = body_text(resp).await;
+    assert!(!html.contains("203.0.113.7"), "requester IP shown");
+    assert!(!html.contains("Request came from"));
+    assert!(!html.contains("different network"));
+    reset(&pool).await;
+}
+
+fn sign_out_post(origin: &str, fields: &[(&str, &str)], user: &str) -> Request<Body> {
+    request_with_cookie("POST", "/cli/sign-out", user)
+        .header("Origin", origin)
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form(fields))
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn sign_out_from_the_device_pages_is_a_post_that_returns_to_the_request() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let st = state(&pool);
+    let user = unique_user();
+    let id = authorize(&st, &Cli::loopback()).await;
+
+    // The consent page offers a POST form, not a /logout link.
+    let html = body_text(
+        send(
+            &st,
+            cookie_get(&format!("/cli/consent?request={id}"), &user),
+        )
+        .await,
+    )
+    .await;
+    assert!(!html.contains("/logout"));
+    assert!(html.contains("<form method=\"post\" action=\"/cli/sign-out\""));
+    assert!(html.contains(&format!("name=\"request\" value=\"{id}\"")));
+    let html = body_text(send(&st, cookie_get("/devices", &user)).await).await;
+    assert!(html.contains("action=\"/cli/sign-out\""));
+
+    // Signed out, cookie cleared, a sign-in link back to this request.
+    let resp = send(&st, sign_out_post(AUD, &[("request", &id)], &user)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cleared = header(&resp, "set-cookie").expect("Set-Cookie");
+    assert!(
+        cleared.starts_with("session=;") && cleared.contains("Max-Age=0"),
+        "{cleared}"
+    );
+    let html = body_text(resp).await;
+    assert!(html.contains("Signed out"));
+    let expected = form_urlencoded::Serializer::new(String::new())
+        .append_pair("returnTo", &format!("{AUD}/cli/consent?request={id}"))
+        .finish();
+    assert!(
+        html.contains(&format!("href=\"/login?{expected}\"")),
+        "{html}"
+    );
+
+    // No or bad request id: back to /devices.
+    for fields in [vec![], vec![("request", "../../evil")]] {
+        let html = body_text(send(&st, sign_out_post(AUD, &fields, &user)).await).await;
+        let expected = form_urlencoded::Serializer::new(String::new())
+            .append_pair("returnTo", &format!("{AUD}/devices"))
+            .finish();
+        assert!(html.contains(&expected), "{html}");
+    }
+
+    // Cross-site POST: rejected, the cookie stays.
+    let resp = send(&st, sign_out_post("https://evil.example", &[], &user)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(header(&resp, "set-cookie").is_none());
     reset(&pool).await;
 }
 
@@ -925,6 +1173,17 @@ async fn code_exchange_registers_a_device_once() {
         device.fingerprint,
         videocall_meeting_types::device::fingerprint(&cli.key.verifying_key().to_bytes())
     );
+
+    // decided_at is the consent decision, not the registration time.
+    let (approved_at, registered_decided_at): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT r.decided_at, d.decided_at FROM cli_auth_requests r \
+         JOIN devices d ON d.public_key = r.public_key WHERE d.id = $1",
+    )
+    .bind(&device.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(approved_at, registered_decided_at);
 
     // The device can call /devices/me.
     let token = cli.device_token(&device.device_id, AUD);

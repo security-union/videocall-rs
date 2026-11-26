@@ -42,13 +42,22 @@ use crate::token::{generate_observer_token, generate_room_token};
 /// display name is never touched, and the room token always has
 /// `is_host = false`. A creator joining their own *active* meeting via the
 /// CLI is still admitted without the waiting room.
+///
+/// Display names for CLI callers: the participant row is shared with the
+/// same account's browser session, so a CLI never replaces a name already
+/// stored there (it only fills an empty one). The name the CLI asked for
+/// goes into the room token it gets directly from this call; without one,
+/// the account's name is used, never the user id.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    CliOrBrowserUser { user_id, via, .. }: CliOrBrowserUser,
+    CliOrBrowserUser { user_id, name, via }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
+    // The name used when nobody chose one: the account name for a CLI
+    // device, the user id for a browser (unchanged behaviour).
+    let fallback_name = fallback_display_name(via, &user_id, &name);
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
@@ -71,13 +80,13 @@ pub async fn join_meeting(
                 .await?;
         let token = generate_room_token(
             &state.jwt_secret,
-            state.token_ttl_secs,
+            room_token_ttl(&state, via),
             &user_id,
             &meeting_id,
             false,
             display_name
                 .or(row.display_name.as_deref())
-                .unwrap_or(&user_id),
+                .unwrap_or(fallback_name),
         )?;
         let mut resp = row.into_participant_status(Some(token));
         resp.is_host = false;
@@ -123,7 +132,7 @@ pub async fn join_meeting(
             // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
             // status with an observer token so the client can receive a push
             // notification when the host activates the meeting.
-            let dn = display_name.unwrap_or(&user_id);
+            let dn = display_name.unwrap_or(fallback_name);
             let observer = generate_observer_token(&state.jwt_secret, &user_id, &meeting_id, dn)?;
             let resp = ParticipantStatusResponse {
                 user_id: user_id.clone(),
@@ -143,17 +152,32 @@ pub async fn join_meeting(
 
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
-        let (auto_admitted, row, waiting_room_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
+        let (auto_admitted, row, waiting_room_enabled) = db_participants::join_attendee(
+            &state.db,
+            meeting.id,
+            &user_id,
+            display_name,
+            via == AuthVia::Cli,
+        )
+        .await?;
+        // The CLI's requested name wins in its own token; the stored row
+        // (shared with the browser) is not renamed.
+        let token_name = match via {
+            AuthVia::Cli => display_name
+                .or(row.display_name.as_deref())
+                .unwrap_or(fallback_name),
+            AuthVia::Browser => display_name.unwrap_or(fallback_name),
+        }
+        .to_string();
 
         let token = if auto_admitted {
             Some(generate_room_token(
                 &state.jwt_secret,
-                state.token_ttl_secs,
+                room_token_ttl(&state, via),
                 &user_id,
                 &meeting_id,
                 false,
-                display_name.unwrap_or(&user_id),
+                &token_name,
             )?)
         } else {
             None
@@ -163,7 +187,7 @@ pub async fn join_meeting(
         // When the participant is placed in the waiting room (not auto-admitted),
         // include an observer token so they can receive push notifications.
         if !auto_admitted {
-            let dn = display_name.unwrap_or(&user_id);
+            let dn = &token_name;
             resp.observer_token = Some(generate_observer_token(
                 &state.jwt_secret,
                 &user_id,
@@ -187,7 +211,7 @@ pub async fn join_meeting(
 /// CLI credentials always get a room token with `is_host = false`.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    CliOrBrowserUser { user_id, via, .. }: CliOrBrowserUser,
+    CliOrBrowserUser { user_id, name, via }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -206,11 +230,13 @@ pub async fn get_my_status(
     let token = if row.status == "admitted" {
         Some(generate_room_token(
             &state.jwt_secret,
-            state.token_ttl_secs,
+            room_token_ttl(&state, via),
             &user_id,
             &meeting_id,
             row.is_host && via == AuthVia::Browser,
-            row.display_name.as_deref().unwrap_or(&user_id),
+            row.display_name
+                .as_deref()
+                .unwrap_or(fallback_display_name(via, &user_id, &name)),
         )?)
     } else {
         None
@@ -224,6 +250,29 @@ pub async fn get_my_status(
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
+}
+
+/// Lifetime of a room token issued to a CLI device. Short so that revoking
+/// a device stops it reaching the relay within minutes: the CLI asks for a
+/// fresh token on every connect attempt.
+pub const CLI_ROOM_TOKEN_TTL_SECS: i64 = 300;
+
+/// Room-token lifetime for this caller: [`CLI_ROOM_TOKEN_TTL_SECS`] for a CLI
+/// device, the configured `TOKEN_TTL_SECS` for a browser (unchanged).
+fn room_token_ttl(state: &AppState, via: AuthVia) -> i64 {
+    match via {
+        AuthVia::Cli => CLI_ROOM_TOKEN_TTL_SECS.min(state.token_ttl_secs),
+        AuthVia::Browser => state.token_ttl_secs,
+    }
+}
+
+/// The display name used when none was chosen or stored: a CLI device
+/// shows its account's name; a browser keeps the old user-id fallback.
+fn fallback_display_name<'a>(via: AuthVia, user_id: &'a str, account_name: &'a str) -> &'a str {
+    match via {
+        AuthVia::Cli if !account_name.trim().is_empty() => account_name,
+        _ => user_id,
+    }
 }
 
 /// POST /api/v1/meetings/{meeting_id}/leave

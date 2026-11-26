@@ -27,7 +27,7 @@ sudo pkill nix-daemon
 ## Use
 
 - Open http://localhost:3001 and navigate to
-  `http://localhost:3001/meeting/<username>/<meeting-id>`.
+  `http://localhost:3001/meeting/<meeting-id>`.
 - Stop with `F10`/`Ctrl-C` in the TUI, or `make dev-down` from another terminal.
 - `make help` lists everything else (tests, single-service watchers, e2e).
 

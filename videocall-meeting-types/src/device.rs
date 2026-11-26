@@ -35,7 +35,10 @@ pub const CLI_ISSUER: &str = "videocall-cli";
 /// `client_id` the CLI sends to `/cli/authorize`.
 pub const CLI_CLIENT_ID: &str = "videocall-cli";
 
-/// Path of the authorize endpoint on the API origin.
+/// Path of the authorize endpoint on the API origin. The loopback
+/// `redirect_uri` must be exactly `http://127.0.0.1:{port}/callback` with
+/// `port` in 1024..=65535; IPv6 loopback (`[::1]`) and `localhost` are not
+/// accepted.
 pub const CLI_AUTHORIZE_PATH: &str = "/cli/authorize";
 
 /// Path of the remote-login `redirect_uri` on the API origin
@@ -144,7 +147,7 @@ pub struct DeviceStatusResponse {
 pub struct DeviceErrorResponse {
     /// Machine-readable code: `invalid_request`, `invalid_grant`,
     /// `invalid_token`, `key_already_registered`, `too_many_devices`,
-    /// `device_auth_disabled`, `server_error`.
+    /// `not_configured` (503, `DEVICE_TOKEN_AUDIENCE` unset), `server_error`.
     pub error: String,
     /// Static human-readable description.
     pub error_description: String,

@@ -239,7 +239,7 @@ env:
 |---|---|---|---|
 | `OAUTH_CLIENT_ID` | Yes | — | OAuth client ID. OAuth is disabled if unset. |
 | `OAUTH_SECRET` | No | — | Client secret. Omit for public clients (PKCE only). |
-| `OAUTH_REDIRECT_URL` | Yes | — | Callback URL registered with the provider. |
+| `OAUTH_REDIRECT_URL` | Yes | — | Callback URL registered with the provider. Must be on the same host that serves `/login` (see below). |
 | `OAUTH_ISSUER` | No | — | OIDC issuer URL. Enables discovery + JWT `iss` validation. |
 | `OAUTH_AUTH_URL` | Cond. | — | Authorization endpoint. Required when `OAUTH_ISSUER` not set. |
 | `OAUTH_TOKEN_URL` | Cond. | — | Token endpoint. Required when `OAUTH_ISSUER` not set. |
@@ -248,6 +248,8 @@ env:
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated scopes. |
 | `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |
 | `ALLOWED_REDIRECT_URLS` | No | — | Comma-separated list of additional allowed redirect origins (e.g. `https://app2.example.com`). The origin of `AFTER_LOGIN_URL` is implicitly allowed. |
+
+**Redirect URL host:** `/login` sets a short-lived, host-only `<COOKIE_NAME>-login` cookie (`__Host-<COOKIE_NAME>-login` when `COOKIE_SECURE` is on), and the callback refuses the login without it. So `OAUTH_REDIRECT_URL` has to point at the same host that served `/login`.
 
 **CLI device login:** `videocall-cli` users sign in through the normal browser login, so nothing extra has to be registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to turn it on; the rest only change defaults:
 
@@ -258,8 +260,8 @@ env:
 | `DEVICE_IDLE_TTL_SECS` | No | `7776000` (90 days) | A CLI device expires after this long unused. |
 | `DEVICE_ABS_TTL_SECS` | No | `31536000` (365 days) | A CLI device expires this long after approval. |
 | `DEVICE_MAX_PER_USER` | No | `10` | Live CLI devices per account. |
-| `DEVICE_MAX_PENDING` | No | `10000` | Unfinished CLI login requests, globally. |
-| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | Unfinished CLI login requests per requester IP. |
+| `DEVICE_MAX_PENDING` | No | `10000` | CLI login requests still awaiting a decision, globally. |
+| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | CLI login requests awaiting a decision per IPv4 address or IPv6 /64. Skipped for private, loopback or unknown addresses. |
 
 The WebSocket and WebTransport relays take no OAuth configuration. For authentication they only need `JWT_SECRET`, the same value meeting-api signs room access tokens with.
 

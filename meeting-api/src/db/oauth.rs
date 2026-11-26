@@ -19,7 +19,12 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::db::{DbPool, OAuthRequestRow, SQL_NOW};
+use crate::db::{
+    DbPool, OAuthRequestRow, SweepGate, ROW_ID, SQL_NOW, SWEEP_BATCH, SWEEP_SKIP_LOCKED,
+};
+
+/// Throttles the sweep that `/login` triggers.
+static OAUTH_SWEEP_GATE: SweepGate = SweepGate::new();
 
 /// How long an IdP leg (`/login` → `/login/callback`) may
 /// take before its stored PKCE/CSRF state is considered abandoned.
@@ -28,8 +33,9 @@ pub const OAUTH_REQUEST_TTL_SECS: i64 = 600;
 /// Store a new OAuth request (PKCE + CSRF state + optional nonce) for later
 /// retrieval in the callback.
 ///
-/// Opportunistically sweeps rows older than [`OAUTH_REQUEST_TTL_SECS`] so the
-/// table cannot grow without bound from abandoned logins.
+/// Afterwards, at most once per [`crate::db::SWEEP_INTERVAL_SECS`] per
+/// process, sweeps rows older than [`OAUTH_REQUEST_TTL_SECS`] so the table
+/// cannot grow without bound from abandoned logins.
 pub async fn store_oauth_request(
     pool: &DbPool,
     pkce_challenge: &str,
@@ -37,19 +43,15 @@ pub async fn store_oauth_request(
     csrf_state: &str,
     return_to: Option<&str>,
     nonce: Option<&str>,
+    browser_binding_hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now();
-    // Best effort: a sweep failure must never fail the login itself.
-    if let Err(e) =
-        sweep_oauth_requests(pool, now - Duration::seconds(OAUTH_REQUEST_TTL_SECS)).await
-    {
-        tracing::warn!("sweeping oauth_requests failed: {e}");
-    }
     sqlx::query(
         r#"
         INSERT INTO oauth_requests
-            (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at,
+             browser_binding_hash)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(pkce_challenge)
@@ -58,8 +60,17 @@ pub async fn store_oauth_request(
     .bind(return_to)
     .bind(nonce)
     .bind(now)
+    .bind(browser_binding_hash)
     .execute(pool)
     .await?;
+    // Best effort: a sweep failure must never fail the login itself.
+    if OAUTH_SWEEP_GATE.try_acquire(now.timestamp()) {
+        if let Err(e) =
+            sweep_oauth_requests(pool, now - Duration::seconds(OAUTH_REQUEST_TTL_SECS)).await
+        {
+            tracing::warn!("sweeping oauth_requests failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -68,18 +79,22 @@ pub async fn store_oauth_request(
 /// one long DELETE.
 ///
 /// Rows with a NULL `created_at` are swept too: on SQLite the column is
-/// nullable, and only a pre-migration binary would insert such a row.
+/// nullable, and only a pre-migration binary would insert such a row. So are
+/// rows with a NULL `csrf_state`, which no callback can ever match. The
+/// delete is keyed on the physical row id, because `csrf_state` is nullable
+/// and `NULL IN (...)` never matches.
 pub async fn sweep_oauth_requests(
     pool: &DbPool,
     cutoff: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(
-        "DELETE FROM oauth_requests WHERE csrf_state IN \
-         (SELECT csrf_state FROM oauth_requests \
-          WHERE created_at < $1 OR created_at IS NULL LIMIT $2)",
-    )
+    let res = sqlx::query(&format!(
+        "DELETE FROM oauth_requests WHERE {ROW_ID} IN \
+         (SELECT {ROW_ID} FROM oauth_requests \
+          WHERE created_at < $1 OR created_at IS NULL OR csrf_state IS NULL \
+          LIMIT $2{SWEEP_SKIP_LOCKED})"
+    ))
     .bind(cutoff)
-    .bind(crate::db::SWEEP_BATCH)
+    .bind(SWEEP_BATCH)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -95,7 +110,8 @@ pub async fn fetch_oauth_request(
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
     let row = sqlx::query_as::<_, OAuthRequestRow>(
         "DELETE FROM oauth_requests WHERE csrf_state = $1 \
-         RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at",
+         RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at, \
+           browser_binding_hash",
     )
     .bind(csrf_state)
     .fetch_optional(pool)

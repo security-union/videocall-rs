@@ -183,6 +183,7 @@ pub fn page_router() -> Router<AppState> {
             get(cli_login::consent_page).post(cli_login::consent_decision),
         )
         .route(devices::CLI_REMOTE_CODE_PATH, get(cli_login::code_info))
+        .route("/cli/sign-out", post(device_pages::sign_out))
         .route("/devices", get(device_pages::devices_page))
         .route("/devices/{device_id}/revoke", post(device_pages::revoke))
         .route("/static/auth.css", get(device_pages::stylesheet))

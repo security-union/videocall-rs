@@ -116,6 +116,8 @@ videocall-cli stream \
 ```
 If the meeting hasn't started, the CLI waits for the host. If it has a waiting room, the host admits you like any other participant. Pass `--display-name "Garage Pi"` to show a different name than your account's.
 
+If the relay connection drops mid-stream, the CLI exits with an error instead of quietly streaming to nobody. Run it under systemd with `Restart=on-failure` (or just run it again) and it joins from scratch. Ctrl-C or `systemctl stop` closes the connection cleanly and exits 0.
+
 ## 🍓 Logging in on a Raspberry Pi or over SSH
 
 A headless box has no browser to open, so use `--remote` (the CLI switches to it on its own over SSH, or on Linux without a desktop session):
@@ -168,6 +170,8 @@ RUST_LOG=info cargo run --release -- auth login --api-url http://localhost:8081
 RUST_LOG=info cargo run --release -- stream --api-url http://localhost:8081 \
   --url https://127.0.0.1:4433 --insecure-skip-verify --meeting-id <meeting-id> ...
 ```
+
+The login step needs sign-in (OAuth) configured on your local meeting-api, because approving the key means signing in through it. The default dev stack has sign-in off, so `auth login` won't get past the browser page until you set it up (see the main README).
 
 `--insecure-skip-verify` exists for the dev stack's self-signed certificate. The CLI refuses it unless `--url` is localhost, a loopback address or a private-range IP. Plain `http://` for `--api-url` has the same limit. You can also set `VIDEOCALL_API_URL` instead of passing `--api-url` each time.
 

@@ -53,10 +53,18 @@ sha2 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
 getrandom = "0.3"
-# Ed25519 device key. Same versions and features as the rest of the
-# workspace (jsonwebtoken's `rust_crypto` backend pulls ed25519-dalek), so no
-# second crypto stack (aws-lc / ring) and no OpenSSL on the Pi build.
+# Ed25519 device key and device JWTs. Same versions and features as the
+# rest of the workspace: jsonwebtoken's pure-Rust `rust_crypto` backend uses
+# ed25519-dalek, so signing adds no C crypto and no OpenSSL to the Pi build.
+# The binary already carries two TLS providers that this doesn't change:
+# aws-lc-rs (web-transport-quinn's default, for the relay) and ring
+# (reqwest's rustls-tls-native-roots, in videocall-meeting-client).
 ed25519-dalek = { version = "2.2", features = ["std", "zeroize", "pkcs8", "alloc"] }
+# Already in the tree through ed25519-dalek; listed only to switch on
+# `zeroize`, which wipes the private key in its PKCS#8 encode/decode
+# scratch buffers (KeypairBytes). ed25519-dalek's own `zeroize` feature
+# doesn't forward it.
+ed25519 = { version = "2.2", default-features = false, features = ["zeroize"] }
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
 # Server `Date` header, for the clock-offset retry.
 httpdate = "1"

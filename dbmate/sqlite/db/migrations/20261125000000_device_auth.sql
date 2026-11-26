@@ -6,11 +6,15 @@
 
 -- SQLite cannot ADD COLUMN with a non-constant default, so backfill existing
 -- rows explicitly; the application always binds created_at on insert.
--- (csrf_state is already UNIQUE here from the initial schema.)
+-- (csrf_state is already UNIQUE here from the initial schema.) A row with no
+-- csrf_state can never be matched by a callback: drop it first.
+DELETE FROM oauth_requests WHERE csrf_state IS NULL;
 ALTER TABLE oauth_requests ADD COLUMN created_at TEXT;
 UPDATE oauth_requests SET created_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
     WHERE created_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_requests_created_at ON oauth_requests(created_at);
+-- SHA-256 of the pre-login cookie set by /login (see the Postgres file).
+ALTER TABLE oauth_requests ADD COLUMN browser_binding_hash TEXT;
 
 -- One browser-approved CLI login in flight (videocall-cli `auth login`,
 -- authorization code + PKCE). Created by GET /cli/authorize, decided on the
@@ -20,12 +24,16 @@ CREATE TABLE IF NOT EXISTS cli_auth_requests (
     id                          TEXT PRIMARY KEY CHECK (length(id) = 22),
     code_challenge              TEXT NOT NULL CHECK (length(code_challenge) BETWEEN 43 AND 128),
     redirect_kind               TEXT NOT NULL CHECK (redirect_kind IN ('loopback','remote')),
-    redirect_host               TEXT CHECK (redirect_host IS NULL OR redirect_host IN ('127.0.0.1','[::1]')),
+    redirect_host               TEXT CHECK (redirect_host IS NULL OR redirect_host = '127.0.0.1'),
     redirect_port               INTEGER CHECK (redirect_port IS NULL OR redirect_port BETWEEN 1024 AND 65535),
     client_state                TEXT NOT NULL CHECK (length(client_state) BETWEEN 16 AND 128),
     public_key                  TEXT NOT NULL CHECK (length(public_key) = 43),
     device_name                 TEXT NOT NULL CHECK (length(device_name) BETWEEN 1 AND 64),
     requester_ip                TEXT,
+    -- Key for the per-client cap on open requests: the IPv4 address or the
+    -- IPv6 /64. NULL when the address is infrastructure (loopback, private,
+    -- missing) and the per-client cap does not apply.
+    requester_cap_key           TEXT,
     created_at                  TEXT NOT NULL,
     expires_at                  TEXT NOT NULL,
     approval_nonce_hash         TEXT,
@@ -43,12 +51,14 @@ CREATE TABLE IF NOT EXISTS cli_auth_requests (
     CHECK (code_hash IS NULL OR (decision = 'approved' AND code_expires_at IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_cli_auth_requests_expires_at ON cli_auth_requests(expires_at);
-CREATE INDEX IF NOT EXISTS idx_cli_auth_requests_ip ON cli_auth_requests(requester_ip, expires_at);
+CREATE INDEX IF NOT EXISTS idx_cli_auth_requests_cap_key ON cli_auth_requests(requester_cap_key, expires_at)
+    WHERE decided_at IS NULL;
 
 -- Approved CLI devices. One row per Ed25519 public key; it exists only once
 -- a human approved the login and the CLI proved possession of the key. The
 -- device signs a short-lived EdDSA JWT whose `kid` is `id`. No secret is
--- stored. Revoked and expired rows are kept 30 days for the device list.
+-- stored. Revoked and expired rows are kept 30 days for audit and support;
+-- the device list shows only live devices.
 CREATE TABLE IF NOT EXISTS devices (
     id                          TEXT PRIMARY KEY CHECK (length(id) = 22),
     public_key                  TEXT NOT NULL UNIQUE CHECK (length(public_key) = 43),
@@ -63,10 +73,12 @@ CREATE TABLE IF NOT EXISTS devices (
     idle_expires_at             TEXT NOT NULL,
     abs_expires_at              TEXT NOT NULL,
     revoked_at                  TEXT,
-    revoked_reason              TEXT CHECK (revoked_reason IS NULL OR revoked_reason IN ('user','device'))
+    revoked_reason              TEXT CHECK (revoked_reason IS NULL OR revoked_reason IN ('user','device')),
+    -- The idle expiry slides but never past the absolute one, so the sweep
+    -- and the indexes only need idle_expires_at.
+    CHECK (idle_expires_at <= abs_expires_at)
 );
 CREATE INDEX IF NOT EXISTS idx_devices_user_live ON devices(user_id) WHERE revoked_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_devices_abs_expires ON devices(abs_expires_at);
 CREATE INDEX IF NOT EXISTS idx_devices_idle_expires ON devices(idle_expires_at);
 CREATE INDEX IF NOT EXISTS idx_devices_revoked_at ON devices(revoked_at) WHERE revoked_at IS NOT NULL;
 
@@ -74,4 +86,5 @@ CREATE INDEX IF NOT EXISTS idx_devices_revoked_at ON devices(revoked_at) WHERE r
 DROP TABLE IF EXISTS devices;
 DROP TABLE IF EXISTS cli_auth_requests;
 DROP INDEX IF EXISTS idx_oauth_requests_created_at;
+ALTER TABLE oauth_requests DROP COLUMN browser_binding_hash;
 ALTER TABLE oauth_requests DROP COLUMN created_at;

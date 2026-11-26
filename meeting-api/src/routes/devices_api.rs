@@ -184,8 +184,11 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         );
         return invalid_grant();
     }
-    let (Some(user_id), Some(user_name)) = (row.user_id.as_deref(), row.user_name.as_deref())
-    else {
+    let (Some(user_id), Some(user_name), Some(decided_at)) = (
+        row.user_id.as_deref(),
+        row.user_name.as_deref(),
+        row.decided_at,
+    ) else {
         return invalid_grant();
     };
 
@@ -206,7 +209,9 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         idle_expires_at,
         abs_expires_at,
     };
-    match db_devices::insert_device_capped(&state.db, &device, config.max_per_user).await {
+    match db_devices::insert_device_capped(&state.db, &device, decided_at, config.max_per_user)
+        .await
+    {
         Ok(CappedInsert::Inserted) => {}
         Ok(CappedInsert::TooManyDevices(n)) => {
             tracing::info!(

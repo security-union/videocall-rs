@@ -1,14 +1,16 @@
 /*
  * auth.css
  *
- * The only stylesheet of auth.videocall.rs. Hand-written so the pages need
- * no build step, no script and no inline style (the CSP allows style-src
- * 'self' and nothing else).
+ * The stylesheet of meeting-api's server-rendered pages (CLI sign-in
+ * consent and /devices), served at /static/auth.css. Hand-written so the
+ * pages need no build step, no script and no inline style (the CSP allows
+ * style-src 'self' and nothing else).
  *
  * The values are copied from videocall-theme/styles/tokens.css: the HIG
  * colors measured on iOS 27.2, the Dynamic Type scale at "Large", 44px hit
- * targets, and the theme's radii and spacing. If a token changes there,
- * change it here too. Only the tokens these pages use are copied.
+ * targets, and the theme's radii and spacing. Only the tokens these pages
+ * use are copied. meeting-api/tests/theme_tokens_tests.rs fails if any of
+ * them differs from the theme in light, dark or Increase Contrast.
  *
  * Mobile first: the base rules are the phone layout, and one min-width
  * query (the theme's 640px "regular" breakpoint) widens it.
@@ -40,12 +42,13 @@
 
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --text-title-1-emphasized: 700 1.75rem/1.2143 var(--font-sans);
-  --text-title-2-emphasized: 700 1.375rem/1.2727 var(--font-sans);
-  --text-headline: 600 1.0625rem/1.2941 var(--font-sans);
-  --text-body: 400 1.0625rem/1.2941 var(--font-sans);
-  --text-subheadline: 400 0.9375rem/1.3333 var(--font-sans);
-  --text-footnote: 400 0.8125rem/1.3846 var(--font-sans);
+  --type-scale: 1;
+  --text-title-1-emphasized: 700 calc(1.75rem * var(--type-scale))/1.2143 var(--font-sans);
+  --text-title-2-emphasized: 700 calc(1.375rem * var(--type-scale))/1.2727 var(--font-sans);
+  --text-headline: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+  --text-body: 400 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+  --text-subheadline: 400 calc(0.9375rem * var(--type-scale))/1.3333 var(--font-sans);
+  --text-footnote: 400 calc(0.8125rem * var(--type-scale))/1.3846 var(--font-sans);
 
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -82,12 +85,21 @@
   }
 }
 
-/* Increase Contrast: the theme's darker blue under white text in light,
-   and black text on the lighter blue in dark. */
+/* Increase Contrast, as in the theme. The light block also matches a dark
+   root (the theme's does too), so the dark block below restates what
+   differs there. */
 @media (prefers-contrast: more) {
   :root {
     --color-blue: #1E6EF4;
     --color-red: #E9152D;
+    --color-orange: #C55300;
+    --color-label-secondary: rgba(60, 60, 67, 0.80);
+    --color-fill-tertiary: rgba(118, 118, 128, 0.20);
+    --color-link: #1E6EF4;
+    --color-bg-grouped: #EBEBF0;
+    --color-accent-tint: rgba(30, 110, 244, 0.18);
+    --color-warning-tint: rgba(197, 83, 0, 0.18);
+    --color-danger-tint: rgba(233, 21, 45, 0.18);
   }
 }
 
@@ -95,7 +107,16 @@
   :root {
     --color-blue: #5CB8FF;
     --color-red: #FF6165;
+    --color-orange: #FFA056;
     --color-on-accent: #000000;
+    --color-label-secondary: rgba(235, 235, 245, 0.70);
+    --color-fill-tertiary: rgba(118, 118, 128, 0.32);
+    --color-link: #5CB8FF;
+    --color-bg-grouped: #000000;
+    --color-bg-grouped-secondary: #242426;
+    --color-accent-tint: rgba(92, 184, 255, 0.30);
+    --color-warning-tint: rgba(255, 160, 86, 0.30);
+    --color-danger-tint: rgba(255, 97, 101, 0.30);
   }
 }
 

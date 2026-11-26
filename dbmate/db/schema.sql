@@ -47,6 +47,7 @@ CREATE TABLE public.cli_auth_requests (
     public_key text NOT NULL,
     device_name text NOT NULL,
     requester_ip text,
+    requester_cap_key text,
     created_at timestamp with time zone NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     approval_nonce_hash text,
@@ -68,7 +69,7 @@ CREATE TABLE public.cli_auth_requests (
     CONSTRAINT cli_auth_requests_device_name_check CHECK (((length(device_name) >= 1) AND (length(device_name) <= 64))),
     CONSTRAINT cli_auth_requests_id_check CHECK ((length(id) = 22)),
     CONSTRAINT cli_auth_requests_public_key_check CHECK ((length(public_key) = 43)),
-    CONSTRAINT cli_auth_requests_redirect_host_check CHECK (((redirect_host IS NULL) OR (redirect_host = ANY (ARRAY['127.0.0.1'::text, '[::1]'::text])))),
+    CONSTRAINT cli_auth_requests_redirect_host_check CHECK (((redirect_host IS NULL) OR (redirect_host = '127.0.0.1'::text))),
     CONSTRAINT cli_auth_requests_redirect_kind_check CHECK ((redirect_kind = ANY (ARRAY['loopback'::text, 'remote'::text]))),
     CONSTRAINT cli_auth_requests_redirect_port_check CHECK (((redirect_port IS NULL) OR ((redirect_port >= 1024) AND (redirect_port <= 65535))))
 );
@@ -93,6 +94,7 @@ CREATE TABLE public.devices (
     abs_expires_at timestamp with time zone NOT NULL,
     revoked_at timestamp with time zone,
     revoked_reason text,
+    CONSTRAINT devices_check CHECK ((idle_expires_at <= abs_expires_at)),
     CONSTRAINT devices_fingerprint_check CHECK ((length(fingerprint) = 19)),
     CONSTRAINT devices_id_check CHECK ((length(id) = 22)),
     CONSTRAINT devices_name_check CHECK (((length(name) >= 1) AND (length(name) <= 64))),
@@ -195,7 +197,8 @@ CREATE TABLE public.oauth_requests (
     csrf_state text,
     return_to text,
     nonce character varying(255),
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    browser_binding_hash text
 );
 
 
@@ -366,24 +369,17 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: idx_cli_auth_requests_cap_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cli_auth_requests_cap_key ON public.cli_auth_requests USING btree (requester_cap_key, expires_at) WHERE (decided_at IS NULL);
+
+
+--
 -- Name: idx_cli_auth_requests_expires_at; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_cli_auth_requests_expires_at ON public.cli_auth_requests USING btree (expires_at);
-
-
---
--- Name: idx_cli_auth_requests_ip; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_cli_auth_requests_ip ON public.cli_auth_requests USING btree (requester_ip, expires_at);
-
-
---
--- Name: idx_devices_abs_expires; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_devices_abs_expires ON public.devices USING btree (abs_expires_at);
 
 
 --

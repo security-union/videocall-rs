@@ -21,7 +21,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::db::{DbPool, SWEEP_BATCH};
+use crate::db::{DbPool, SWEEP_BATCH, SWEEP_SKIP_LOCKED};
 
 /// How long a login request may wait for a decision.
 pub const REQUEST_TTL_SECS: i64 = 600;
@@ -43,7 +43,7 @@ pub struct CliAuthRequestRow {
     pub code_challenge: String,
     /// `loopback` or `remote`.
     pub redirect_kind: String,
-    /// `127.0.0.1` or `[::1]` for loopback.
+    /// Always `127.0.0.1` for loopback.
     pub redirect_host: Option<String>,
     pub redirect_port: Option<i32>,
     pub client_state: String,
@@ -78,6 +78,9 @@ pub struct NewCliAuthRequest<'a> {
     pub public_key: &'a str,
     pub device_name: &'a str,
     pub requester_ip: Option<&'a str>,
+    /// See `routes::device_pages::cap_key`; `None` exempts the row from the
+    /// per-client cap.
+    pub requester_cap_key: Option<&'a str>,
     pub now: DateTime<Utc>,
 }
 
@@ -92,8 +95,8 @@ pub async fn insert_request(
     sqlx::query(
         "INSERT INTO cli_auth_requests (id, code_challenge, redirect_kind, redirect_host, \
            redirect_port, client_state, public_key, device_name, requester_ip, created_at, \
-           expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+           expires_at, requester_cap_key) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(request.id)
     .bind(request.code_challenge)
@@ -106,29 +109,33 @@ pub async fn insert_request(
     .bind(request.requester_ip)
     .bind(request.now)
     .bind(request.now + Duration::seconds(REQUEST_TTL_SECS))
+    .bind(request.requester_cap_key)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Unexpired requests, globally or for one requester IP (approximate caps).
+/// Requests still waiting for a decision (undecided and unexpired), globally
+/// or for one per-client cap key. Decided and consumed rows do not count:
+/// they no longer hold anything open. Approximate caps (no lock).
 pub async fn count_open_requests(
     pool: &DbPool,
     now: DateTime<Utc>,
-    requester_ip: Option<&str>,
+    cap_key: Option<&str>,
 ) -> Result<i64, sqlx::Error> {
-    let base = "SELECT COUNT(*) FROM cli_auth_requests WHERE expires_at > $1";
-    match requester_ip {
+    let base =
+        "SELECT COUNT(*) FROM cli_auth_requests WHERE expires_at > $1 AND decided_at IS NULL";
+    match cap_key {
         None => {
             sqlx::query_scalar::<_, i64>(base)
                 .bind(now)
                 .fetch_one(pool)
                 .await
         }
-        Some(ip) => {
-            sqlx::query_scalar::<_, i64>(&format!("{base} AND requester_ip = $2"))
+        Some(key) => {
+            sqlx::query_scalar::<_, i64>(&format!("{base} AND requester_cap_key = $2"))
                 .bind(now)
-                .bind(ip)
+                .bind(key)
                 .fetch_one(pool)
                 .await
         }
@@ -260,10 +267,10 @@ pub async fn consume_code(
 /// Bounded sweep of requests more than an hour past their expiry (their
 /// codes expired long before). Deletes at most [`SWEEP_BATCH`] rows.
 pub async fn sweep_requests(pool: &DbPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(
+    let res = sqlx::query(&format!(
         "DELETE FROM cli_auth_requests WHERE id IN (SELECT id FROM cli_auth_requests \
-           WHERE expires_at < $1 LIMIT $2)",
-    )
+           WHERE expires_at < $1 LIMIT $2{SWEEP_SKIP_LOCKED})"
+    ))
     .bind(now - Duration::hours(1))
     .bind(SWEEP_BATCH)
     .execute(pool)

@@ -5,7 +5,7 @@ CREATE TABLE oauth_requests (
     csrf_state TEXT UNIQUE,
     return_to TEXT,
     nonce TEXT
-, created_at TEXT);
+, created_at TEXT, browser_binding_hash TEXT);
 CREATE TABLE users (
     email TEXT PRIMARY KEY CHECK (length(email) <= 255),
     access_token TEXT,
@@ -61,12 +61,16 @@ CREATE TABLE cli_auth_requests (
     id                          TEXT PRIMARY KEY CHECK (length(id) = 22),
     code_challenge              TEXT NOT NULL CHECK (length(code_challenge) BETWEEN 43 AND 128),
     redirect_kind               TEXT NOT NULL CHECK (redirect_kind IN ('loopback','remote')),
-    redirect_host               TEXT CHECK (redirect_host IS NULL OR redirect_host IN ('127.0.0.1','[::1]')),
+    redirect_host               TEXT CHECK (redirect_host IS NULL OR redirect_host = '127.0.0.1'),
     redirect_port               INTEGER CHECK (redirect_port IS NULL OR redirect_port BETWEEN 1024 AND 65535),
     client_state                TEXT NOT NULL CHECK (length(client_state) BETWEEN 16 AND 128),
     public_key                  TEXT NOT NULL CHECK (length(public_key) = 43),
     device_name                 TEXT NOT NULL CHECK (length(device_name) BETWEEN 1 AND 64),
     requester_ip                TEXT,
+    -- Key for the per-client cap on open requests: the IPv4 address or the
+    -- IPv6 /64. NULL when the address is infrastructure (loopback, private,
+    -- missing) and the per-client cap does not apply.
+    requester_cap_key           TEXT,
     created_at                  TEXT NOT NULL,
     expires_at                  TEXT NOT NULL,
     approval_nonce_hash         TEXT,
@@ -84,7 +88,8 @@ CREATE TABLE cli_auth_requests (
     CHECK (code_hash IS NULL OR (decision = 'approved' AND code_expires_at IS NOT NULL))
 );
 CREATE INDEX idx_cli_auth_requests_expires_at ON cli_auth_requests(expires_at);
-CREATE INDEX idx_cli_auth_requests_ip ON cli_auth_requests(requester_ip, expires_at);
+CREATE INDEX idx_cli_auth_requests_cap_key ON cli_auth_requests(requester_cap_key, expires_at)
+    WHERE decided_at IS NULL;
 CREATE TABLE devices (
     id                          TEXT PRIMARY KEY CHECK (length(id) = 22),
     public_key                  TEXT NOT NULL UNIQUE CHECK (length(public_key) = 43),
@@ -99,10 +104,12 @@ CREATE TABLE devices (
     idle_expires_at             TEXT NOT NULL,
     abs_expires_at              TEXT NOT NULL,
     revoked_at                  TEXT,
-    revoked_reason              TEXT CHECK (revoked_reason IS NULL OR revoked_reason IN ('user','device'))
+    revoked_reason              TEXT CHECK (revoked_reason IS NULL OR revoked_reason IN ('user','device')),
+    -- The idle expiry slides but never past the absolute one, so the sweep
+    -- and the indexes only need idle_expires_at.
+    CHECK (idle_expires_at <= abs_expires_at)
 );
 CREATE INDEX idx_devices_user_live ON devices(user_id) WHERE revoked_at IS NULL;
-CREATE INDEX idx_devices_abs_expires ON devices(abs_expires_at);
 CREATE INDEX idx_devices_idle_expires ON devices(idle_expires_at);
 CREATE INDEX idx_devices_revoked_at ON devices(revoked_at) WHERE revoked_at IS NOT NULL;
 -- Dbmate schema migrations

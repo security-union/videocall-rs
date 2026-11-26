@@ -39,9 +39,11 @@ const OFFLINE_TEST_USER_ID: &str = "offline-streaming-test";
 
 /// Resolves on Ctrl-C, or on SIGTERM on unix (systemd/docker stop).
 ///
-/// Shutdown is local only: the CLI does not call meeting-api `leave`. Its
-/// account may also be in the meeting from a browser, and leaving would
-/// mark that participant as gone; the relay notices the dropped session.
+/// A requested stop exits 0 wherever it happens (joining, connecting or
+/// streaming). Once connected, the relay session is closed explicitly
+/// (code 0) so the relay drops us right away. The CLI does not call
+/// meeting-api `leave`: its account may also be in the meeting from a
+/// browser, and leaving would mark that participant as gone.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -115,7 +117,10 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         println!("Joining meeting '{meeting_id}'...");
         let room = tokio::select! {
             room = RoomSession::join(creds, &meeting_id, opt.display_name.clone()) => room?,
-            () = &mut shutdown => bail!("stopped before joining meeting '{meeting_id}'"),
+            () = &mut shutdown => {
+                println!("Stopped before joining meeting '{meeting_id}'.");
+                return Ok(());
+            }
         };
         println!("Admitted to meeting '{meeting_id}' as {}.", room.user_id());
         (
@@ -165,17 +170,22 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let data = tokio::select! {
             data = wt_rx.recv() => data,
             () = &mut shutdown => {
+                client.close().await;
                 println!("Stopped.");
-                break;
+                return Ok(());
+            }
+            reason = client.lost() => {
+                // No reconnect: exit non-zero so systemd (or the user)
+                // restarts the CLI, which joins again from scratch.
+                bail!("lost the relay connection ({reason}); exiting");
             }
         };
         let Some(data) = data else { break };
         tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
-            tracing::error!("Failed to send packet: {}", e);
-        } else {
-            tracing::debug!("Packet sent successfully to WebTransport client");
+            tracing::debug!("Packet not sent: {e}");
         }
     }
+    client.close().await;
     Ok(())
 }

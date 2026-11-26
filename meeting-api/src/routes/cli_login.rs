@@ -40,13 +40,14 @@ use crate::db::cli_auth::{
     REMOTE_CODE_TTL_SECS,
 };
 use crate::db::devices as db_devices;
+use crate::db::SweepGate;
 use crate::device_auth::{
     self, consent_path, is_valid_client_state, is_valid_code_challenge, parse_redirect_uri,
     validate_public_key, RedirectTarget,
 };
 use crate::html;
 use crate::routes::device_pages::{
-    api_origin, check_form_post, client_ip, login_redirect, page_user, PeerAddr,
+    api_origin, cap_key, check_form_post, client_ip, login_redirect, page_user, PeerAddr,
 };
 use crate::secrets::{random_base64url, sha256_hex};
 use crate::state::AppState;
@@ -124,6 +125,10 @@ pub async fn authorize(
     let Some(origin) = api_origin(&state) else {
         return html::not_configured_page();
     };
+    if !is_top_level_navigation(&headers) {
+        tracing::info!("cli authorize rejected: not a top-level navigation");
+        return html::authorize_error_page();
+    }
     let Ok(Query(query)) = query else {
         return html::authorize_error_page();
     };
@@ -137,20 +142,27 @@ pub async fn authorize(
     let now = Utc::now();
     let config = &state.device;
 
-    match db_devices::public_key_exists(&state.db, &request.public_key).await {
-        Ok(true) => return html::key_registered_page(),
-        Ok(false) => {}
-        Err(e) => return db_error(e),
+    // Caps first, cheapest and most selective first; sweeps only after the
+    // request is accepted. Expired rows never count toward the caps, so a
+    // late sweep cannot let more through.
+    let client = client_ip(&headers, peer, config.trust_x_forwarded_for);
+    let ip = client.map(|ip| ip.to_string());
+    let cap_key = cap_key(client);
+    match cap_key.as_deref() {
+        Some(key) => match db_cli::count_open_requests(&state.db, now, Some(key)).await {
+            Ok(n) if n >= config.max_pending_per_ip => {
+                tracing::info!(
+                    requester_cap_key = key,
+                    "per-client open CLI login cap reached"
+                );
+                return html::busy_page();
+            }
+            Ok(_) => {}
+            Err(e) => return db_error(e),
+        },
+        None if config.trust_x_forwarded_for => warn_infrastructure_address_once(ip.as_deref()),
+        None => {}
     }
-
-    if let Err(e) = db_cli::sweep_requests(&state.db, now).await {
-        tracing::warn!("sweeping cli_auth_requests failed: {e}");
-    }
-    if let Err(e) = db_devices::sweep_devices(&state.db, now).await {
-        tracing::warn!("sweeping devices failed: {e}");
-    }
-
-    let ip = client_ip(&headers, peer, config.trust_x_forwarded_for).map(|ip| ip.to_string());
     match db_cli::count_open_requests(&state.db, now, None).await {
         Ok(n) if n >= config.max_pending => {
             tracing::warn!("global open CLI login cap reached ({n})");
@@ -159,15 +171,11 @@ pub async fn authorize(
         Ok(_) => {}
         Err(e) => return db_error(e),
     }
-    if let Some(ip) = ip.as_deref() {
-        match db_cli::count_open_requests(&state.db, now, Some(ip)).await {
-            Ok(n) if n >= config.max_pending_per_ip => {
-                tracing::info!(requester_ip = ip, "per-IP open CLI login cap reached");
-                return html::busy_page();
-            }
-            Ok(_) => {}
-            Err(e) => return db_error(e),
-        }
+
+    match db_devices::public_key_exists(&state.db, &request.public_key).await {
+        Ok(true) => return html::key_registered_page(),
+        Ok(false) => {}
+        Err(e) => return db_error(e),
     }
 
     let id = device_auth::generate_device_id();
@@ -183,6 +191,7 @@ pub async fn authorize(
         public_key: &request.public_key,
         device_name: &request.device_name,
         requester_ip: ip.as_deref(),
+        requester_cap_key: cap_key.as_deref(),
         now,
     };
     if let Err(e) = db_cli::insert_request(&state.db, &row).await {
@@ -195,7 +204,54 @@ pub async fn authorize(
         requester_ip = ip.as_deref().unwrap_or("-"),
         "cli login requested"
     );
+    sweep_if_due(&state, now).await;
     (StatusCode::FOUND, [(header::LOCATION, consent_path(&id))]).into_response()
+}
+
+/// `/cli/authorize` creates state for an unauthenticated GET, so only a
+/// top-level navigation may do it: an `<img>`, `fetch` or iframe on another
+/// site is refused. Browsers that send no Fetch Metadata (old ones, curl)
+/// are allowed.
+fn is_top_level_navigation(headers: &HeaderMap) -> bool {
+    let header_is = |name: &str, expected: &str| {
+        headers
+            .get(name)
+            .map(|v| v.to_str().is_ok_and(|v| v.eq_ignore_ascii_case(expected)))
+            .unwrap_or(true)
+    };
+    header_is("sec-fetch-mode", "navigate") && header_is("sec-fetch-dest", "document")
+}
+
+/// With `TRUST_X_FORWARDED_FOR=true` the resolved client should be a public
+/// address. If it is not, the ingress is hiding client addresses and the
+/// per-client cap is off; say so once per process.
+fn warn_infrastructure_address_once(ip: Option<&str>) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            client_ip = ip.unwrap_or("-"),
+            "TRUST_X_FORWARDED_FOR is on but the client address is loopback, private or \
+             missing; the per-client CLI login cap is not applied. Check that the ingress \
+             appends the real client address to X-Forwarded-For."
+        );
+    });
+}
+
+/// Throttle for the two sweeps `/cli/authorize` triggers.
+static CLI_SWEEP_GATE: SweepGate = SweepGate::new();
+
+/// Best effort, at most once per [`crate::db::SWEEP_INTERVAL_SECS`] per
+/// process: drop long-expired login requests and long-dead devices.
+async fn sweep_if_due(state: &AppState, now: chrono::DateTime<Utc>) {
+    if !CLI_SWEEP_GATE.try_acquire(now.timestamp()) {
+        return;
+    }
+    if let Err(e) = db_cli::sweep_requests(&state.db, now).await {
+        tracing::warn!("sweeping cli_auth_requests failed: {e}");
+    }
+    if let Err(e) = db_devices::sweep_devices(&state.db, now).await {
+        tracing::warn!("sweeping devices failed: {e}");
+    }
 }
 
 fn db_error(e: sqlx::Error) -> Response {
@@ -212,7 +268,6 @@ pub struct ConsentQuery {
 /// `GET /cli/consent?request={id}`
 pub async fn consent_page(
     State(state): State<AppState>,
-    peer: PeerAddr,
     headers: HeaderMap,
     query: Result<Query<ConsentQuery>, QueryRejection>,
 ) -> Response {
@@ -227,7 +282,7 @@ pub async fn consent_page(
         return html::invalid_page();
     };
     let Some(user) = page_user(&state, &headers) else {
-        return login_redirect(origin, &consent_path(&request_id));
+        return login_redirect(&state, origin, &consent_path(&request_id));
     };
 
     let now = Utc::now();
@@ -248,16 +303,12 @@ pub async fn consent_page(
     let Some(fingerprint) = device_auth::fingerprint_of(&request.public_key) else {
         return html::invalid_page();
     };
-    let viewer_ip =
-        client_ip(&headers, peer, state.device.trust_x_forwarded_for).map(|ip| ip.to_string());
     let mut response = html::confirm_page(&html::ConfirmView {
         viewer_name: &user.name,
         viewer_user_id: &user.user_id,
         request: &request,
         nonce: &nonce,
         fingerprint: &fingerprint,
-        viewer_ip: viewer_ip.as_deref(),
-        logout_url: "/logout",
         now,
     });
     // A loopback approval ends in a redirect to the CLI's listener; CSP

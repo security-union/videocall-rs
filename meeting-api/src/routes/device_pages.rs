@@ -23,8 +23,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
-use axum::http::{header, request::Parts, HeaderMap, StatusCode};
+use axum::http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use url::form_urlencoded;
@@ -62,17 +63,26 @@ pub fn api_origin(state: &AppState) -> Option<&str> {
 /// `302` to `/login` on this host, returning to `path` on the API origin.
 /// `path` must be one of the closed return targets (see
 /// [`crate::device_auth::device_return_target`]) and is always rebuilt by
-/// the caller, never echoed from the request.
-pub fn login_redirect(api_origin: &str, path: &str) -> Response {
+/// the caller, never echoed from the request. Without OAuth configured
+/// `/login` can only fail, so this renders a 503 page instead.
+pub fn login_redirect(state: &AppState, api_origin: &str, path: &str) -> Response {
+    if state.oauth.is_none() {
+        return html::sign_in_unavailable_page();
+    }
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, login_location(api_origin, path))],
+    )
+        .into_response()
+}
+
+/// `/login?returnTo={api_origin}{path}`, encoded.
+pub fn login_location(api_origin: &str, path: &str) -> String {
     let return_to = format!("{api_origin}{path}");
     let query: String = form_urlencoded::Serializer::new(String::new())
         .append_pair("returnTo", &return_to)
         .finish();
-    (
-        StatusCode::FOUND,
-        [(header::LOCATION, format!("/login?{query}"))],
-    )
-        .into_response()
+    format!("/login?{query}")
 }
 
 /// CSRF checks for every page POST: `Origin` exactly the API origin,
@@ -146,6 +156,87 @@ pub fn client_ip(
     peer.0.map(|addr| addr.ip())
 }
 
+/// The key the per-client cap on open sign-in requests counts by: an IPv4
+/// address, or the /64 of an IPv6 address (one subscriber's usual
+/// allocation, so rotating privacy addresses do not each get a fresh
+/// allowance). `None` for addresses that belong to infrastructure rather
+/// than a client (loopback, RFC 1918, CGNAT 100.64/10, link-local, IPv6
+/// ULA, unspecified) and for a missing address: counting those would let one
+/// client exhaust the cap for everyone behind the same hop.
+pub fn cap_key(ip: Option<IpAddr>) -> Option<String> {
+    match ip? {
+        IpAddr::V4(v4) => v4_cap_key(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4_cap_key(v4);
+            }
+            let segments = v6.segments();
+            let infrastructure = v6.is_loopback()
+                || v6.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (segments[0] & 0xffc0) == 0xfe80; // link-local fe80::/10
+            if infrastructure {
+                return None;
+            }
+            let prefix = std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            );
+            Some(format!("{prefix}/64"))
+        }
+    }
+}
+
+fn v4_cap_key(v4: std::net::Ipv4Addr) -> Option<String> {
+    let [a, b, ..] = v4.octets();
+    let cgnat = a == 100 && (64..128).contains(&b);
+    let infrastructure =
+        v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || cgnat;
+    (!infrastructure).then(|| v4.to_string())
+}
+
+/// `POST /cli/sign-out` (form): clear the session cookie and render a
+/// "Signed out" page whose sign-in link returns to the consent request named
+/// in the form, or to /devices. Same CSRF checks as every page POST. The
+/// web app's `GET /logout` is unchanged.
+pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(origin) = api_origin(&state) else {
+        return html::not_configured_page();
+    };
+    if let Err(reason) = check_form_post(origin, &headers) {
+        tracing::info!("sign-out POST rejected: {reason}");
+        return html::rejected_page();
+    }
+    let request_id = form_urlencoded::parse(&body)
+        .find(|(key, _)| key == "request")
+        .map(|(_, value)| value.into_owned())
+        .filter(|id| is_valid_device_id(id));
+    // Rebuilt from the validated id: always one of the closed return targets.
+    let path = match request_id {
+        Some(id) => crate::device_auth::consent_path(&id),
+        None => "/devices".to_string(),
+    };
+    let clear = crate::routes::oauth::build_clear_session_cookie(
+        &state.cookie_name,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
+    let mut response = html::signed_out_by_user_page(&login_location(origin, &path));
+    match HeaderValue::from_str(&clear) {
+        Ok(value) => {
+            response.headers_mut().append(header::SET_COOKIE, value);
+            response
+        }
+        Err(_) => html::error_page(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// `GET /static/auth.css`
 pub async fn stylesheet() -> Response {
     (
@@ -164,7 +255,7 @@ pub async fn devices_page(State(state): State<AppState>, headers: HeaderMap) -> 
         return html::not_configured_page();
     };
     let Some(user) = page_user(&state, &headers) else {
-        return login_redirect(origin, "/devices");
+        return login_redirect(&state, origin, "/devices");
     };
     match db_devices::list_live_devices(&state.db, &user.user_id, Utc::now()).await {
         Ok(devices) => html::devices_page(&user.name, &devices),
@@ -210,7 +301,6 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     #[test]
     fn x_forwarded_for_only_when_trusted() {
@@ -236,10 +326,44 @@ mod tests {
     }
 
     #[test]
-    fn login_redirect_encodes_return_to() {
-        let resp = login_redirect("https://api.videocall.rs", "/devices");
+    fn cap_keys_skip_infrastructure_and_group_ipv6_by_64() {
+        let key = |s: &str| cap_key(Some(s.parse().unwrap()));
+        assert_eq!(key("203.0.113.7").as_deref(), Some("203.0.113.7"));
+        for infra in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.1.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fd00::1",
+            "fc12::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert_eq!(key(infra), None, "{infra}");
+        }
+        assert_eq!(key("100.128.0.1").as_deref(), Some("100.128.0.1"));
+        assert_eq!(key("172.32.0.1").as_deref(), Some("172.32.0.1"));
+        assert_eq!(key("::ffff:203.0.113.7").as_deref(), Some("203.0.113.7"));
         assert_eq!(
-            resp.headers().get("location").unwrap(),
+            key("2001:db8:1:2:aaaa::1"),
+            key("2001:db8:1:2:bbbb:cccc:dddd:eeee")
+        );
+        assert_eq!(key("2001:db8:1:2::9").as_deref(), Some("2001:db8:1:2::/64"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(cap_key(None), None);
+    }
+
+    #[test]
+    fn login_redirect_encodes_return_to() {
+        assert_eq!(
+            login_location("https://api.videocall.rs", "/devices"),
             "/login?returnTo=https%3A%2F%2Fapi.videocall.rs%2Fdevices"
         );
     }

@@ -94,16 +94,22 @@ pub fn device_validation(expected_aud: &str, require_sub: bool) -> Validation {
     validation
 }
 
-/// `iat` not in the future beyond the leeway, and a lifetime of at most
-/// [`DEVICE_TOKEN_MAX_LIFETIME_SECS`].
+/// `iat` not in the future beyond the leeway, and a lifetime `exp - iat` in
+/// `1..=`[`DEVICE_TOKEN_MAX_LIFETIME_SECS`]. All arithmetic is checked, so
+/// extreme claim values cannot wrap around the bounds.
 pub fn check_token_times(iat: i64, exp: i64, now: DateTime<Utc>) -> Result<(), &'static str> {
-    if iat > now.timestamp() + DEVICE_TOKEN_LEEWAY_SECS {
+    let latest_iat = now
+        .timestamp()
+        .checked_add(DEVICE_TOKEN_LEEWAY_SECS)
+        .ok_or("clock overflow")?;
+    if iat > latest_iat {
         return Err("iat in the future");
     }
-    if exp - iat > DEVICE_TOKEN_MAX_LIFETIME_SECS {
-        return Err("lifetime too long");
+    match exp.checked_sub(iat) {
+        Some(lifetime) if (1..=DEVICE_TOKEN_MAX_LIFETIME_SECS).contains(&lifetime) => Ok(()),
+        Some(_) => Err("lifetime out of range"),
+        None => Err("lifetime overflow"),
     }
-    Ok(())
 }
 
 /// Decode a stored base64url public key to its 32 raw bytes.
@@ -111,7 +117,7 @@ pub fn public_key_raw(public_key_b64: &str) -> Option<[u8; 32]> {
     URL_SAFE_NO_PAD.decode(public_key_b64).ok()?.try_into().ok()
 }
 
-/// Validate an encoded public key (contract 2.3): 43 base64url chars, 32
+/// Validate an encoded public key: 43 base64url chars, 32
 /// bytes, a valid Edwards point, not a small-order (weak) key.
 pub fn validate_public_key(encoded: &str) -> Option<[u8; 32]> {
     if !device::is_valid_public_key_format(encoded) {
@@ -208,7 +214,8 @@ struct PublicKeyOnly {
     public_key: String,
 }
 
-/// Verify the self-signed registration JWS (contract 2.5): read
+/// Verify the self-signed registration JWS (proof that the caller holds
+/// the private key it is registering): read
 /// `public_key` unverified, validate it, then verify the whole token with
 /// that key and the pinned [`device_validation`]. Returns the claims (name
 /// normalized) and the raw key.
@@ -266,7 +273,7 @@ impl RedirectTarget {
 ///
 /// Accepted spellings, exactly (anything else is rejected, never
 /// normalized):
-/// - `http://127.0.0.1:{port}/callback` or `http://[::1]:{port}/callback`
+/// - `http://127.0.0.1:{port}/callback`
 ///   with `port` in 1024..=65535 written without leading zeros. Not
 ///   `localhost` (DNS can point it elsewhere), no userinfo, query or fragment.
 /// - `{api_origin}/cli/code` (remote login).
@@ -275,10 +282,10 @@ pub fn parse_redirect_uri(raw: &str, api_origin: &str) -> Option<RedirectTarget>
         return Some(RedirectTarget::Remote);
     }
     let rest = raw.strip_prefix("http://")?;
-    let (host, rest) = match rest.strip_prefix("127.0.0.1:") {
-        Some(rest) => ("127.0.0.1", rest),
-        None => ("[::1]", rest.strip_prefix("[::1]:")?),
-    };
+    // IPv4 loopback only: CSP form-action cannot express an IPv6 literal
+    // host, and the CLI always listens on 127.0.0.1.
+    let host = "127.0.0.1";
+    let rest = rest.strip_prefix("127.0.0.1:")?;
     let port_str = rest.strip_suffix("/callback")?;
     if port_str.is_empty()
         || port_str.len() > 5
@@ -372,10 +379,6 @@ mod tests {
             loopback("127.0.0.1", 53682)
         );
         assert_eq!(
-            parse_redirect_uri("http://[::1]:1024/callback", API),
-            loopback("[::1]", 1024)
-        );
-        assert_eq!(
             parse_redirect_uri("http://127.0.0.1:65535/callback", API),
             loopback("127.0.0.1", 65535)
         );
@@ -383,8 +386,8 @@ mod tests {
             parse_redirect_uri("https://api.videocall.rs/cli/code", API),
             Some(RedirectTarget::Remote)
         );
-        let target = loopback("[::1]", 4000).unwrap();
-        assert_eq!(target.redirect_uri(API), "http://[::1]:4000/callback");
+        let target = loopback("127.0.0.1", 4000).unwrap();
+        assert_eq!(target.redirect_uri(API), "http://127.0.0.1:4000/callback");
         assert_eq!(
             RedirectTarget::Remote.redirect_uri(API),
             "https://api.videocall.rs/cli/code"
@@ -419,6 +422,7 @@ mod tests {
             "http://[::ffff:127.0.0.1]:53682/callback",
             "http://[0:0:0:0:0:0:0:1]:53682/callback",
             "http://::1:53682/callback",
+            "http://[::1]:53682/callback",
             " http://127.0.0.1:53682/callback",
             "http://127.0.0.1:53682/callback ",
             "http://127.0.0.1:53682/../callback",
@@ -507,6 +511,13 @@ mod tests {
         assert!(check_token_times(t, t + 301, now).is_err());
         assert!(check_token_times(t + 60, t + 120, now).is_ok());
         assert!(check_token_times(t + 120, t + 240, now).is_err());
+        // Overflow and non-positive lifetimes.
+        assert!(check_token_times(i64::MIN, t + 120, now).is_err());
+        assert!(check_token_times(i64::MIN, i64::MAX, now).is_err());
+        assert!(check_token_times(t, t - 1, now).is_err());
+        assert!(check_token_times(t, t, now).is_err());
+        assert!(check_token_times(t, i64::MIN, now).is_err());
+        assert!(check_token_times(t, t + 1, now).is_ok());
     }
 
     #[test]

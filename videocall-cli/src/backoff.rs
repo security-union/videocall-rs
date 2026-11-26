@@ -44,7 +44,7 @@ impl Backoff {
         }
     }
 
-    /// Relay reconnect policy: 1 s doubling to 30 s.
+    /// Policy for the initial relay connect attempts: 1 s doubling to 30 s.
     pub fn relay() -> Self {
         Self::new(Duration::from_secs(1), Duration::from_secs(30))
     }

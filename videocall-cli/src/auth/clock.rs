@@ -16,7 +16,9 @@
  * conditions.
  */
 
-//! Clock-offset correction for signing device JWTs (contract 2.6).
+//! Clock-offset correction for signing device JWTs. The servers accept
+//! `iat` up to 60 s in the future and `exp` with 60 s of leeway, so a
+//! clock off by more than that gets every token rejected.
 //!
 //! A Raspberry Pi has no RTC, so right after boot its clock can be off by
 //! minutes until NTP catches up. Device tokens carry `iat`/`exp`, so the

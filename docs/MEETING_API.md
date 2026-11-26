@@ -390,7 +390,8 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **First user to join** becomes the host; the meeting is created and activated
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
-- **CLI devices** never host: a missing meeting returns 404 instead of being created, an idle meeting is never activated, and the `room_token` always has `is_host: false`. The creator joining their own active meeting from the CLI skips the waiting room.
+- **CLI devices** never host: a missing meeting returns 404 instead of being created, an idle meeting is never activated, and the `room_token` always has `is_host: false` and lasts at most 300 seconds. The creator joining their own active meeting from the CLI skips the waiting room.
+- A CLI's `display_name` goes only into its own room token; it never renames the participant row it shares with the same account's browser session. Without one, the CLI uses the name already stored for the account in that meeting, or the account's name.
 
 ```
 POST /api/v1/meetings/{meeting_id}/join
@@ -817,7 +818,7 @@ The server stores only the public key. From then on the CLI signs a short-lived 
 
 Devices expire after 90 days unused and 365 days after approval, and an account can have 10 live devices (defaults, see [Configuration](#device-auth-configuration)). Users list and revoke their devices at `GET /devices`.
 
-The browser pages (`/cli/*`, `/devices`) are server-rendered HTML on the API origin, outside CORS. Form POSTs must be `application/x-www-form-urlencoded` with an `Origin` exactly equal to `DEVICE_TOKEN_AUDIENCE`. When `DEVICE_TOKEN_AUDIENCE` is unset, the login and devices pages return 503 and device JWTs get 401.
+The browser pages (`/cli/*`, `/devices`) are server-rendered HTML on the API origin, outside CORS. Form POSTs must be `application/x-www-form-urlencoded` with an `Origin` exactly equal to `DEVICE_TOKEN_AUDIENCE`. When `DEVICE_TOKEN_AUDIENCE` is unset, the login and devices pages return 503 and device JWTs get 401. When OAuth is not configured, a page that would send the user to sign in returns 503 ("no sign-in configured") instead.
 
 > **Rust types**: `videocall-meeting-types/src/device.rs` (`RegisterDeviceRequest`, `RegisterDeviceResponse`, `DeviceStatusResponse`, `DeviceErrorResponse`, `DeviceTokenClaims`, `RegistrationClaims`)
 
@@ -831,7 +832,7 @@ GET /cli/authorize?response_type=code&client_id=videocall-cli&redirect_uri={uri}
 
 | Parameter | Constraint |
 |-----------|------------|
-| `redirect_uri` | `http://127.0.0.1:{port}/callback` or `http://[::1]:{port}/callback` (port 1024-65535), or `{api origin}/cli/code` for a remote login |
+| `redirect_uri` | `http://127.0.0.1:{port}/callback` (port 1024-65535; `[::1]` and `localhost` are rejected), or `{api origin}/cli/code` for a remote login |
 | `code_challenge` | PKCE S256 challenge |
 | `state` | 16-128 visible ASCII characters |
 | `public_key` | Raw Ed25519 public key, base64url without padding (43 characters) |
@@ -843,7 +844,7 @@ Stores the request (valid 10 minutes) and redirects (302) to the consent page.
 
 | Status | Description |
 |--------|-------------|
-| 400 | A parameter is missing or invalid |
+| 400 | A parameter is missing or invalid, or the request is not a top-level navigation (`Sec-Fetch-Mode` other than `navigate` or `Sec-Fetch-Dest` other than `document`; requests without these headers are allowed) |
 | 409 | This public key is already registered |
 | 429 | Too many pending logins, globally or from this IP |
 | 503 | Device login is not configured |
@@ -857,7 +858,9 @@ GET /cli/consent?request={id}
 POST /cli/consent
 ```
 
-Browser session (cookie) only; a signed-out user is sent through login first. The page shows the device name, the key fingerprint and the requesting IP. The POST carries `request`, a per-render `nonce` and `decision`.
+Browser session (cookie) only; a signed-out user is sent through login first. The page shows the device name and the key fingerprint. The POST carries `request`, a per-render `nonce` and `decision`.
+
+"Not you? Sign out" is a form `POST /cli/sign-out` (same CSRF checks as the other page POSTs). It clears the session cookie and renders a signed-out page whose sign-in link returns to the same consent request.
 
 On approval it mints a one-time code. A loopback login is redirected (303) to `{redirect_uri}?code=...&state=...` (code valid 60 s). A remote login gets the code on the response page (valid 5 minutes); the code never appears in a URL. `GET /cli/code` is the remote `redirect_uri` and only renders instructions.
 
@@ -978,8 +981,8 @@ Optional meeting-api environment variables:
 | `DEVICE_IDLE_TTL_SECS` | `7776000` (90 days) | A device expires after this long unused |
 | `DEVICE_ABS_TTL_SECS` | `31536000` (365 days) | A device expires this long after approval |
 | `DEVICE_MAX_PER_USER` | `10` | Live devices per account |
-| `DEVICE_MAX_PENDING` | `10000` | Unfinished login requests, globally |
-| `DEVICE_MAX_PENDING_PER_IP` | `5` | Unfinished login requests per requester IP |
+| `DEVICE_MAX_PENDING` | `10000` | Login requests still awaiting a decision, globally |
+| `DEVICE_MAX_PENDING_PER_IP` | `5` | Login requests still awaiting a decision per client: per IPv4 address or IPv6 /64. Not applied to private, loopback or unknown addresses |
 
 ---
 

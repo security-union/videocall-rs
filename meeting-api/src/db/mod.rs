@@ -56,15 +56,70 @@ pub type Db = sqlx::Postgres;
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
 pub type Db = sqlx::Sqlite;
 
+/// Maximum rows deleted by one opportunistic sweep statement, so a backlog
+/// never turns into one long-running DELETE on a user's request.
+pub const SWEEP_BATCH: i64 = 500;
+
+/// Minimum time between two opportunistic sweeps of the same table by one
+/// process. The sweeps run on unauthenticated request paths, so without a
+/// gate every `/login` or `/cli/authorize` would issue a DELETE.
+pub const SWEEP_INTERVAL_SECS: i64 = 30;
+
+/// Lets one opportunistic sweep through per [`SWEEP_INTERVAL_SECS`] per
+/// process. Lock-free: concurrent callers race on one compare-exchange and
+/// only the winner sweeps. Tests that need a sweep call the sweep function
+/// directly; the gate only guards the request paths.
+#[derive(Debug)]
+pub struct SweepGate {
+    last_sweep_secs: std::sync::atomic::AtomicI64,
+}
+
+impl SweepGate {
+    pub const fn new() -> Self {
+        Self {
+            last_sweep_secs: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// True if the caller should sweep now (and records `now_secs`).
+    pub fn try_acquire(&self, now_secs: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.last_sweep_secs.load(Ordering::Relaxed);
+        if last != i64::MIN && now_secs.saturating_sub(last) < SWEEP_INTERVAL_SECS {
+            return false;
+        }
+        self.last_sweep_secs
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+impl Default for SweepGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Appended to the LIMITed sweep subqueries. On Postgres, pods sweeping at
+/// the same moment skip each other's rows instead of queueing on them;
+/// SQLite has one writer and no row locks.
+#[cfg(feature = "postgres")]
+pub(crate) const SWEEP_SKIP_LOCKED: &str = " FOR UPDATE SKIP LOCKED";
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+pub(crate) const SWEEP_SKIP_LOCKED: &str = "";
+
+/// The physical row id, for tables without a usable key (`oauth_requests`
+/// has no primary key and a nullable `csrf_state`).
+#[cfg(feature = "postgres")]
+pub(crate) const ROW_ID: &str = "ctid";
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+pub(crate) const ROW_ID: &str = "rowid";
+
 /// SQL expression yielding the current timestamp.
 ///
 /// On SQLite this is an RFC3339-with-milliseconds string so values sort
 /// consistently with sqlx-bound `DateTime<Utc>` (which encodes via `to_rfc3339`
 /// on SQLite, e.g. `2026-07-21T12:34:56.789+00:00`).
-/// Maximum rows deleted by one opportunistic sweep statement, so a backlog
-/// never turns into one long-running DELETE on a user's request.
-pub const SWEEP_BATCH: i64 = 500;
-
 #[cfg(feature = "postgres")]
 pub(crate) const SQL_NOW: &str = "NOW()";
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
@@ -208,6 +263,9 @@ pub struct OAuthRequestRow {
     /// When the IdP leg started. `None` only for rows that predate the column
     /// on SQLite (backfilled by the migration, so in practice always set).
     pub created_at: Option<DateTime<Utc>>,
+    /// SHA-256 (hex) of the pre-login cookie of the browser that started
+    /// this login. `None` only on rows created before the column existed.
+    pub browser_binding_hash: Option<String>,
 }
 
 // ---- Conversions to API response types -------------------------------------
@@ -232,5 +290,20 @@ impl ParticipantRow {
             host_display_name: None,
             host_user_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod sweep_gate_tests {
+    use super::{SweepGate, SWEEP_INTERVAL_SECS};
+
+    #[test]
+    fn one_sweep_per_interval() {
+        let gate = SweepGate::new();
+        assert!(gate.try_acquire(1_000));
+        assert!(!gate.try_acquire(1_000));
+        assert!(!gate.try_acquire(1_000 + SWEEP_INTERVAL_SECS - 1));
+        assert!(gate.try_acquire(1_000 + SWEEP_INTERVAL_SECS));
+        assert!(!gate.try_acquire(1_000 + SWEEP_INTERVAL_SECS));
     }
 }

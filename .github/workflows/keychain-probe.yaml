@@ -39,33 +39,44 @@ jobs:
         run: |
           set +e
           tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }
-          run() {
-            echo "=== $1"; shift
-            start=$(date +%s)
-            tmo 25 /tmp/probe/target/debug/probe 2>&1
-            echo "exit=$? after $(( $(date +%s) - start ))s"
+          cat > /tmp/probe/src/main.rs <<'RS'
+          fn main() {
+              let e = keyring::Entry::new("videocall-cli-probe", "acct").unwrap();
+              let arg = std::env::args().nth(1).unwrap_or_default();
+              match arg.as_str() {
+                  "set" => println!("set={:?}", e.set_password("secret").map_err(|e| e.to_string())),
+                  "get" => println!("get={:?}", e.get_password().map_err(|e| e.to_string())),
+                  _ => println!("delete={:?}", e.delete_credential().map_err(|e| e.to_string())),
+              }
           }
-          echo "--- initial state"; security list-keychains; security default-keychain; id; launchctl managername 2>&1
+          RS
+          (cd /tmp/probe && cargo build -q 2>&1 | tail -3)
+          P=/tmp/probe/target/debug/probe
+          run() { echo "--- $*"; start=$(date +%s); tmo 20 $P "$@" 2>&1; echo "exit=$? after $(( $(date +%s) - start ))s"; }
           KC=$RUNNER_TEMP/probe.keychain-db
           security create-keychain -p pw "$KC"
           security default-keychain -s "$KC"
           security list-keychains -d user -s "$KC"
           security set-keychain-settings -t 3600 "$KC"
           security unlock-keychain -p pw "$KC"
-          run "A: unlocked temp default"
+          run set
+          echo "=== G: keychain file moved away (default pref unchanged)"
+          mv "$KC" "$KC.away"
+          security default-keychain
+          run set; run get; run delete
+          echo "=== H: moved back"
+          mv "$KC.away" "$KC"
+          run get
+          echo "=== I: locked: get / delete too?"
           security lock-keychain "$KC"
-          run "B: locked temp default"
+          run get; run delete
           security unlock-keychain -p pw "$KC"
-          chmod a-w "$KC"
-          run "F: read-only keychain file"
-          chmod u+w "$KC"
-          security default-keychain -d user -s /nonexistent/nope.keychain-db
-          echo "default now:"; security default-keychain
-          run "C: default points at a missing file"
-          security default-keychain -s "$KC"
-          security list-keychains -d user -s
-          echo "list now:"; security list-keychains
-          run "D: empty search list, default still set"
+          echo "=== J: keychain removed from list+default via delete-keychain, then recreated and reset"
+          run get
+          echo "=== K: default pointing at a directory"
           security delete-keychain "$KC"
-          echo "default after delete:"; security default-keychain
-          run "E: temp keychain deleted"
+          security default-keychain
+          run set
+          NEW=$RUNNER_TEMP/new.keychain-db
+          security create-keychain -p pw "$NEW"; security default-keychain -s "$NEW"; security list-keychains -d user -s "$NEW"; security unlock-keychain -p pw "$NEW"
+          run set; run get; run delete

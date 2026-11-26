@@ -29,7 +29,7 @@ let
   loginScript = pkgs.writeShellScript "videocall-cli-login" ''
     export HOME=/home/alice
     exec 3<>/tmp/login.in
-    ${cli} auth login --remote --api-url ${apiOrigin} --name "nixos test device" \
+    ${pkgs.coreutils}/bin/timeout 60 ${cli} auth login --remote --api-url ${apiOrigin} --name "nixos test device" \
       <&3 >/tmp/login.out 2>&1
     echo $? > /tmp/login.rc
   '';
@@ -39,6 +39,8 @@ if !pkgs.stdenv.isLinux then
 else
   pkgs.testers.runNixOSTest {
     name = "videocall-cli-device-enrollment";
+    # A hang must cost minutes, not the default hour.
+    globalTimeout = 300;
 
     nodes.machine = { pkgs, ... }: {
       systemd.services.mock-meeting-api = {
@@ -63,7 +65,7 @@ else
 
 
       def as_alice(command):
-          return "su -s /bin/sh alice -c " + shlex.quote("export HOME=/home/alice; " + command)
+          return "su -s /bin/sh alice -c " + shlex.quote("export HOME=/home/alice; timeout 30 " + command)
 
 
       def mock(method, path):
@@ -78,8 +80,11 @@ else
           """Start `auth login --remote`; return (authorize URL, fingerprint it printed)."""
           machine.succeed("rm -f /tmp/login.*; mkfifo -m 0666 /tmp/login.in; "
                           "install -m 0666 /dev/null /tmp/login.out")
-          machine.succeed("su -s /bin/sh alice -c " + shlex.quote(f"setsid -f {LOGIN}"))
-          machine.wait_until_succeeds("grep -q 'Paste the code' /tmp/login.out")
+          # The driver's execute() waits for stdout to close, so the detached
+          # login must not inherit it (without this the VM test hangs).
+          machine.succeed("su -s /bin/sh alice -c "
+                          + shlex.quote(f"setsid -f {LOGIN} >/dev/null 2>&1 </dev/null"))
+          machine.wait_until_succeeds("grep -q 'Paste the code' /tmp/login.out", timeout=30)
           out = machine.succeed("cat /tmp/login.out")
           url = re.search(r"(http://127\.0\.0\.1:8081/cli/authorize\?\S+)", out).group(1)
           fingerprint = re.search(r"Key fingerprint[^:]*: (\S+)", out).group(1)
@@ -91,12 +96,12 @@ else
           machine.succeed("curl -sSf -o /dev/null " + shlex.quote(url))
           code = json.loads(machine.succeed(f"curl -sSf -X POST {API}/_mock/approve"))["code"]
           machine.succeed(f"echo {shlex.quote(code)} > /tmp/login.in")
-          machine.wait_until_succeeds("test -s /tmp/login.rc")
+          machine.wait_until_succeeds("test -s /tmp/login.rc", timeout=60)
           return int(machine.succeed("cat /tmp/login.rc")), machine.succeed("cat /tmp/login.out")
 
 
-      machine.wait_for_unit("mock-meeting-api.service")
-      machine.wait_for_open_port(8081)
+      machine.wait_for_unit("mock-meeting-api.service", timeout=60)
+      machine.wait_for_open_port(8081, timeout=30)
 
       with subtest("not logged in yet"):
           code, out = cli_status()

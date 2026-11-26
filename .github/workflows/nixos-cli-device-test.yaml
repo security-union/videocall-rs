@@ -24,6 +24,7 @@ jobs:
   device-enrollment:
     name: videocall-cli device enrollment (NixOS VM)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4

@@ -1076,6 +1076,7 @@ dependencies = [
  "hound",
  "image 0.25.9",
  "jsonwebtoken",
+ "lazy_static",
  "protobuf",
  "ropus",
  "serde",

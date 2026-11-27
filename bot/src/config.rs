@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::constants::{BOT_CONFIG_PATH, CLIENT_ENV, INSECURE, N_CLIENTS, ROOM, SERVER_URL};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use url::Url;
@@ -45,35 +46,37 @@ impl BotConfig {
 
     pub fn from_env_or_default() -> anyhow::Result<Self> {
         // Try to load from config file first
-        if let Ok(config_path) = std::env::var("BOT_CONFIG_PATH") {
-            return Self::from_file(&config_path);
+        if let Some(config_path) = BOT_CONFIG_PATH.as_deref() {
+            return Self::from_file(config_path);
         }
 
         // Fallback to environment variables (backwards compatibility)
-        let server_url = std::env::var("SERVER_URL")
-            .unwrap_or_else(|_| "https://webtransport-us-east.webtransport.video".to_string());
+        let server_url = SERVER_URL.clone();
 
-        let n_clients = std::env::var("N_CLIENTS")
-            .unwrap_or_else(|_| "1".to_string())
-            .parse::<usize>()
-            .unwrap_or(1);
+        let n_clients = *N_CLIENTS;
 
-        let default_meeting_id = std::env::var("ROOM").unwrap_or_else(|_| "test-room".to_string());
+        let default_meeting_id = ROOM.clone();
 
         // Each client gets individual settings - audio, video, and meeting_id
         let mut clients = Vec::new();
         for i in 0..n_clients {
             // Check for per-client env vars first, then default to global/defaults
-            let client_enable_audio = std::env::var(format!("CLIENT_{i}_ENABLE_AUDIO"))
-                .unwrap_or_else(|_| "true".to_string())
+            let client_enable_audio = CLIENT_ENV
+                .get(&format!("CLIENT_{i}_ENABLE_AUDIO"))
+                .cloned()
+                .unwrap_or_else(|| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_enable_video = std::env::var(format!("CLIENT_{i}_ENABLE_VIDEO"))
-                .unwrap_or_else(|_| "true".to_string())
+            let client_enable_video = CLIENT_ENV
+                .get(&format!("CLIENT_{i}_ENABLE_VIDEO"))
+                .cloned()
+                .unwrap_or_else(|| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_meeting_id = std::env::var(format!("CLIENT_{i}_MEETING_ID"))
-                .unwrap_or_else(|_| default_meeting_id.clone());
+            let client_meeting_id = CLIENT_ENV
+                .get(&format!("CLIENT_{i}_MEETING_ID"))
+                .cloned()
+                .unwrap_or_else(|| default_meeting_id.clone());
 
             clients.push(ClientConfig {
                 user_id: format!("bot{i:03}"), // Remove hyphen for server compatibility
@@ -84,10 +87,7 @@ impl BotConfig {
         }
 
         // Check for insecure flag
-        let insecure = std::env::var("INSECURE")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse::<bool>()
-            .unwrap_or(false);
+        let insecure = *INSECURE;
 
         Ok(BotConfig {
             ramp_up_delay_ms: Some(1000),

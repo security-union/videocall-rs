@@ -14,6 +14,7 @@ use videocall_types::protos::server_connection_packet::{
 use prometheus::{Encoder, TextEncoder};
 
 // Import shared Prometheus metrics
+use sec_api::constants::{METRICS_PORT, NATS_URL};
 use sec_api::metrics::{
     SERVER_CONNECTIONS_ACTIVE, SERVER_CONNECTION_EVENTS_TOTAL, SERVER_DATA_BYTES_TOTAL,
     SERVER_PROTOCOL_CONNECTIONS, SERVER_UNIQUE_USERS_ACTIVE,
@@ -390,11 +391,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Get configuration from environment
-    let port = std::env::var("METRICS_PORT")
-        .unwrap_or_else(|_| "9091".to_string())
-        .parse::<u16>()?;
+    let port = METRICS_PORT.parse::<u16>()?;
 
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+    let nats_url = NATS_URL
+        .clone()
+        .unwrap_or_else(|| "nats://nats:4222".to_string());
 
     info!(
         "Starting stateless snapshot metrics server on port {}",

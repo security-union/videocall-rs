@@ -32,6 +32,10 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
+    constants::{
+        ACTIX_PORT, COOKIE_DOMAIN, DATABASE_ENABLED, NATS_URL, OAUTH_AUTH_URL, OAUTH_CLIENT_ID,
+        OAUTH_REDIRECT_URL, OAUTH_SECRET, OAUTH_TOKEN_URL, UI_ENDPOINT,
+    },
     db::{get_pool, PostgresPool},
     lobby::ws_connect_authenticated,
     models::{AppConfig, AppState},
@@ -150,7 +154,7 @@ async fn handle_google_oauth_callback(
     })?;
 
     // 4. Create session cookie with email.
-    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
+    let cookie_domain = COOKIE_DOMAIN.clone();
 
     let mut cookie_builder = Cookie::build("email", claims.email.clone())
         .path("/")
@@ -236,7 +240,7 @@ async fn get_profile(req: HttpRequest) -> Result<HttpResponse, Error> {
 async fn logout() -> Result<HttpResponse, Error> {
     info!("User logging out");
 
-    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
+    let cookie_domain = COOKIE_DOMAIN.clone();
 
     // Create expired cookies to clear them
     let mut email_cookie_builder = Cookie::build("email", "")
@@ -272,7 +276,7 @@ async fn main() -> std::io::Result<()> {
         .init();
     info!("start");
 
-    let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
+    let nats_url = NATS_URL.clone().expect("NATS_URL env var must be defined");
     let nats_client = async_nats::ConnectOptions::new()
         .require_tls(false)
         .ping_interval(std::time::Duration::from_secs(10))
@@ -295,20 +299,13 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         tracker_task.run_message_loop(tracker_receiver).await;
     });
-    let oauth_client_id: String =
-        std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
-    let oauth_auth_url: String =
-        std::env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
-    let oauth_token_url: String =
-        std::env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
-    let oauth_secret: String = std::env::var("OAUTH_SECRET").unwrap_or_else(|_| String::from(""));
-    let oauth_redirect_url: String =
-        std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
-    let after_login_url: String =
-        std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from("/"));
-    let db_enabled: bool = truthy(Some(
-        &std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false")),
-    ));
+    let oauth_client_id: String = OAUTH_CLIENT_ID.clone();
+    let oauth_auth_url: String = OAUTH_AUTH_URL.clone();
+    let oauth_token_url: String = OAUTH_TOKEN_URL.clone();
+    let oauth_secret: String = OAUTH_SECRET.clone();
+    let oauth_redirect_url: String = OAUTH_REDIRECT_URL.clone();
+    let after_login_url: String = UI_ENDPOINT.clone();
+    let db_enabled: bool = truthy(Some(&DATABASE_ENABLED));
 
     HttpServer::new(move || {
         let cors = Cors::permissive();
@@ -374,10 +371,7 @@ async fn main() -> std::io::Result<()> {
     })
     .bind((
         "0.0.0.0",
-        std::env::var("ACTIX_PORT")
-            .unwrap_or_else(|_| String::from("8080"))
-            .parse::<u16>()
-            .unwrap(),
+        ACTIX_PORT.parse::<u16>().unwrap(),
     ))?
     .run()
     .await

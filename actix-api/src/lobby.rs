@@ -28,7 +28,7 @@ use actix_web_actors::ws::{handshake, WebsocketContext};
 use tracing::{debug, error};
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
-use crate::constants::MAX_FRAME_SIZE;
+use crate::constants::{JWT_SECRET, MAX_FRAME_SIZE};
 use crate::models::AppState;
 use crate::token_validator;
 
@@ -65,13 +65,13 @@ pub async fn ws_connect_authenticated(
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+    let jwt_secret: &str = &JWT_SECRET;
     if jwt_secret.is_empty() {
         error!("JWT_SECRET not set");
         return Ok(HttpResponse::InternalServerError().body("Server misconfigured"));
     }
 
-    let claims = match token_validator::decode_room_token(&jwt_secret, &query.token) {
+    let claims = match token_validator::decode_room_token(jwt_secret, &query.token) {
         Ok(c) => c,
         Err(e) => {
             e.log("WS");

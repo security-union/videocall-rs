@@ -23,6 +23,7 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
+use sec_api::constants::{CERT_PATH, HEALTH_LISTEN_URL, KEY_PATH, LISTEN_URL, NATS_URL};
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::version;
@@ -43,7 +44,7 @@ async fn main() {
     info!("Starting WebTransport server with actor-based session handling");
 
     // Connect to NATS
-    let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
+    let nats_url = NATS_URL.clone().expect("NATS_URL env var must be defined");
     let nats_client = async_nats::ConnectOptions::new()
         .require_tls(false)
         .ping_interval(std::time::Duration::from_secs(10))
@@ -71,7 +72,8 @@ async fn main() {
     });
 
     // Health server setup
-    let health_listen = std::env::var("HEALTH_LISTEN_URL")
+    let health_listen = HEALTH_LISTEN_URL
+        .as_deref()
         .expect("expected HEALTH_LISTEN_URL to be set")
         .to_socket_addrs()
         .expect("expected HEALTH_LISTEN_URL to be a valid socket address")
@@ -80,17 +82,20 @@ async fn main() {
 
     // WebTransport server options
     let opt = webtransport::WebTransportOpt {
-        listen: std::env::var("LISTEN_URL")
+        listen: LISTEN_URL
+            .as_deref()
             .expect("expected LISTEN_URL to be set")
             .to_socket_addrs()
             .expect("expected LISTEN_URL to be a valid socket address")
             .next()
             .expect("expected LISTEN_URL to be a valid socket address"),
         certs: Certs {
-            key: std::env::var("KEY_PATH")
+            key: KEY_PATH
+                .as_deref()
                 .expect("expected KEY_PATH to be set")
                 .into(),
-            cert: std::env::var("CERT_PATH")
+            cert: CERT_PATH
+                .as_deref()
                 .expect("expected CERT_PATH to be set")
                 .into(),
         },

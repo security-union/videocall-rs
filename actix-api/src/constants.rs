@@ -16,6 +16,8 @@
  * conditions.
  */
 
+use lazy_static::lazy_static;
+use std::env;
 use std::time::Duration;
 
 /// How often heartbeat pings are sent
@@ -72,3 +74,65 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 2;
 
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+/// Default server stats reporting interval in seconds
+pub const DEFAULT_REPORTING_INTERVAL_SECS: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------
+
+lazy_static! {
+    // Startup: the server binaries read these in `main`.
+    pub static ref NATS_URL: Option<String> = env::var("NATS_URL").ok();
+    pub static ref ACTIX_PORT: String =
+        env::var("ACTIX_PORT").unwrap_or_else(|_| String::from("8080"));
+    pub static ref METRICS_PORT: String =
+        env::var("METRICS_PORT").unwrap_or_else(|_| "9091".to_string());
+    pub static ref HEALTH_LISTEN_URL: Option<String> = env::var("HEALTH_LISTEN_URL").ok();
+    pub static ref LISTEN_URL: Option<String> = env::var("LISTEN_URL").ok();
+    pub static ref KEY_PATH: Option<String> = env::var("KEY_PATH").ok();
+    pub static ref CERT_PATH: Option<String> = env::var("CERT_PATH").ok();
+    pub static ref DATABASE_ENABLED: String =
+        env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false"));
+    pub static ref DATABASE_URL: Option<String> = env::var("DATABASE_URL").ok();
+
+    // Legacy OAuth and cookies on the websocket server.
+    pub static ref OAUTH_CLIENT_ID: String =
+        env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
+    pub static ref OAUTH_AUTH_URL: String =
+        env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
+    pub static ref OAUTH_TOKEN_URL: String =
+        env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
+    pub static ref OAUTH_SECRET: String =
+        env::var("OAUTH_SECRET").unwrap_or_else(|_| String::from(""));
+    pub static ref OAUTH_REDIRECT_URL: String =
+        env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
+    pub static ref UI_ENDPOINT: String =
+        env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from("/"));
+    pub static ref COOKIE_DOMAIN: Option<String> = env::var("COOKIE_DOMAIN").ok();
+
+    // Room token verification key; empty means unset.
+    pub static ref JWT_SECRET: String = env::var("JWT_SECRET").unwrap_or_default();
+
+    // Diagnostics identity and reporting.
+    pub static ref REGION: String = env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+    pub static ref SERVICE_TYPE: String =
+        env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+    pub static ref SERVER_ID: Option<String> = env::var("SERVER_ID").ok();
+    pub static ref HOSTNAME: Option<String> = env::var("HOSTNAME").ok();
+    pub static ref SERVER_STATS_INTERVAL_SECS: u64 = env::var("SERVER_STATS_INTERVAL_SECS")
+        .unwrap_or_else(|_| DEFAULT_REPORTING_INTERVAL_SECS.to_string())
+        .parse::<u64>()
+        .unwrap_or(DEFAULT_REPORTING_INTERVAL_SECS);
+
+    // QUIC transport tuning for WebTransport.
+    pub static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    pub static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+}

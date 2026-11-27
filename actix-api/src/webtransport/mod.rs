@@ -20,6 +20,7 @@ mod bridge;
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
+use crate::constants::{JWT_SECRET, QUIC_KEEP_ALIVE_INTERVAL_SECS, QUIC_MAX_IDLE_TIMEOUT_SECS};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::token_validator::{self, TokenError};
@@ -33,18 +34,6 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 use videocall_meeting_types::token::RoomAccessTokenClaims;
-
-lazy_static::lazy_static! {
-    static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-
-    static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = std::env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-}
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,8 +261,7 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     // Identity and room come from the JWT claims; there is no other way in.
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-    let claims = authorize_connect(uri.path(), token.as_deref(), &jwt_secret)?;
+    let claims = authorize_connect(uri.path(), token.as_deref(), &JWT_SECRET)?;
     info!(
         "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
         claims.sub, claims.room, claims.display_name, claims.observer

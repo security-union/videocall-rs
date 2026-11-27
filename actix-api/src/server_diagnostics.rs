@@ -18,6 +18,7 @@
 
 //! Connection tracking module for server-side metrics via NATS
 
+use crate::constants::{HOSTNAME, REGION, SERVER_ID, SERVER_STATS_INTERVAL_SECS, SERVICE_TYPE};
 use async_nats::Client;
 use protobuf::Message;
 use std::collections::HashMap;
@@ -118,17 +119,9 @@ pub struct ConnectionInfo {
     pub last_data_report: Instant,
 }
 
-/// Default server stats reporting interval in seconds
-const DEFAULT_REPORTING_INTERVAL_SECS: u64 = 5;
-
 /// Get the server stats reporting interval from environment variable
 fn get_reporting_interval() -> Duration {
-    let interval_secs = std::env::var("SERVER_STATS_INTERVAL_SECS")
-        .unwrap_or_else(|_| DEFAULT_REPORTING_INTERVAL_SECS.to_string())
-        .parse::<u64>()
-        .unwrap_or(DEFAULT_REPORTING_INTERVAL_SECS);
-
-    Duration::from_secs(interval_secs)
+    Duration::from_secs(*SERVER_STATS_INTERVAL_SECS)
 }
 
 #[derive(Debug)]
@@ -144,12 +137,12 @@ pub struct ServerDiagnostics {
 
 impl ServerDiagnostics {
     pub fn new(nats_client: Client) -> Self {
-        let server_instance = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("SERVER_ID"))
-            .unwrap_or_else(|_| "server-unknown".to_string());
-        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
-        let service_type =
-            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+        let server_instance = HOSTNAME
+            .clone()
+            .or_else(|| SERVER_ID.clone())
+            .unwrap_or_else(|| "server-unknown".to_string());
+        let region = REGION.clone();
+        let service_type = SERVICE_TYPE.clone();
 
         ServerDiagnostics {
             connections: Mutex::new(HashMap::new()),

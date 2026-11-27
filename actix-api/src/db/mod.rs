@@ -16,17 +16,17 @@
  * conditions.
  */
 
+use crate::constants::DATABASE_URL;
 use postgres::NoTls;
 use r2d2::Pool;
 use r2d2::PooledConnection;
 use r2d2_postgres::{postgres, PostgresConnectionManager};
-use std::env;
 
 pub type PostgresPool = Pool<PostgresConnectionManager<NoTls>>;
 pub type PostgresConnection = PooledConnection<PostgresConnectionManager<NoTls>>;
 
 pub fn get_database_url() -> String {
-    env::var("DATABASE_URL").unwrap()
+    DATABASE_URL.clone().expect("DATABASE_URL must be set")
 }
 
 pub fn get_pool() -> PostgresPool {

@@ -19,6 +19,7 @@
 //! Health packet processing and Prometheus metrics collection
 
 pub mod health_processor {
+    use crate::constants::{REGION, SERVER_ID, SERVICE_TYPE};
     use actix_web::{HttpResponse, Responder};
     use prometheus::{Encoder, TextEncoder};
     use protobuf::Message;
@@ -54,10 +55,9 @@ pub mod health_processor {
         health_data: PbHealthPacket,
         client: async_nats::client::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
-        let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "server-1".to_string());
-        let service_type =
-            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+        let region: &str = &REGION;
+        let server_id = SERVER_ID.clone().unwrap_or_else(|| "server-1".to_string());
+        let service_type: &str = &SERVICE_TYPE;
 
         let topic = format!("health.diagnostics.{region}.{service_type}.{server_id}");
 

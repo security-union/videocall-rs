@@ -35,6 +35,7 @@ type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
+use sec_api::constants::{METRICS_PORT, NATS_URL};
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
@@ -654,11 +655,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Get configuration from environment
-    let port = std::env::var("METRICS_PORT")
-        .unwrap_or_else(|_| "9091".to_string())
-        .parse::<u16>()?;
+    let port = METRICS_PORT.parse::<u16>()?;
 
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+    let nats_url = NATS_URL
+        .clone()
+        .unwrap_or_else(|| "nats://nats:4222".to_string());
 
     info!("Starting metrics server on port {}", port);
     info!("Connecting to NATS at {}", nats_url);

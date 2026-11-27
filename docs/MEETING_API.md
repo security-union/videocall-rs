@@ -144,6 +144,7 @@ sequenceDiagram
 | Invalid signature | `403 Forbidden` | Token has been tampered with. This incident is logged. |
 | Missing | `401 Unauthorized` | No token provided. Use `/lobby?token=<JWT>`. |
 | Room join denied | `403 Forbidden` | Token does not grant room join permission. |
+| Any other path | `404 Not Found` | Includes the removed `/lobby/{user_id}/{room}` form. |
 
 ## Meeting States
 
@@ -869,14 +870,6 @@ The Media Server:
 4. Extracts `sub` (identity), `room` (room ID), `is_host`, and `display_name`
 5. Establishes the WebSocket or WebTransport connection
 6. **Rejects the connection** if the token is missing, invalid, or expired
-
-### Connection Errors
-
-| Status | Cause |
-|--------|-------|
-| 401 | Token missing, or expired (fetch a new one via `GET /status`) |
-| 403 | Token invalid, signed with another secret, or `room_join` is false |
-| 404 | Any path other than `/lobby`, including the removed `/lobby/{user_id}/{room}` form |
 
 ---
 

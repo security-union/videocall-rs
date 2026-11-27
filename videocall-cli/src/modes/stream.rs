@@ -73,7 +73,6 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let user_id = "offline-streaming-test".to_string();
         (user_id, CameraSynks::DeadSynk(DeadSynk::new(opt)))
     } else {
-        // Join as the account that approved this machine's device key.
         let api = ApiOrigin::from_url(&opt.api.api_url)?;
         let creds = Credentials::load(Store::open_default()?, api).await?;
         let user_id = videocall_cli::room::join(&creds, &opt.meeting_id).await?;

@@ -11,34 +11,25 @@
  * at your option.
  */
 
-//! Queries on `device_auth_codes`: one-time codes minted when a signed-in
-//! user approves a CLI login, exchanged once at `POST /api/v1/devices`.
-//!
-//! Only the SHA-256 of a code is stored. A user has at most one outstanding
-//! code: approving a new login deletes the previous one, together with every
-//! expired code, so the table needs no sweeper.
+//! One-time device login codes, stored only as SHA-256. Approving a login deletes the
+//! user's previous code and every expired one, so the table needs no sweeper.
 
 use chrono::{DateTime, Utc};
 
 use crate::db::{begin_write_tx, DbPool};
 
-/// A `device_auth_codes` row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeviceCodeRow {
-    /// SHA-256 (lowercase hex) of the code.
     pub code_hash: String,
     pub user_id: String,
     pub user_name: String,
     pub public_key: String,
     pub device_name: String,
     pub code_challenge: String,
-    /// Canonical loopback URI or the remote constant.
     pub redirect_uri: String,
     pub expires_at: DateTime<Utc>,
 }
 
-/// Store a newly approved code. In one write transaction, first delete the
-/// user's previous code and every expired code, then insert `row`.
 pub async fn replace_code(
     pool: &DbPool,
     row: &DeviceCodeRow,
@@ -68,8 +59,7 @@ pub async fn replace_code(
     tx.commit().await
 }
 
-/// Consume an unexpired code: one atomic `DELETE … RETURNING`. A code can be
-/// returned at most once, whatever the caller does with it afterwards.
+/// One atomic `DELETE … RETURNING`, so a code is returned at most once.
 pub async fn consume_code(
     pool: &DbPool,
     code_hash: &str,

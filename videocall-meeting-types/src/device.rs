@@ -11,8 +11,7 @@
  * at your option.
  */
 
-//! CLI device sign-in: wire types and pure, wasm-safe validators shared by
-//! meeting-api, the app and the CLI, so every check has one implementation.
+//! CLI device sign-in: wire types and pure validators shared by meeting-api, the app and the CLI.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,34 +19,25 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "device-crypto")]
 pub mod crypto;
 
-/// `iss` claim of every device JWT and registration JWS.
 pub const CLI_ISSUER: &str = "videocall-cli";
 
-/// `client_id` the CLI sends to `/cli/authorize`.
 pub const CLI_CLIENT_ID: &str = "videocall-cli";
 
-/// On the API origin; redirects with the query unchanged to
-/// [`APP_AUTHORIZE_PATH`] on the app origin.
+/// Redirects, query unchanged, to [`APP_AUTHORIZE_PATH`] on the app origin.
 pub const CLI_AUTHORIZE_PATH: &str = "/cli/authorize";
 
-/// Path of the consent page on the app origin.
 pub const APP_AUTHORIZE_PATH: &str = "/devices/authorize";
 
-/// Query parameter carrying the CLI's request to [`APP_AUTHORIZE_PATH`]:
-/// `?request=<encode_authorize_request(raw query)>`. Base64url survives any
-/// router or address-bar rewriting that would percent-decode the raw query.
+/// Base64url of the raw query, so no router or address bar percent-decodes it.
 pub const AUTHORIZE_REQUEST_PARAM: &str = "request";
 
-/// Longest raw `/cli/authorize` query accepted, in bytes.
 pub const MAX_AUTHORIZE_QUERY_LEN: usize = 2048;
 
-/// The remote-login `redirect_uri`: the app shows the code to paste.
 pub const CLI_REMOTE_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
 pub const CODE_CHALLENGE_METHOD_S256: &str = "S256";
 
-/// `POST`: the CLI's code exchange. `GET`: the user's devices.
-/// `DELETE {DEVICES_PATH}/{id}`: revoke one.
+/// POST: the CLI's code exchange. GET: the user's devices. DELETE `{DEVICES_PATH}/{id}`: revoke.
 pub const DEVICES_PATH: &str = "/api/v1/devices";
 
 pub const DEVICE_AUTHORIZATIONS_PATH: &str = "/api/v1/devices/authorizations";
@@ -63,35 +53,24 @@ pub const DEVICE_TOKEN_MAX_LIFETIME_SECS: i64 = 300;
 /// Clock leeway, in seconds, a server allows on `exp` and on a future `iat`.
 pub const DEVICE_TOKEN_LEEWAY_SECS: i64 = 60;
 
-/// Device names are ASCII, at most this many bytes.
 pub const DEVICE_NAME_MAX_LEN: usize = 64;
 
-// `APIError::code` values of the browser device routes. A device JWT on any
-// of them gets `BROWSER_SESSION_REQUIRED`; no session gets `UNAUTHORIZED`.
+// Browser device route error codes; a device JWT on these routes gets `BROWSER_SESSION_REQUIRED`.
 
-/// 400: a malformed body or an invalid field.
 pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
-/// 400: a remote login approved without `confirm: true`.
 pub const CONFIRMATION_REQUIRED: &str = "CONFIRMATION_REQUIRED";
 /// 403: `Origin` missing, `null` or not an allowed browser origin.
 pub const ORIGIN_NOT_ALLOWED: &str = "ORIGIN_NOT_ALLOWED";
-/// 415: a POST body that is not `application/json`.
 pub const UNSUPPORTED_MEDIA_TYPE: &str = "UNSUPPORTED_MEDIA_TYPE";
-/// 409: the public key already belongs to a device.
 pub const KEY_ALREADY_REGISTERED: &str = "KEY_ALREADY_REGISTERED";
-/// 409: the user is at the live-device cap.
 pub const TOO_MANY_DEVICES: &str = "TOO_MANY_DEVICES";
 /// 404: no such device for this user (unknown, someone else's or revoked).
 pub const DEVICE_NOT_FOUND: &str = "DEVICE_NOT_FOUND";
-/// 503: device sign-in is not configured on this server.
 pub const NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 
-/// A parsed `redirect_uri`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectUri {
-    /// `http://127.0.0.1:{port}/callback`.
     Loopback { port: u16 },
-    /// [`CLI_REMOTE_REDIRECT_URI`].
     Remote,
 }
 
@@ -103,7 +82,6 @@ impl RedirectUri {
         }
     }
 
-    /// The canonical spelling, rebuilt from the parsed value.
     pub fn as_uri(self) -> String {
         match self {
             RedirectUri::Loopback { port } => format!("http://127.0.0.1:{port}/callback"),
@@ -112,12 +90,8 @@ impl RedirectUri {
     }
 }
 
-/// Parse a CLI `redirect_uri`. Accepted spellings, exactly (anything else is
-/// rejected, never normalized):
-/// - `http://127.0.0.1:{port}/callback` with `port` in 1024..=65535 written
-///   without leading zeros. Not `localhost` (DNS can point it elsewhere), not
-///   `[::1]`, no userinfo, query or fragment.
-/// - [`CLI_REMOTE_REDIRECT_URI`].
+/// Exact spellings only, never normalized: `http://127.0.0.1:{port}/callback` (port 1024..=65535,
+/// no leading zeros; not `localhost`, which DNS can repoint) or [`CLI_REMOTE_REDIRECT_URI`].
 pub fn parse_redirect_uri(raw: &str) -> Option<RedirectUri> {
     if raw == CLI_REMOTE_REDIRECT_URI {
         return Some(RedirectUri::Remote);
@@ -136,12 +110,10 @@ pub fn parse_redirect_uri(raw: &str) -> Option<RedirectUri> {
     (port >= 1024).then_some(RedirectUri::Loopback { port })
 }
 
-/// OAuth `state` from the CLI: 16..=128 visible ASCII characters.
 pub fn is_valid_client_state(state: &str) -> bool {
     (16..=128).contains(&state.len()) && state.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// PKCE S256 challenge: 43..=128 base64url characters.
 pub fn is_valid_code_challenge(challenge: &str) -> bool {
     (43..=128).contains(&challenge.len())
         && challenge
@@ -149,8 +121,6 @@ pub fn is_valid_code_challenge(challenge: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Body of `POST /api/v1/devices/authorizations`: the `/cli/authorize`
-/// query parameters plus `confirm`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDeviceAuthorizationRequest {
     pub redirect_uri: String,
@@ -165,7 +135,6 @@ pub struct CreateDeviceAuthorizationRequest {
     pub confirm: bool,
 }
 
-/// `result` of a successful `POST /api/v1/devices/authorizations`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CreateDeviceAuthorizationResponse {
@@ -173,20 +142,17 @@ pub enum CreateDeviceAuthorizationResponse {
     Remote { code: String, expires_in: i64 },
 }
 
-/// One live device in `GET /api/v1/devices`. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceListItem {
     pub id: String,
     pub name: String,
     pub fingerprint: String,
     pub created_at: i64,
-    /// Updated at most once an hour.
     pub last_used_at: i64,
     /// The earlier of the idle and absolute expiry.
     pub expires_at: i64,
 }
 
-/// Body of `POST /api/v1/devices`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterDeviceRequest {
     pub code: String,
@@ -197,7 +163,6 @@ pub struct RegisterDeviceRequest {
     pub registration: String,
 }
 
-/// `201` body of `POST /api/v1/devices`. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterDeviceResponse {
     /// The `kid` and `sub` of every device JWT.
@@ -210,8 +175,7 @@ pub struct RegisterDeviceResponse {
     pub abs_expires_at: i64,
 }
 
-/// `200` body of `GET /api/v1/devices/me`: the calling device is approved
-/// and live (otherwise it gets 401). Times are Unix seconds.
+/// `200` body of `GET /api/v1/devices/me`; a revoked or expired device gets 401.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceStatusResponse {
     pub device_id: String,
@@ -220,7 +184,6 @@ pub struct DeviceStatusResponse {
     pub user_id: String,
     pub user_name: String,
     pub created_at: i64,
-    /// Updated at most once an hour.
     pub last_used_at: i64,
     pub idle_expires_at: i64,
     pub abs_expires_at: i64,
@@ -233,9 +196,7 @@ pub struct DeviceErrorResponse {
     pub error_description: String,
 }
 
-/// Claims of the device JWT signed for every request. Header:
-/// `{"alg":"EdDSA","typ":"JWT","kid":"<device_id>"}`; `iss` is
-/// [`CLI_ISSUER`], `sub` equals `kid`, `aud` is the exact API origin.
+/// Claims of the per-request device JWT; `sub` equals the header `kid`, `aud` the API origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceTokenClaims {
     pub iss: String,
@@ -246,9 +207,7 @@ pub struct DeviceTokenClaims {
     pub jti: String,
 }
 
-/// Claims of the self-signed registration JWS (proof of possession), header
-/// without `kid`. `public_key` (43-char base64url raw Ed25519 key) and `name`
-/// must equal the approved ones.
+/// Claims of the self-signed registration JWS; `public_key` and `name` must match the approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrationClaims {
     pub iss: String,
@@ -259,8 +218,7 @@ pub struct RegistrationClaims {
     pub name: String,
 }
 
-/// First 8 bytes of `SHA-256(raw key)` as upper-case hex in four
-/// dash-separated groups, e.g. `9F3C-21AB-77D0-4E18`.
+/// First 8 bytes of `SHA-256(raw key)` as hex, e.g. `9F3C-21AB-77D0-4E18`.
 pub fn fingerprint(public_key_raw: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let digest = Sha256::digest(public_key_raw);
@@ -275,9 +233,7 @@ pub fn fingerprint(public_key_raw: &[u8]) -> String {
     out
 }
 
-/// Trim ASCII whitespace from a device name and validate it against
-/// `^[A-Za-z0-9][A-Za-z0-9 ._()@:+-]{0,63}$`. ASCII only by design: no
-/// control, format, bidi or homoglyph characters.
+/// Trimmed; ASCII only by design, so no control, bidi or homoglyph characters.
 pub fn normalize_device_name(input: &str) -> Option<String> {
     let name = input.trim_matches(|c: char| c.is_ascii_whitespace());
     let bytes = name.as_bytes();
@@ -296,18 +252,15 @@ fn is_base64url_of_len(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// 22 base64url chars (16 random bytes).
 pub fn is_valid_device_id(value: &str) -> bool {
     is_base64url_of_len(value, 22)
 }
 
-/// 43 base64url chars (a raw 32-byte key). The Ed25519 checks are
-/// server-side.
+/// Format only; the Ed25519 checks are server-side.
 pub fn is_valid_public_key_format(value: &str) -> bool {
     is_base64url_of_len(value, 43)
 }
 
-/// Decode a public key to its 32 raw bytes (canonical spelling only).
 pub fn decode_public_key(encoded: &str) -> Option<[u8; 32]> {
     if !is_valid_public_key_format(encoded) {
         return None;
@@ -315,13 +268,10 @@ pub fn decode_public_key(encoded: &str) -> Option<[u8; 32]> {
     base64url_decode(encoded)?.try_into().ok()
 }
 
-/// Wrap the raw `/cli/authorize` query for the app (no validation).
 pub fn encode_authorize_request(raw_query: &str) -> String {
     base64url_encode(raw_query.as_bytes())
 }
 
-/// Unwrap [`encode_authorize_request`]: strict base64url without padding,
-/// valid UTF-8, at most [`MAX_AUTHORIZE_QUERY_LEN`] bytes.
 pub fn decode_authorize_request(request: &str) -> Option<String> {
     if request.len() > MAX_AUTHORIZE_QUERY_LEN.div_ceil(3) * 4 {
         return None;
@@ -335,12 +285,10 @@ pub fn decode_authorize_request(request: &str) -> Option<String> {
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-/// RFC 7636 S256 PKCE challenge: `BASE64URL(SHA256(verifier))`.
 pub fn code_challenge_s256(verifier: &str) -> String {
     base64url_encode(&Sha256::digest(verifier.as_bytes()))
 }
 
-/// RFC 4648 base64url without padding.
 pub fn base64url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -355,9 +303,7 @@ pub fn base64url_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Strict base64url: alphabet only, no padding, and only the canonical
-/// spelling (unused trailing bits zero), so every byte string has exactly
-/// one accepted encoding.
+/// Strict: canonical spelling only, so every byte string has exactly one accepted encoding.
 pub fn base64url_decode(encoded: &str) -> Option<Vec<u8>> {
     if encoded.len() % 4 == 1 {
         return None;
@@ -381,9 +327,7 @@ mod tests {
 
     #[test]
     fn fingerprint_vectors() {
-        // SHA-256 of 32 zero bytes = 66687aadf862bd77…
         assert_eq!(fingerprint(&[0u8; 32]), "6668-7AAD-F862-BD77");
-        // SHA-256 of 32 0x01 bytes = 72cd6e8422c407fb…
         assert_eq!(fingerprint(&[1u8; 32]), "72CD-6E84-22C4-07FB");
         assert_eq!(fingerprint(&[7u8; 32]).len(), 19);
     }
@@ -525,7 +469,6 @@ mod tests {
         for bad in ["Zg==", "Zm9v+", "Zm9v/", "Zh", "Zm9", "Z", "Zm9vY", "Zm 9v"] {
             assert_eq!(base64url_decode(bad), None, "{bad}");
         }
-        // The app's request parameter: bounded and UTF-8.
         let longest = "a".repeat(MAX_AUTHORIZE_QUERY_LEN);
         let request = encode_authorize_request(&longest);
         assert_eq!(decode_authorize_request(&request), Some(longest));

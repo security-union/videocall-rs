@@ -11,9 +11,7 @@
  * at your option.
  */
 
-//! Queries on the `devices` table. A row exists only for an approved device.
-//! Timestamps are bound from the application so the same SQL runs on
-//! Postgres and SQLite.
+//! `devices` queries. Timestamps are bound from Rust so the same SQL runs on Postgres and SQLite.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -51,13 +49,11 @@ pub struct NewDevice<'a> {
     pub name: &'a str,
     pub user_id: &'a str,
     pub user_name: &'a str,
-    /// Used for `created_at` and `last_used_at`.
     pub now: DateTime<Utc>,
     pub idle_expires_at: DateTime<Utc>,
     pub abs_expires_at: DateTime<Utc>,
 }
 
-/// True if `err` is a unique violation on `devices.public_key`.
 pub fn is_duplicate_public_key(err: &sqlx::Error) -> bool {
     let sqlx::Error::Database(db) = err else {
         return false;
@@ -70,11 +66,8 @@ pub fn is_duplicate_public_key(err: &sqlx::Error) -> bool {
             .unwrap_or_else(|| db.message().contains("devices.public_key"))
 }
 
-/// Insert an approved device unless the user is at `max_per_user` live
-/// devices. On Postgres a transaction-scoped advisory lock keyed on the user
-/// serializes concurrent logins of that user; on SQLite `BEGIN IMMEDIATE`
-/// already serializes all writers. A duplicate key surfaces as the sqlx
-/// error (see [`is_duplicate_public_key`]).
+/// Insert unless the user has `max_per_user` live devices. A Postgres advisory lock (SQLite:
+/// `BEGIN IMMEDIATE`) serializes a user's concurrent logins.
 pub async fn insert_device_capped(
     pool: &DbPool,
     device: &NewDevice<'_>,
@@ -86,10 +79,8 @@ pub async fn insert_device_capped(
         .bind(device.user_id)
         .execute(&mut *tx)
         .await?;
-    // Relies on READ COMMITTED (begin_write_tx issues a plain BEGIN): the
-    // COUNT takes a fresh snapshot after the lock is granted, so it sees the
-    // previous holder's insert. Under REPEATABLE READ the cap could be
-    // exceeded.
+    // Relies on READ COMMITTED: the COUNT snapshot is taken after the lock, so it sees the
+    // previous holder's insert. Under REPEATABLE READ the cap could be exceeded.
     if count_live_devices(&mut *tx, device.user_id, device.now).await? >= max_per_user {
         tx.rollback().await?;
         return Ok(CappedInsert::TooManyDevices);
@@ -120,7 +111,6 @@ pub enum CappedInsert {
     TooManyDevices,
 }
 
-/// Number of the user's live devices.
 pub async fn count_live_devices<'c, E>(
     executor: E,
     user_id: &str,
@@ -150,7 +140,6 @@ pub async fn public_key_exists(pool: &DbPool, public_key: &str) -> Result<bool, 
     Ok(found > 0)
 }
 
-/// The hot path for every device JWT.
 pub async fn find_device(pool: &DbPool, id: &str) -> Result<Option<DeviceRow>, sqlx::Error> {
     sqlx::query_as::<_, DeviceRow>(&format!(
         "SELECT {DEVICE_COLUMNS} FROM devices WHERE id = $1"
@@ -160,9 +149,7 @@ pub async fn find_device(pool: &DbPool, id: &str) -> Result<Option<DeviceRow>, s
     .await
 }
 
-/// Record use of a live device, at most one write per hour, sliding
-/// `idle_expires_at` to `idle_new` (capped at `abs_expires_at`). Only a live
-/// device is touched, so a race can never revive an expired one.
+/// At most one write per hour; only a live device is touched, so a race never revives one.
 pub async fn touch_device(
     pool: &DbPool,
     id: &str,
@@ -184,8 +171,7 @@ pub async fn touch_device(
     Ok(res.rows_affected() > 0)
 }
 
-/// Revoke one of `user_id`'s devices. `reason` is `device` (self-revoke) or
-/// `user` (from the device list). False if there was nothing to revoke.
+/// `reason` is `device` (self-revoke) or `user`; false if there was nothing to revoke.
 pub async fn revoke(
     pool: &DbPool,
     id: &str,
@@ -206,7 +192,6 @@ pub async fn revoke(
     Ok(res.rows_affected() > 0)
 }
 
-/// The user's live devices, newest first.
 pub async fn list_live_devices(
     pool: &DbPool,
     user_id: &str,

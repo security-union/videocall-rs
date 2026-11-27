@@ -13,9 +13,7 @@
 
 //! WebSocket lobby handler for the Media Server.
 //!
-//! The only endpoint is **`GET /lobby?token=<JWT>`**: identity and room are
-//! extracted from the room access token's claims. The old unauthenticated
-//! `GET /lobby/{user_id}/{room}` form is gone and gets a 404.
+//! The only endpoint is `GET /lobby?token=<JWT>`; `/lobby/{user_id}/{room}` gets 404.
 
 use actix::prelude::Stream;
 use actix::Actor;

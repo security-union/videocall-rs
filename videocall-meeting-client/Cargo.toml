@@ -23,6 +23,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "cha
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
-# Parses the server's `Date` header (device clock correction).
-httpdate = "1"
 thiserror = "2"
+# device-session only: the server's `Date` header (clock correction) and the
+# seed and codes it hands out.
+httpdate = { version = "1", optional = true }
+secrecy = { version = "0.10", optional = true }
+
+[features]
+# The device key login and signed session (videocall-cli). Off by default:
+# dioxus-ui builds this crate for wasm and must not pull in the crypto.
+device-session = ["videocall-meeting-types/device-crypto", "dep:httpdate", "dep:secrecy"]

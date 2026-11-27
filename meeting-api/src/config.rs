@@ -53,16 +53,12 @@ pub struct Config {
     pub device: DeviceAuthConfig,
 }
 
-/// CLI device sign-in settings, derived from existing variables.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceAuthConfig {
-    /// `DEVICE_TOKEN_AUDIENCE`: this server's public origin, the `aud` of
-    /// every device JWT. `None` disables device auth.
+    /// `DEVICE_TOKEN_AUDIENCE`, the `aud` of every device JWT; `None` disables device auth.
     pub audience: Option<String>,
-    /// Origin of `AFTER_LOGIN_URL` (if absolute), which hosts the consent
-    /// page. Read directly, so device login does not depend on OAuth.
+    /// Origin of `AFTER_LOGIN_URL`; read directly so device login doesn't need OAuth.
     pub ui_origin: Option<String>,
-    /// `Origin` values accepted on state-changing device routes:
     /// `CORS_ALLOWED_ORIGIN` plus `ui_origin`, compared as exact strings.
     pub browser_origins: Vec<String>,
 }
@@ -310,8 +306,7 @@ impl Config {
     }
 }
 
-/// Parse `value` as an absolute http(s) URL and return its ASCII origin
-/// (`scheme://host[:port]`, no trailing slash). `None` if it is not one.
+/// The ASCII origin of an absolute http(s) URL.
 pub fn parse_origin(value: &str) -> Option<String> {
     let url = url::Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {

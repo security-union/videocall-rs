@@ -36,18 +36,8 @@ use crate::token::{generate_observer_token, generate_room_token};
 /// Hosts are auto-admitted and receive a room_token immediately.
 /// Attendees enter the waiting room.
 ///
-/// CLI credentials ([`AuthVia::Cli`]) never host: a missing meeting is 404
-/// (no auto-create), a non-active meeting is never activated (the creator
-/// gets the same `waiting_for_meeting` answer as anyone else), the host
-/// display name is never touched, and the room token always has
-/// `is_host = false`. A creator joining their own *active* meeting via the
-/// CLI is still admitted without the waiting room.
-///
-/// Display names for CLI callers: the participant row is shared with the
-/// same account's browser session, so a CLI never replaces a name already
-/// stored there (it only fills an empty one). The name the CLI asked for
-/// goes into the room token it gets directly from this call; without one,
-/// the account's name is used, never the user id.
+/// CLI credentials never host and never create or activate a meeting; a creator joining
+/// their own active meeting is admitted without the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
     CliOrBrowserUser { user_id, name, via }: CliOrBrowserUser,
@@ -55,8 +45,6 @@ pub async fn join_meeting(
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
-    // The name used when nobody chose one: the account name for a CLI
-    // device, the user id for a browser (unchanged behaviour).
     let fallback_name = fallback_display_name(via, &user_id, &name);
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
@@ -160,8 +148,7 @@ pub async fn join_meeting(
             via == AuthVia::Cli,
         )
         .await?;
-        // The CLI's requested name wins in its own token; the stored row
-        // (shared with the browser) is not renamed.
+        // The CLI's requested name wins in its own token; the shared row is not renamed.
         let token_name = match via {
             AuthVia::Cli => display_name
                 .or(row.display_name.as_deref())
@@ -252,13 +239,9 @@ pub async fn get_my_status(
     Ok(Json(APIResponse::ok(resp)))
 }
 
-/// Lifetime of a room token issued to a CLI device. Short so that revoking
-/// a device stops it reaching the relay within minutes: the CLI asks for a
-/// fresh token on every connect attempt.
+/// Short, so revoking a device stops it reaching the relay within minutes.
 pub const CLI_ROOM_TOKEN_TTL_SECS: i64 = 300;
 
-/// Room-token lifetime for this caller: [`CLI_ROOM_TOKEN_TTL_SECS`] for a CLI
-/// device, the configured `TOKEN_TTL_SECS` for a browser (unchanged).
 fn room_token_ttl(state: &AppState, via: AuthVia) -> i64 {
     match via {
         AuthVia::Cli => CLI_ROOM_TOKEN_TTL_SECS.min(state.token_ttl_secs),
@@ -266,8 +249,6 @@ fn room_token_ttl(state: &AppState, via: AuthVia) -> i64 {
     }
 }
 
-/// The display name used when none was chosen or stored: a CLI device
-/// shows its account's name; a browser keeps the old user-id fallback.
 fn fallback_display_name<'a>(via: AuthVia, user_id: &'a str, account_name: &'a str) -> &'a str {
     match via {
         AuthVia::Cli if !account_name.trim().is_empty() => account_name,
@@ -277,8 +258,7 @@ fn fallback_display_name<'a>(via: AuthVia, user_id: &'a str, account_name: &'a s
 
 /// POST /api/v1/meetings/{meeting_id}/leave
 ///
-/// Browser session only: leaving as the creator ends the meeting, and a CLI
-/// shares its participant row with the same account's browser session.
+/// Browser session only: leaving as the creator ends the meeting, and the row is shared.
 pub async fn leave_meeting(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,

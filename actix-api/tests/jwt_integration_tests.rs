@@ -76,7 +76,6 @@ async fn start_real_ws_server(port: u16) {
 }
 
 async fn wait_for_server(port: u16) {
-    // Probe with a valid token: the token endpoint is the only way in.
     let token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         TOKEN_TTL_SECS,
@@ -99,7 +98,6 @@ async fn wait_for_server(port: u16) {
     panic!("WS server not ready after 5 seconds on port {port}");
 }
 
-/// Start the server and wait until it accepts a token connection.
 async fn setup(port: u16) {
     std::env::set_var("JWT_SECRET", JWT_SECRET);
     start_real_ws_server(port).await;
@@ -129,8 +127,7 @@ async fn try_connect_with_token(
     }
 }
 
-/// Open a WebSocket to an arbitrary path and query, returning the HTTP status
-/// of the refusal if the upgrade is rejected.
+/// Open a WebSocket to any path; the HTTP status if the upgrade is refused.
 async fn try_connect_raw(
     port: u16,
     path_and_query: &str,

@@ -50,6 +50,7 @@ jobs:
   build-images:
     name: Build Nix images (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

@@ -7,6 +7,7 @@
  * The session cookie is set on `localhost`, so the app on :3001 sends it to
  * meeting-api on :8081 (cookies ignore the port).
  */
+import { randomBytes } from "crypto";
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import {
@@ -81,9 +82,19 @@ async function openConsent(page: Page, login: CliLogin) {
   await expect(page.getByTestId("fingerprint")).toHaveText(login.key.fingerprint);
 }
 
-/** Remote approve: tick the checkbox, approve, return the code shown. */
+/** The remote-login confirmation: a theme Switch (`role="switch"`). */
+function confirmSwitch(page: Page) {
+  return page.getByRole("switch", {
+    name: "I started this sign-in myself, on a device I own.",
+    exact: true,
+  });
+}
+
+/** Remote approve: turn the confirmation on, approve, return the code shown. */
 async function approveRemote(page: Page): Promise<string> {
-  await page.getByLabel("I started this sign-in myself, on a device I own.").check();
+  const confirm = confirmSwitch(page);
+  if ((await confirm.getAttribute("aria-checked")) !== "true") await confirm.click();
+  await expect(confirm).toHaveAttribute("aria-checked", "true");
   await page.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(page.getByTestId("device-authorize-code")).toBeVisible();
   const code = await page.getByLabel("Code", { exact: true }).inputValue();
@@ -150,10 +161,17 @@ test.describe("CLI device login", () => {
           "Signed in as E2E Device User",
         );
 
+        // Approve follows the confirmation switch both ways.
         const approve = page.getByRole("button", { name: "Approve", exact: true });
+        const confirm = confirmSwitch(page);
+        await expect(confirm).toHaveAttribute("aria-checked", "false");
         await expect(approve).toBeDisabled();
-        await page.getByLabel("I started this sign-in myself, on a device I own.").check();
+        await confirm.click();
+        await expect(confirm).toHaveAttribute("aria-checked", "true");
         await expect(approve).toBeEnabled();
+        await confirm.click();
+        await expect(confirm).toHaveAttribute("aria-checked", "false");
+        await expect(approve).toBeDisabled();
 
         const code = await approveRemote(page);
         expect(page.url()).not.toContain(code);
@@ -178,6 +196,8 @@ test.describe("CLI device login", () => {
       try {
         const login = newLogin(listener.redirectUri);
         await openConsent(page, login);
+        // A loopback login has no confirmation control of either kind.
+        await expect(page.getByRole("switch")).toHaveCount(0);
         await expect(page.getByRole("checkbox")).toHaveCount(0);
 
         await page.getByRole("button", { name: "Approve", exact: true }).click();
@@ -267,7 +287,10 @@ test.describe("CLI device login", () => {
       page,
     }) => {
       await page.setViewportSize({ width: 375, height: 812 });
-      await openConsent(page, newLogin(REMOTE_REDIRECT_URI));
+      // The longest allowed name (64 chars) with no break opportunity.
+      const longName = `e2e-${"w".repeat(52)}${randomBytes(4).toString("hex")}`;
+      expect(longName).toHaveLength(64);
+      await openConsent(page, newLogin(REMOTE_REDIRECT_URI, longName));
 
       const approve = page.getByRole("button", { name: "Approve", exact: true });
       await expect(approve).not.toBeFocused();

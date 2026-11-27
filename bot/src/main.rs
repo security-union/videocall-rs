@@ -47,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
     let config = BotConfig::from_env_or_default()?;
     info!("Loaded configuration for {} clients", config.clients.len());
 
-    // Fail before starting any client if we can't sign room tokens.
     let signer = RoomTokenSigner::from_env()?;
 
     let server_url = config.server_url()?;

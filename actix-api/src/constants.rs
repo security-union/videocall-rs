@@ -95,7 +95,7 @@ lazy_static! {
     pub static ref CERT_PATH: Option<String> = env::var("CERT_PATH").ok();
     pub static ref DATABASE_ENABLED: String =
         env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false"));
-    pub static ref DATABASE_URL: Option<String> = env::var("DATABASE_URL").ok();
+    pub(crate) static ref DATABASE_URL: Option<String> = env::var("DATABASE_URL").ok();
 
     // Legacy OAuth and cookies on the websocket server.
     pub static ref OAUTH_CLIENT_ID: String =
@@ -113,25 +113,25 @@ lazy_static! {
     pub static ref COOKIE_DOMAIN: Option<String> = env::var("COOKIE_DOMAIN").ok();
 
     // Room token verification key; empty means unset.
-    pub static ref JWT_SECRET: String = env::var("JWT_SECRET").unwrap_or_default();
+    pub(crate) static ref JWT_SECRET: String = env::var("JWT_SECRET").unwrap_or_default();
 
     // Diagnostics identity and reporting.
-    pub static ref REGION: String = env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
-    pub static ref SERVICE_TYPE: String =
+    pub(crate) static ref REGION: String = env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+    pub(crate) static ref SERVICE_TYPE: String =
         env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
-    pub static ref SERVER_ID: Option<String> = env::var("SERVER_ID").ok();
-    pub static ref HOSTNAME: Option<String> = env::var("HOSTNAME").ok();
-    pub static ref SERVER_STATS_INTERVAL_SECS: u64 = env::var("SERVER_STATS_INTERVAL_SECS")
+    pub(crate) static ref SERVER_ID: Option<String> = env::var("SERVER_ID").ok();
+    pub(crate) static ref HOSTNAME: Option<String> = env::var("HOSTNAME").ok();
+    pub(crate) static ref SERVER_STATS_INTERVAL_SECS: u64 = env::var("SERVER_STATS_INTERVAL_SECS")
         .unwrap_or_else(|_| DEFAULT_REPORTING_INTERVAL_SECS.to_string())
         .parse::<u64>()
         .unwrap_or(DEFAULT_REPORTING_INTERVAL_SECS);
 
     // QUIC transport tuning for WebTransport.
-    pub static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
+    pub(crate) static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
-    pub static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
+    pub(crate) static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);

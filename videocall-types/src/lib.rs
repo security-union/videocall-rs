@@ -17,7 +17,7 @@
  */
 
 pub mod callback;
-pub mod constants;
+pub(crate) mod constants;
 pub mod feature_flags;
 pub mod protos;
 pub mod user_id;

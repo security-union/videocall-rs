@@ -46,6 +46,9 @@ pub fn env_lookup(key: &str) -> Option<String> {
         CONFIG_DIR_ENV => VIDEOCALL_CONFIG_DIR.clone(),
         "XDG_CONFIG_HOME" => XDG_CONFIG_HOME.clone(),
         "APPDATA" => APPDATA.clone(),
-        _ => None,
+        _ => {
+            debug_assert!(false, "env_lookup: no static for {key}");
+            None
+        }
     }
 }

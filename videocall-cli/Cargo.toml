@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "4.1.2"
+version = "5.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -37,12 +37,12 @@ ropus = "0.12"  # Pure-Rust Opus encoding
 image = "0.25.5"
 # Pure-Rust VP9 encoding. Default features pull in zero C dependencies; the
 # libvpx backend is opt-in via the `libvpx` feature below.
-videocall-codecs = { path = "../videocall-codecs", version = "0.1.17" }
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.18" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.10", features = ["input-native", "output-threaded"] }
 # Device-key login (`videocall-cli auth ...`) and meeting join: all HTTP to
 # meeting-api goes through videocall-meeting-client.
-videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2", features = ["device-session"] }
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.2.0", features = ["device-session"] }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.0" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 secrecy = "0.10"
@@ -70,7 +70,7 @@ httpdate = "1"
 
 [dependencies.videocall-types]
 path = "../videocall-types"
-version = "7.0.0"
+version = "8.0.0"
 
 [features]
 # Default: pure-Rust VP9 encoder (no C dependencies).

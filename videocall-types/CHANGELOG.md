@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v7.0.0...videocall-types-v8.0.0) - 2026-11-27
+
+### Other
+
+- [**breaking**] remove the relay's dead legacy login and feature flags ([#961](https://github.com/security-union/videocall-rs/pull/961))
+
 ## [7.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v6.0.1...videocall-types-v7.0.0) - 2026-11-22
 
 ### Added

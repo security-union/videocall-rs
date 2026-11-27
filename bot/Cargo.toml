@@ -24,6 +24,7 @@ protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
 url = "2.3.1"
+lazy_static = "1.4.0"
 
 # Audio processing (from neteq_player.rs pattern)
 hound = "3.5"  # WAV file reading

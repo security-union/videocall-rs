@@ -18,6 +18,7 @@
 
 mod audio_producer;
 mod config;
+mod constants;
 mod token;
 mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;

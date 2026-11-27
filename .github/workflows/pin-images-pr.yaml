@@ -197,7 +197,7 @@ jobs:
           # line that may differ from this checkout is the one that holds the
           # configured image key's tag here, and its new value must be a
           # strict pin.
-          while IFS= read -r file; do
+          while IFS= read -r file || [ -n "$file" ]; do
             key=""
             for i in "${!values_files[@]}"; do
               [ "${values_files[$i]}" = "$file" ] && key="${image_keys[$i]}"
@@ -247,7 +247,8 @@ jobs:
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
 
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$PIN_BRANCH" --base main \
-                 --state open --json number --jq '.[0].number // empty')
+                 --state open --json number,isCrossRepository \
+                 --jq 'map(select(.isCrossRepository | not))[0].number // empty')
 
           if git diff --quiet -- "${values_files[@]}"; then
             echo "pins already match the newest main images"

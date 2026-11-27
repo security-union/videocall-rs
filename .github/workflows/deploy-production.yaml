@@ -11,11 +11,15 @@ name: Deploy production
 # doctl, helm, kubectl, curl and jq from the runner on files from this
 # checkout. It executes nothing built in this run.
 #
-# The plan is checked as data before the cluster is touched: its names,
-# Helm releases, chart dirs, values files and version URLs must be this
-# checkout's own deploy-pins.toml lines, in order. A forged plan can at worst
-# weaken a version check or be rejected; it cannot run code or touch other
-# releases.
+# The plan is checked as data before the cluster is touched: each release's
+# name, Helm release, chart dir, values file, repository and version check
+# must be that release's own lines in this checkout's deploy-pins.toml, in
+# order, and its pin must appear in its values file. A forged plan can only
+# pick a different pin string that appears in a release's values file, which
+# changes the sha the gate waits for and the image shown in the summary. It
+# cannot run code, change which releases, charts or values files are deployed
+# or their order, drop or redirect a version check, or make curl fetch a URL
+# that is not that release's own in deploy-pins.toml.
 #
 # Only the five values files trigger this. A PR that edits a chart (Chart.yaml,
 # templates, the file:// dependency charts) does not roll production with the
@@ -56,12 +60,14 @@ jobs:
     # Time budget, every command using its whole allowance:
     #   checkout, plan check, helm, doctl, kubeconfig        ~2 min
     #   per release: dependency update 20 s + helm upgrade 35 s
-    #     + rollout 150 s + version gate 90 s (+ 5 s last poll)
-    #     + revision lookup 10 s                             = 310 s
-    #     (the website has no gate: 215 s)
-    #   5 releases                                           ~24.3 min
+    #     + rollout 160 s + version gate 100 s (90 s, then one
+    #     more 5 s sleep and 5 s poll) + revision lookup 10 s = 325 s
+    #     (the website has no gate: 225 s)
+    #   5 releases                                           ~25.4 min
     #   diagnostics after a failure, once: 5 x 10 s          ~0.8 min
-    #   final check 15 s (+ one round of polls, 20 s)        ~0.6 min
+    #   final check 40 s (15 s, then a 5 s sleep and one
+    #     round of four 5 s polls)                           ~0.7 min
+    #   total in the deploy step                             ~26.9 min
     # Before each release the loop checks that its worst case, diagnostics
     # and the final check still fit before both the step cap (28 min) and
     # the job cap (30 min), and stops without starting it otherwise. So a
@@ -105,22 +111,22 @@ jobs:
           sha_length=$(sed -n 's/^sha_length = \([0-9][0-9]*\)$/\1/p' "$toml")
           jq -e --arg n "${sha_length:-8}" '
             def exact($k): type == "object" and (keys == ($k | sort));
-            def plain: type == "string" and test("^[A-Za-z0-9._/-]+$");
+            def plain: type == "string" and test("\\A[A-Za-z0-9._/-]+\\z");
             def path: plain and (startswith("/") | not) and (split("/") | all(. != ".." and . != ""));
-            def pointer: type == "string" and test("^(/[A-Za-z0-9._-]+)*$");
-            def word: type == "string" and test("^[A-Za-z0-9._-]+$");
+            def pointer: type == "string" and test("\\A(/[A-Za-z0-9._-]+)*\\z");
+            def word: type == "string" and test("\\A[A-Za-z0-9._-]+\\z");
             exact(["releases"]) and (.releases | type == "array" and length > 0) and
             all(.releases[];
               exact(["name", "helm_release", "chart_dir", "values_file", "repository", "pin", "sha", "version"])
               and (.name | plain) and (.helm_release | plain)
               and (.chart_dir | path) and (.values_file | path)
-              and (.repository | type == "string" and test("^[a-z0-9._/:-]+$"))
-              and (.sha | type == "string" and test("^[0-9a-f]{" + $n + "}$"))
-              and (.pin | type == "string" and test("^[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}$"))
+              and (.repository | type == "string" and test("\\A[a-z0-9._/:-]+\\z"))
+              and (.sha | type == "string" and test("\\A[0-9a-f]{" + $n + "}\\z"))
+              and (.pin | type == "string" and test("\\A[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}\\z"))
               and (.sha as $sha | .pin | split("@")[0] | contains($sha))
               and (.version == null or (.version
                 | exact(["url", "pointer", "select"])
-                and (.url | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$"))
+                and (.url | type == "string" and test("\\Ahttps://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?\\z"))
                 and (.pointer | pointer)
                 and (.select == null or (.select
                   | exact(["array", "field", "equals"])
@@ -129,20 +135,40 @@ jobs:
           count=$(jq '.releases | length' "$PLAN")
           [ "$count" = "$(grep -c '^\[\[release\]\]$' "$toml")" ] ||
             fail "$count releases, but $toml has $(grep -c '^\[\[release\]\]$' "$toml")"
-          # Every [[release]] spells these out on one line each, so the
-          # columns of the plan must be exactly these lines, in order.
-          for key in name helm_release chart_dir values_file; do
-            want=$(sed -n "s|^$key = \"\\([A-Za-z0-9._/-]*\\)\"\$|\\1|p" "$toml")
-            got=$(jq -r --arg k "$key" '.releases[][$k]' "$PLAN")
-            [ "$want" = "$got" ] || fail "its $key list is not the one in $toml"
-          done
-          while IFS=$'\t' read -r values pin url; do
+          # Each release in the plan must be its own [[release]] table in the
+          # toml, field for field, in order, version check included. Only
+          # lines inside [[release]] and [release.version] count (so not
+          # pr_note), and only in the one-line `key = "value"` form.
+          want=$(awk '
+            function str(key,   m) {
+              if (!match($0, key " = \"[^\"]*\"")) return ""
+              m = substr($0, RSTART, RLENGTH); sub(/^[^"]*"/, "", m); sub(/"$/, "", m); return m
+            }
+            function flush() { if (n) print name "\t" hr "\t" dir "\t" vf "\t" repo "\t" v "\t" url "\t" ptr "\t" arr "\t" fld "\t" eq }
+            /^\[\[release\]\]$/ { flush(); n++; sec = "release"; name = hr = dir = vf = repo = url = ptr = arr = fld = eq = ""; v = 0; next }
+            /^\[release\.version\]$/ { sec = "version"; v = 1; next }
+            /^\[/ { sec = "other"; next }
+            sec == "release" && /^(name|helm_release|chart_dir|values_file|repository) = "[^"]*"$/ {
+              name = name str("^name"); hr = hr str("^helm_release"); dir = dir str("^chart_dir")
+              vf = vf str("^values_file"); repo = repo str("^repository")
+            }
+            sec == "version" && /^url = "[^"]*"$/ { url = str("^url") }
+            sec == "version" && /^pointer = "[^"]*"$/ { ptr = str("^pointer") }
+            sec == "version" && /^select = \{ [^{}]* \}$/ { arr = str("array"); fld = str("field"); eq = str("equals") }
+            END { flush() }' "$toml")
+          got=$(jq -r '.releases[] | [.name, .helm_release, .chart_dir, .values_file, .repository,
+              (if .version == null then 0 else 1 end), (.version.url // ""), (.version.pointer // ""),
+              (.version.select.array // ""), (.version.select.field // ""), (.version.select.equals // "")] | @tsv' "$PLAN")
+          if [ "$want" != "$got" ]; then
+            diff <(echo "$want") <(echo "$got") || true
+            fail "its releases are not the ones in $toml (left: $toml, right: plan)"
+          fi
+          while IFS=$'\t' read -r values pin; do
             [ -f "$values" ] && [ ! -L "$values" ] || fail "$values is not a regular file"
             grep -qF -- "$pin" "$values" || fail "$values does not hold the pin $pin"
-            if [ "$url" != "-" ]; then
-              grep -qxF -- "url = \"$url\"" "$toml" || fail "version url $url is not in $toml"
-            fi
-          done < <(jq -r '.releases[] | [.values_file, .pin, (.version.url // "-")] | @tsv' "$PLAN")
+          done < <(jq -r '.releases[] | [.values_file, .pin] | @tsv' "$PLAN")
+          jq -r '"\([.releases[] | select(.version != null)] | length) of \(.releases | length)"' "$PLAN" \
+            > "$RUNNER_TEMP/gated"
           jq -r '.releases[] | [.helm_release, .repository + ":" + .pin, "not attempted"] | @tsv' "$PLAN" \
             > "$RUNNER_TEMP/status.tsv"
           column -t -s $'\t' "$RUNNER_TEMP/status.tsv"
@@ -170,10 +196,10 @@ jobs:
         run: |
           set -euo pipefail
           # Seconds, worst case. See the budget at the top of the job.
-          release_worst=$((20 + 35 + 150 + 10))
-          gate_worst=$((GATE_SECONDS + 5))
+          release_worst=$((20 + 35 + 160 + 10))
+          gate_worst=$((GATE_SECONDS + 10))
           after_failure=50
-          final_worst=$((FINAL_SECONDS + 20))
+          final_worst=$((FINAL_SECONDS + 25))
           job_deadline=$(( $(cat "$RUNNER_TEMP/job-start") + 30 * 60 - 60 ))
           step_deadline=$(( $(date +%s) + 28 * 60 - 30 ))
           deadline=$(( job_deadline < step_deadline ? job_deadline : step_deadline ))
@@ -190,7 +216,7 @@ jobs:
               jq -r --arg pointer "$(field "$i" version.pointer)" --arg array "$(field "$i" version.select.array)" \
                 --arg field "$(field "$i" version.select.field)" --arg equals "$(field "$i" version.select.equals)" '
                 def at($p): if $p == "" then . else getpath($p | ltrimstr("/") | split("/")
-                  | map(if test("^[0-9]+$") then tonumber else . end)) end;
+                  | map(if test("\\A[0-9]+\\z") then tonumber else . end)) end;
                 try (
                   (if $field == "" then . else
                     [at($array)[] | select(type == "object" and .[$field] == $equals)]
@@ -211,7 +237,7 @@ jobs:
             name=$(field "$i" name) want=$(field "$i" sha)
             until=$(( $(date +%s) + GATE_SECONDS ))
             while :; do
-              got=$(live_sha "$i")
+              got=$(live_sha "$i") got=${got:0:64} got=${got//[^0-9a-f]/?}
               echo "$name reports ${got:-nothing}, want $want"
               sha_matches "$got" "$want" && return 0
               [ "$(date +%s)" -lt "$until" ] || return 1
@@ -257,7 +283,7 @@ jobs:
             # TERM first, so helm can cancel the upgrade itself; KILL 5 s later.
             timeout -k 5 30 helm upgrade --install "$release" "$dir" -f "$values" -n "$NAMESPACE" --timeout 25s ||
               stop "$release" "helm upgrade"
-            kubectl rollout status "deploy/$release" -n "$NAMESPACE" --timeout=150s ||
+            timeout -k 5 155 kubectl rollout status "deploy/$release" -n "$NAMESPACE" --timeout=150s ||
               stop "$release" "rollout"
             # No readiness probes here, so a finished rollout only means the
             # container started. Wait for the new build to report its sha
@@ -280,7 +306,7 @@ jobs:
             bad=""
             for ((i = 0; i < count; i++)); do
               [ "$(jq -r --argjson i "$i" '.releases[$i].version != null' "$PLAN")" = true ] || continue
-              got=$(live_sha "$i")
+              got=$(live_sha "$i") got=${got:0:64} got=${got//[^0-9a-f]/?}
               sha_matches "$got" "$(field "$i" sha)" || bad="$bad $(field "$i" name)=${got:-nothing}"
             done
             if [ -z "$bad" ]; then
@@ -306,7 +332,7 @@ jobs:
             if [ -s "$RUNNER_TEMP/failure" ]; then
               echo "**Failed:** $(cat "$RUNNER_TEMP/failure"). Nothing was rolled back."
             elif [ -s "$RUNNER_TEMP/status.tsv" ] && ! cut -f3 "$RUNNER_TEMP/status.tsv" | grep -qv '^deployed'; then
-              echo "All releases deployed and reporting their pinned sha. The website has no version endpoint, so it is checked by rollout status only."
+              echo "All releases deployed. $(cat "$RUNNER_TEMP/gated" 2>/dev/null || echo "? of ?") releases were gated on their version endpoint; the rest were checked by rollout status only."
             else
               echo "Did not finish: cancelled, timed out, or failed during setup or the plan check."
             fi

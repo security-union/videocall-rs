@@ -66,7 +66,7 @@ If a publish job is re-run on the same commit and pushes a new digest, `pin` and
 
 ## Limits
 
-It finds builds by listing tags in the registry, so a build only counts once its tag is pushed. The version wait is a liveness signal, not an integrity check; the digest pin is the integrity check. It only edits Helm values files, and only an image block with `repository` and `tag` keys. `image_key` cannot name a key that has a dot in it. A service that reports a sha shorter than the pin, or in uppercase, never matches.
+It finds builds by listing tags in the registry, so a build only counts once its tag is pushed. The version wait is a liveness signal, not an integrity check; the digest pin is the integrity check. It only edits Helm values files, and only an image block with `repository` and `tag` keys. `image_key` cannot name a key that has a dot in it. A service that reports a sha shorter than the pin, or in uppercase, never matches. This repo's workflows read `deploy-pins.toml` and the values files with line tools, so they are stricter than the tool about formatting (one key per line, double quotes, no trailing comments on those lines) and stop with an error otherwise. If `helm upgrade` is killed and a release is left in pending-upgrade, later runs stop at that release until someone runs `helm rollback`.
 
 ## CI
 

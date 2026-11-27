@@ -5,6 +5,18 @@ name: Deploy production
 # its version endpoint before touching the next. The usual trigger is merging
 # the PR that pin-images-pr.yaml opens.
 #
+# Two jobs. `preflight` (deploy-preflight.yaml) has no secrets: it builds the
+# deploy-pins tool, renders every chart, verifies every pin, and uploads one
+# data file, plan.json. `deploy` gets the cluster credentials and runs only
+# doctl, helm, kubectl, curl and jq from the runner on files from this
+# checkout. It executes nothing built in this run.
+#
+# The plan is checked as data before the cluster is touched: its names,
+# Helm releases, chart dirs, values files and version URLs must be this
+# checkout's own deploy-pins.toml lines, in order. A forged plan can at worst
+# weaken a version check or be rejected; it cannot run code or touch other
+# releases.
+#
 # Only the five values files trigger this. A PR that edits a chart (Chart.yaml,
 # templates, the file:// dependency charts) does not roll production with the
 # old image; the chart change ships with the next pin merge, since helm upgrade
@@ -29,34 +41,111 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy-preflight.yaml
+    with:
+      upload: true
+    permissions:
+      contents: read
+
   deploy:
     name: Deploy to videocall-us-east
-    if: github.ref == 'refs/heads/main'
+    needs: preflight
     runs-on: ubuntu-24.04
-    # Time budget, every step using its whole allowance:
-    #   setup + preflight                          ~4 min
-    #   5 x helm upgrade (no --wait)   5 x  60 s =  5 min (normally seconds)
-    #   5 x rollout status             5 x 150 s = 12.5 min
-    #   4 x version gate (no website)  4 x  90 s =  6 min
-    #   final check + diagnostics                  ~1 min
-    #   total                                      28.5 min < 30
-    # The loop stops at the first failure, so diagnostics always get printed.
+    # Time budget, every command using its whole allowance:
+    #   checkout, plan check, helm, doctl, kubeconfig        ~2 min
+    #   per release: dependency update 20 s + helm upgrade 35 s
+    #     + rollout 150 s + version gate 90 s (+ 5 s last poll)
+    #     + revision lookup 10 s                             = 310 s
+    #     (the website has no gate: 215 s)
+    #   5 releases                                           ~24.3 min
+    #   diagnostics after a failure, once: 5 x 10 s          ~0.8 min
+    #   final check 15 s (+ one round of polls, 20 s)        ~0.6 min
+    # Before each release the loop checks that its worst case, diagnostics
+    # and the final check still fit before both the step cap (28 min) and
+    # the job cap (30 min), and stops without starting it otherwise. So a
+    # timeout never lands in the middle of a helm upgrade.
     timeout-minutes: 30
     env:
       CLUSTER: videocall-us-east
       KUBE_CONTEXT: do-nyc1-videocall-us-east
       NAMESPACE: default
-      HELM_TIMEOUT: 60s
-      ROLLOUT_TIMEOUT: 150s
       GATE_SECONDS: "90"
-      VERSIONS_URL: https://api.videocall.rs/api/v1/versions
-      UI_VERSION_URL: https://app.videocall.rs/version.json
+      FINAL_SECONDS: "15"
     steps:
+      - name: Start the job clock
+        run: |
+          date +%s > "$RUNNER_TEMP/job-start"
+          echo "PLAN=$RUNNER_TEMP/plan/plan.json" >> "$GITHUB_ENV"
+
       - name: Check out
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0 # preflight checks each pinned sha is on main's history
           persist-credentials: false
+
+      - name: Fetch the deploy plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: deploy-plan
+          path: ${{ runner.temp }}/plan
+
+      # plan.json came from a job that compiled third-party crates. It is
+      # data: check its shape and every value, and tie each release to this
+      # checkout's deploy-pins.toml.
+      - name: Check the plan
+        run: |
+          set -euo pipefail
+          toml=deploy-pins.toml
+          fail() { echo "::error::deploy plan: $*"; exit 1; }
+          [ "$(cd "$(dirname "$PLAN")" && find . -mindepth 1 | sort)" = "./plan.json" ] ||
+            fail "the artifact must hold plan.json and nothing else"
+          [ -f "$PLAN" ] && [ ! -L "$PLAN" ] || fail "plan.json is not a regular file"
+          [ "$(wc -c < "$PLAN")" -le 65536 ] || fail "plan.json is larger than 64 KiB"
+          sha_length=$(sed -n 's/^sha_length = \([0-9][0-9]*\)$/\1/p' "$toml")
+          jq -e --arg n "${sha_length:-8}" '
+            def exact($k): type == "object" and (keys == ($k | sort));
+            def plain: type == "string" and test("^[A-Za-z0-9._/-]+$");
+            def path: plain and (startswith("/") | not) and (split("/") | all(. != ".." and . != ""));
+            def pointer: type == "string" and test("^(/[A-Za-z0-9._-]+)*$");
+            def word: type == "string" and test("^[A-Za-z0-9._-]+$");
+            exact(["releases"]) and (.releases | type == "array" and length > 0) and
+            all(.releases[];
+              exact(["name", "helm_release", "chart_dir", "values_file", "repository", "pin", "sha", "version"])
+              and (.name | plain) and (.helm_release | plain)
+              and (.chart_dir | path) and (.values_file | path)
+              and (.repository | type == "string" and test("^[a-z0-9._/:-]+$"))
+              and (.sha | type == "string" and test("^[0-9a-f]{" + $n + "}$"))
+              and (.pin | type == "string" and test("^[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}$"))
+              and (.sha as $sha | .pin | split("@")[0] | contains($sha))
+              and (.version == null or (.version
+                | exact(["url", "pointer", "select"])
+                and (.url | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$"))
+                and (.pointer | pointer)
+                and (.select == null or (.select
+                  | exact(["array", "field", "equals"])
+                  and (.array | pointer) and (.field | word) and (.equals | word))))))
+          ' "$PLAN" > /dev/null || fail "plan.json does not have the expected shape and values"
+          count=$(jq '.releases | length' "$PLAN")
+          [ "$count" = "$(grep -c '^\[\[release\]\]$' "$toml")" ] ||
+            fail "$count releases, but $toml has $(grep -c '^\[\[release\]\]$' "$toml")"
+          # Every [[release]] spells these out on one line each, so the
+          # columns of the plan must be exactly these lines, in order.
+          for key in name helm_release chart_dir values_file; do
+            want=$(sed -n "s|^$key = \"\\([A-Za-z0-9._/-]*\\)\"\$|\\1|p" "$toml")
+            got=$(jq -r --arg k "$key" '.releases[][$k]' "$PLAN")
+            [ "$want" = "$got" ] || fail "its $key list is not the one in $toml"
+          done
+          while IFS=$'\t' read -r values pin url; do
+            [ -f "$values" ] && [ ! -L "$values" ] || fail "$values is not a regular file"
+            grep -qF -- "$pin" "$values" || fail "$values does not hold the pin $pin"
+            if [ "$url" != "-" ]; then
+              grep -qxF -- "url = \"$url\"" "$toml" || fail "version url $url is not in $toml"
+            fi
+          done < <(jq -r '.releases[] | [.values_file, .pin, (.version.url // "-")] | @tsv' "$PLAN")
+          jq -r '.releases[] | [.helm_release, .repository + ":" + .pin, "not attempted"] | @tsv' "$PLAN" \
+            > "$RUNNER_TEMP/status.tsv"
+          column -t -s $'\t' "$RUNNER_TEMP/status.tsv"
 
       - name: Set up Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
@@ -69,111 +158,77 @@ jobs:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Configure kubectl
+        timeout-minutes: 2
         run: |
           doctl kubernetes cluster kubeconfig save "$CLUSTER"
           kubectl config use-context "$KUBE_CONTEXT"
           kubectl version
           helm version --short
 
-      # Render every chart and check its image before touching the cluster,
-      # so a broken chart or a bad pin stops the run with nothing deployed.
-      - name: Preflight
-        run: |
-          set -euo pipefail
-          # chart, expected image repo, version component (- = none), in
-          # deploy order. meeting-api first: clients re-fetch room tokens from
-          # it when a relay restarts. Relays one at a time, so clients can
-          # fall back to the other transport while one restarts.
-          {
-            printf '%s\t%s\t%s\n' meeting-api securityunion/videocall-meeting-api meeting-api
-            printf '%s\t%s\t%s\n' webtransport securityunion/videocall-media-server webtransport-relay
-            printf '%s\t%s\t%s\n' websocket securityunion/videocall-media-server websocket-relay
-            printf '%s\t%s\t%s\n' videocall-ui securityunion/videocall-dioxus-ui dioxus-ui
-            printf '%s\t%s\t%s\n' videocall-website securityunion/video-call-rs-website -
-          } > "$RUNNER_TEMP/charts.tsv"
-          git rev-list --first-parent HEAD > "$RUNNER_TEMP/history"
-          : > "$RUNNER_TEMP/plan.tsv"
-          : > "$RUNNER_TEMP/status.tsv"
-          fail() {
-            echo "::error::$chart: $*"
-            echo "preflight ($chart): $*" > "$RUNNER_TEMP/failure"
-            exit 1
-          }
-          while IFS=$'\t' read -r chart want_repo component; do
-            dir="helm/global/us-east/$chart"
-            release="$chart-us-east"
-            ( cd "$dir" && helm dependency update >/dev/null ) || fail "helm dependency update failed"
-            helm template "$release" "$dir" -f "$dir/values.yaml" -n "$NAMESPACE" > "$RUNNER_TEMP/$chart.yaml" ||
-              fail "helm template failed"
-            images=$(sed -n -E 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' "$RUNNER_TEMP/$chart.yaml" | sort -u)
-            [ "$(printf '%s\n' "$images" | grep -c .)" = "1" ] || fail "renders more or fewer than one image: $images"
-            [[ "$images" =~ ^([a-z0-9./-]+):(main-([0-9a-f]{8}))@(sha256:[0-9a-f]{64})$ ]] ||
-              fail "image '$images' is not <repo>:main-<sha8>@sha256:<digest>"
-            repo="${BASH_REMATCH[1]}" tag="${BASH_REMATCH[2]}" sha8="${BASH_REMATCH[3]}" digest="${BASH_REMATCH[4]}"
-            [ "$repo" = "$want_repo" ] || fail "image repo '$repo' is not the expected '$want_repo'"
-            # Resolve sha8 through main's first-parent list, not rev-parse,
-            # so a prefix can only match a commit that main actually has.
-            [ "$(grep -c "^$sha8" "$RUNNER_TEMP/history" || true)" = "1" ] ||
-              fail "$tag is not exactly one commit on main's first-parent history"
-            # Public, anonymous registry check that the tag still points at
-            # the pinned digest. A mismatch means the tag was re-pushed.
-            token=$(curl -sS --fail --retry 4 --retry-delay 5 \
-              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repo:pull" | jq -r .token) ||
-              fail "no registry token for $repo"
-            served=$(curl -sS --fail --retry 4 --retry-delay 5 -I -H "Authorization: Bearer $token" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-              "https://registry-1.docker.io/v2/$repo/manifests/$tag" | tr -d '\r' |
-              awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }') ||
-              fail "$repo:$tag not found in the registry"
-            [ "$served" = "$digest" ] || fail "$repo:$tag now serves '$served', pin says $digest (tag re-pushed?)"
-            printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$release" "$repo:$tag@$digest" "$sha8" "$component" >> "$RUNNER_TEMP/plan.tsv"
-            printf '%s\tnot attempted\n' "$release" >> "$RUNNER_TEMP/status.tsv"
-          done < "$RUNNER_TEMP/charts.tsv"
-          column -t -s $'\t' "$RUNNER_TEMP/plan.tsv"
-
       - name: Deploy releases in order
+        timeout-minutes: 28
         run: |
           set -euo pipefail
-          set_status() { sed -i "s|^$1\t.*|$1\t$2|" "$RUNNER_TEMP/status.tsv"; }
-          # The git_sha a component reports. It shows the new build is up and
-          # answering: a liveness signal, not an integrity control (the digest
-          # pin is that).
+          # Seconds, worst case. See the budget at the top of the job.
+          release_worst=$((20 + 35 + 150 + 10))
+          gate_worst=$((GATE_SECONDS + 5))
+          after_failure=50
+          final_worst=$((FINAL_SECONDS + 20))
+          job_deadline=$(( $(cat "$RUNNER_TEMP/job-start") + 30 * 60 - 60 ))
+          step_deadline=$(( $(date +%s) + 28 * 60 - 30 ))
+          deadline=$(( job_deadline < step_deadline ? job_deadline : step_deadline ))
+
+          set_status() { sed -i "s|^$1\t\([^\t]*\)\t.*|$1\t\1\t$2|" "$RUNNER_TEMP/status.tsv"; }
+          field() { jq -r --argjson i "$1" --arg k "$2" '.releases[$i] | getpath($k | split(".")) // ""' "$PLAN"; }
+
+          # The sha release $1 reports right now, or nothing. The pointer
+          # and selector are plan values, passed as jq variables only.
           live_sha() {
-            local component="$1" url filter got
-            if [ "$component" = dioxus-ui ]; then
-              url="$UI_VERSION_URL" filter='.git_sha // empty'
-            else
-              # shellcheck disable=SC2016 # $s is a jq variable, not shell
-              url="$VERSIONS_URL" filter='[.components[]? | select(.service == $s) | .git_sha] | first // empty'
-            fi
-            got=$(curl -sS --max-time 10 -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" 2>/dev/null |
-              jq -r --arg s "$component" "$filter" 2>/dev/null || true)
-            echo "${got:-unreachable-or-missing}"
+            local i="$1" url
+            url=$(field "$i" version.url)
+            curl -sS --fail --max-time 5 -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" 2>/dev/null |
+              jq -r --arg pointer "$(field "$i" version.pointer)" --arg array "$(field "$i" version.select.array)" \
+                --arg field "$(field "$i" version.select.field)" --arg equals "$(field "$i" version.select.equals)" '
+                def at($p): if $p == "" then . else getpath($p | ltrimstr("/") | split("/")
+                  | map(if test("^[0-9]+$") then tonumber else . end)) end;
+                try (
+                  (if $field == "" then . else
+                    [at($array)[] | select(type == "object" and .[$field] == $equals)]
+                    | if length == 1 then .[0] else error("not exactly one") end
+                  end)
+                  | at($pointer) | strings
+                ) catch empty' 2>/dev/null || true
+          }
+          # The same rule as the tool: the short sha itself, or a longer
+          # lowercase hex id that starts with it.
+          sha_matches() {
+            local got="$1" want="$2"
+            [ "$got" = "$want" ] ||
+              { [[ "$got" =~ ^[0-9a-f]{1,40}$ ]] && [ "${#got}" -gt "${#want}" ] && [ "${got:0:${#want}}" = "$want" ]; }
           }
           wait_for_version() {
-            local component="$1" want="$2" deadline got
-            deadline=$(( $(date +%s) + GATE_SECONDS ))
+            local i="$1" name want got until
+            name=$(field "$i" name) want=$(field "$i" sha)
+            until=$(( $(date +%s) + GATE_SECONDS ))
             while :; do
-              got=$(live_sha "$component")
-              echo "$component reports $got, want $want"
-              [ "$got" = "$want" ] && return 0
-              [ "$(date +%s)" -lt "$deadline" ] || return 1
+              got=$(live_sha "$i")
+              echo "$name reports ${got:-nothing}, want $want"
+              sha_matches "$got" "$want" && return 0
+              [ "$(date +%s)" -lt "$until" ] || return 1
               sleep 5
             done
           }
           diagnose() {
             local release="$1" selector
             echo "::group::diagnostics for $release"
-            selector=$(kubectl get deploy "$release" -n "$NAMESPACE" -o json 2>/dev/null \
+            selector=$(timeout 10 kubectl get deploy "$release" -n "$NAMESPACE" -o json 2>/dev/null \
               | jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' || true)
-            kubectl get deploy "$release" -n "$NAMESPACE" -o wide || true
+            timeout 10 kubectl get deploy "$release" -n "$NAMESPACE" -o wide || true
             if [ -n "$selector" ]; then
-              kubectl get pods -n "$NAMESPACE" -o wide -l "$selector" || true
-            else
-              kubectl get pods -n "$NAMESPACE" -o wide || true
+              timeout 10 kubectl get pods -n "$NAMESPACE" -o wide -l "$selector" || true
             fi
-            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -n 40 || true
-            helm history "$release" -n "$NAMESPACE" --max 5 || true
+            timeout 10 kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -n 40 || true
+            timeout 10 helm history "$release" -n "$NAMESPACE" --max 5 || true
             echo "::endgroup::"
           }
           stop() {
@@ -185,43 +240,59 @@ jobs:
             echo "::error::$release: $stage failed. Stopped before the next release. Nothing was rolled back."
             exit 1
           }
-          while IFS=$'\t' read -r chart release image sha8 component; do
-            dir="helm/global/us-east/$chart"
-            echo "::group::$release -> $image"
-            ( cd "$dir" && helm upgrade --install "$release" . -f values.yaml -n "$NAMESPACE" --timeout "$HELM_TIMEOUT" ) ||
+
+          count=$(jq '.releases | length' "$PLAN")
+          for ((i = 0; i < count; i++)); do
+            release=$(field "$i" helm_release) dir=$(field "$i" chart_dir) values=$(field "$i" values_file)
+            has_gate=$(jq -r --argjson i "$i" '.releases[$i].version != null' "$PLAN")
+            worst=$((release_worst + after_failure + final_worst))
+            [ "$has_gate" = true ] && worst=$((worst + gate_worst))
+            if [ $(( $(date +%s) + worst )) -gt "$deadline" ]; then
+              echo "out of time before $release; it was not started" > "$RUNNER_TEMP/failure"
+              echo "::error::out of time before $release; stopped without starting it"
+              exit 1
+            fi
+            echo "::group::$release"
+            ( cd "$dir" && timeout 20 helm dependency update >/dev/null ) || stop "$release" "helm dependency update"
+            # TERM first, so helm can cancel the upgrade itself; KILL 5 s later.
+            timeout -k 5 30 helm upgrade --install "$release" "$dir" -f "$values" -n "$NAMESPACE" --timeout 25s ||
               stop "$release" "helm upgrade"
-            kubectl rollout status "deploy/$release" -n "$NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" ||
+            kubectl rollout status "deploy/$release" -n "$NAMESPACE" --timeout=150s ||
               stop "$release" "rollout"
             # No readiness probes here, so a finished rollout only means the
-            # container started. Wait for the new build to answer before the
-            # next release; a crash-looping relay stops the run right here.
-            if [ "$component" != "-" ]; then
-              wait_for_version "$component" "$sha8" || stop "$release" "version gate"
+            # container started. Wait for the new build to report its sha
+            # before the next release; a crash-looping relay stops the run
+            # here. The sha is a liveness signal, not an integrity control.
+            if [ "$has_gate" = true ]; then
+              wait_for_version "$i" || stop "$release" "version gate"
             fi
-            revision=$(helm history "$release" -n "$NAMESPACE" --max 1 -o json | jq -r '.[0].revision')
-            set_status "$release" "deployed (revision $revision)"
+            # Bookkeeping only: a failed lookup must not undo "deployed".
+            revision=$(timeout 10 helm history "$release" -n "$NAMESPACE" --max 1 -o json 2>/dev/null \
+              | jq -r '.[0].revision' 2>/dev/null) || revision=unknown
+            set_status "$release" "deployed (revision ${revision:-unknown})"
             echo "::endgroup::"
-          done < "$RUNNER_TEMP/plan.tsv"
+          done
 
-          # One pass over everything, a few tries for network blips only: an
-          # earlier release may have fallen over while later ones rolled.
-          bad=""
-          for attempt in 1 2 3; do
+          # One more look at everything: an earlier release may have fallen
+          # over while later ones rolled. Short deadline, not a second wait.
+          until=$(( $(date +%s) + FINAL_SECONDS ))
+          while :; do
             bad=""
-            while IFS=$'\t' read -r _ _ _ sha8 component; do
-              [ "$component" = "-" ] && continue
-              got=$(live_sha "$component")
-              [ "$got" = "$sha8" ] || bad="$bad $component=$got(want $sha8)"
-            done < "$RUNNER_TEMP/plan.tsv"
+            for ((i = 0; i < count; i++)); do
+              [ "$(jq -r --argjson i "$i" '.releases[$i].version != null' "$PLAN")" = true ] || continue
+              got=$(live_sha "$i")
+              sha_matches "$got" "$(field "$i" sha)" || bad="$bad $(field "$i" name)=${got:-nothing}"
+            done
             if [ -z "$bad" ]; then
-              echo "all components report their pinned sha"
+              echo "every release with a version check reports its pinned sha"
               exit 0
             fi
-            echo "final check attempt $attempt:$bad"
+            echo "final check:$bad"
+            [ "$(date +%s)" -lt "$until" ] || break
             sleep 5
           done
           echo "final version check:$bad" > "$RUNNER_TEMP/failure"
-          echo "::error::after all rollouts, components disagree with their pins:$bad"
+          echo "::error::after all rollouts, a release no longer reports its pinned sha:$bad"
           exit 1
 
       - name: Job summary
@@ -234,18 +305,18 @@ jobs:
             echo
             if [ -s "$RUNNER_TEMP/failure" ]; then
               echo "**Failed:** $(cat "$RUNNER_TEMP/failure"). Nothing was rolled back."
-            elif [ -s "$RUNNER_TEMP/status.tsv" ] && ! grep -qv 'deployed' "$RUNNER_TEMP/status.tsv"; then
+            elif [ -s "$RUNNER_TEMP/status.tsv" ] && ! cut -f3 "$RUNNER_TEMP/status.tsv" | grep -qv '^deployed'; then
               echo "All releases deployed and reporting their pinned sha. The website has no version endpoint, so it is checked by rollout status only."
             else
-              echo "Did not finish: cancelled, timed out, or failed during setup."
+              echo "Did not finish: cancelled, timed out, or failed during setup or the plan check."
             fi
             echo
-            if [ -s "$RUNNER_TEMP/plan.tsv" ]; then
+            # status.tsv only exists once the plan passed its check.
+            if [ -s "$RUNNER_TEMP/status.tsv" ]; then
               echo "| Release | Image | Result |"
               echo "|---|---|---|"
-              while IFS=$'\t' read -r _ release image _ _; do
-                result=$(awk -F'\t' -v r="$release" '$1 == r { print $2 }' "$RUNNER_TEMP/status.tsv")
+              while IFS=$'\t' read -r release image result; do
                 echo "| \`$release\` | \`$image\` | $result |"
-              done < "$RUNNER_TEMP/plan.tsv"
+              done < "$RUNNER_TEMP/status.tsv"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

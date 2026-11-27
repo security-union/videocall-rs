@@ -1,0 +1,35 @@
+[package]
+name = "deploy-pins"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+description = "Pins Helm values to an exact image tag and digest, verifies the pins before a deploy, and waits for each service to report the new build"
+repository = "https://github.com/security-union/videocall-rs"
+readme = "README.md"
+keywords = ["helm", "kubernetes", "gitops", "deploy", "oci"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+# clap (derive, no color or suggestions) parses the command line. ureq
+# (rustls, no other features) is the HTTPS client, serde_json reads registry
+# and version JSON, yaml-rust2 parses values.yaml and rendered manifests, toml
+# (parse only) reads the config. base64 and percent-encoding come in with
+# ureq anyway and do the two encodings the registry token request needs.
+# clap, serde_json and toml were already in the workspace lock; ureq,
+# yaml-rust2 and some of their dependencies are new to it.
+[dependencies]
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+percent-encoding = "2.3"
+serde_json = "1.0.145"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+yaml-rust2 = { version = "0.13", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

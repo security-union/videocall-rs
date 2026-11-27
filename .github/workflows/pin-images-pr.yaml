@@ -1,11 +1,23 @@
 name: Pin production images
 
 # When an image publish run on main finishes, open (or refresh) one rolling
-# PR that pins helm/global/us-east/* to the newest main-<sha8> images.
+# PR that pins helm/global/us-east/* to the newest main-<sha8>@sha256 images.
 # Merging that PR is the deploy: deploy-production.yaml runs on the merge.
 #
-# workflow_run jobs get a write token, so this workflow only ever checks out
-# and runs code from main, and never interpolates event data into `run:`.
+# Two jobs. `plan` has a read-only token and no secrets: it builds the
+# deploy-pins tool (deploy-pins/, configured by deploy-pins.toml), runs it,
+# and uploads the rewritten values files plus the PR title and body. `pr` has
+# the write token and runs only git, gh and the shell. It treats the artifact
+# as untrusted: plain files only, values files the config names, each
+# differing from this checkout on exactly the tag line of the configured
+# image key, with a strict new value; a one-line title; a capped body. The
+# title and body reach git and gh as arguments and files, never through
+# GITHUB_ENV or GITHUB_OUTPUT.
+#
+# Both jobs check out github.sha: the last commit on main for workflow_run,
+# and the tip of main when dispatched (the jobs only run on main). Nothing
+# the plan job says decides what the pr job checks out. workflow_run jobs get
+# a write token, so this workflow never interpolates event data into `run:`.
 
 on:
   workflow_run:
@@ -33,23 +45,25 @@ env:
     upload-website-docker-hub.yaml
 
 jobs:
-  pin:
-    name: Open or refresh the pin PR
+  plan:
+    name: Resolve the newest main images
     # Dispatch only from main; workflow_run only for runs of main in this
-    # repository. Failed publish runs count too: the script only pins tags
-    # that exist, and skipping them would leave no PR when the last sibling
-    # to finish is the one that failed.
+    # repository. Failed publish runs count too: the tool only pins tags the
+    # registry confirms, and skipping them would leave no PR when the last
+    # sibling to finish is the one that failed.
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event.workflow_run.head_branch == 'main' &&
         github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Budget: gate and setup ~3 min, build <= 10 min, pin <= 5 min.
+    timeout-minutes: 18
     permissions:
-      contents: write # push the rolling PR branch
-      pull-requests: write # create, edit, close the PR
+      contents: read
       actions: read # see whether publish runs are still going
+    outputs:
+      busy: ${{ steps.gate.outputs.busy }}
     env:
       TRIGGER_WORKFLOW: ${{ github.event.workflow_run.name }}
       TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -80,22 +94,154 @@ jobs:
         if: steps.gate.outputs.busy == 'false'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/heads/main
-          fetch-depth: 0 # the script walks up to 200 first-parent commits
+          ref: ${{ github.sha }}
+          fetch-depth: 0 # the tool walks main's first-parent history
           persist-credentials: false
 
-      - name: Resolve newest main images
+      - name: Install Nix
         if: steps.gate.outputs.busy == 'false'
-        run: |
-          scripts/pin-main-images.sh > "$RUNNER_TEMP/pins.tsv"
-          column -t -s $'\t' "$RUNNER_TEMP/pins.tsv"
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
 
-      - name: Open, refresh or close the PR
+      - name: Use the project binary cache (pull only)
         if: steps.gate.outputs.busy == 'false'
+        uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: videocall-rs
+
+      - name: Build deploy-pins
+        if: steps.gate.outputs.busy == 'false'
+        timeout-minutes: 10
+        run: |
+          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p deploy-pins"
+          echo "DEPLOY_PINS=$PWD/target/release/deploy-pins" >> "$GITHUB_ENV"
+
+      - name: Pin and stage the result
+        if: steps.gate.outputs.busy == 'false'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pin"
+          mkdir -p "$out/files"
+          "$DEPLOY_PINS" --registry-budget-secs 180 pin --report-dir "$out/report"
+          git diff --name-only > "$out/changed.txt"
+          while IFS= read -r file; do
+            mkdir -p "$out/files/$(dirname "$file")"
+            cp "$file" "$out/files/$file"
+          done < "$out/changed.txt"
+
+      - name: Upload the plan
+        if: steps.gate.outputs.busy == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pin-plan
+          path: ${{ runner.temp }}/pin
+          if-no-files-found: error
+          retention-days: 1
+
+  pr:
+    name: Open, refresh or close the PR
+    needs: plan
+    if: needs.plan.outputs.busy == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # push the rolling PR branch
+      pull-requests: write # create, edit, close the PR
+    steps:
+      - name: Check out the same main commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Fetch the plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pin-plan
+          path: ${{ runner.temp }}/pin
+
+      # One step: what is checked here is what git and gh get, with nothing
+      # passed between steps.
+      - name: Check the plan, then open, refresh or close the PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          plan="$RUNNER_TEMP/pin"
+          toml=deploy-pins.toml
+          fail() { echo "::error::pin plan: $*"; exit 1; }
+
+          # Plain files only: no links, devices or fifos, nothing large.
+          [ -d "$plan" ] && [ ! -L "$plan" ] && [ -f "$plan/changed.txt" ] || fail "no plan artifact"
+          [ -z "$(find "$plan" -mindepth 1 ! -type f ! -type d)" ] || fail "the artifact holds something other than plain files"
+          [ -z "$(find "$plan" -type f -size +64k)" ] || fail "a file in the artifact is over 64 KiB"
+
+          # The values files and image keys the config names, in config
+          # order. Every [[release]] spells both out on one line for this.
+          mapfile -t values_files < <(sed -n 's|^values_file = "\([A-Za-z0-9._/-]*\)"$|\1|p' "$toml")
+          mapfile -t image_keys < <(sed -n 's|^image_key = "\([A-Za-z0-9_.-]*\)"$|\1|p' "$toml")
+          releases=$(grep -c '^\[\[release\]\]$' "$toml")
+          [ "${#values_files[@]}" = "$releases" ] && [ "${#image_keys[@]}" = "$releases" ] ||
+            fail "every [[release]] in $toml must spell out values_file and image_key on one line"
+
+          expected=$( { printf '%s\n' changed.txt report/title.txt report/body.md
+                        sed 's|^|files/|' "$plan/changed.txt"; } | sort)
+          actual=$(cd "$plan" && find . -type f | sed 's|^\./||' | sort)
+          if [ "$expected" != "$actual" ]; then
+            diff <(echo "$expected") <(echo "$actual") || true
+            fail "unexpected artifact contents"
+          fi
+          [ -z "$(sort "$plan/changed.txt" | uniq -d)" ] || fail "changed.txt names a file twice"
+
+          # Do not trust the diff's shape. For each changed file, the only
+          # line that may differ from this checkout is the one that holds the
+          # configured image key's tag here, and its new value must be a
+          # strict pin.
+          while IFS= read -r file; do
+            key=""
+            for i in "${!values_files[@]}"; do
+              [ "${values_files[$i]}" = "$file" ] && key="${image_keys[$i]}"
+            done
+            [ -n "$key" ] || fail "plan touches '$file', which $toml does not name"
+            [ -f "$file" ] && [ ! -L "$file" ] || fail "$file is not a regular file in this checkout"
+            at=$(awk -v key="$key" '
+              FNR == NR { old[FNR] = $0; n_old = FNR; next }
+              { new[FNR] = $0; n_new = FNR }
+              END {
+                if (n_old != n_new) { print "the line count changed"; exit 1 }
+                for (i = 1; i <= n_old; i++) if (old[i] != new[i]) { diffs++; at = i }
+                if (diffs != 1) { print diffs + 0 " lines differ"; exit 1 }
+                # The key path of that line, from the indentation above it.
+                line = old[at]; match(line, /^ */); indent = RLENGTH
+                if (line !~ /^ +tag:/) { print "line " at " is not a tag line"; exit 1 }
+                path = "tag"
+                for (i = at - 1; i >= 1 && indent > 0; i--) {
+                  l = old[i]
+                  if (l ~ /^ *(#.*)?$/) continue
+                  match(l, /^ */)
+                  if (RLENGTH >= indent) continue
+                  if (l !~ /^ *[A-Za-z0-9_.-]+:$/) { print "line " i " is not a plain mapping key"; exit 1 }
+                  k = l; sub(/^ */, "", k); sub(/:$/, "", k)
+                  path = k "." path; indent = RLENGTH
+                }
+                if (indent != 0 || path != key ".tag") { print "line " at " is " path ", not " key ".tag"; exit 1 }
+                print at
+              }' "$file" "$plan/files/$file") || fail "$file: $at"
+            old_line=$(sed -n "${at}p" "$file")
+            new_line=$(sed -n "${at}p" "$plan/files/$file")
+            pin='main-[0-9a-f]{8}@sha256:[0-9a-f]{64}'
+            [[ "$new_line" =~ ^(\ +)tag:\ ($pin|\"$pin\")$ ]] || fail "$file:$at: '$new_line' is not a strict pin"
+            [[ "$old_line" == "${BASH_REMATCH[1]}tag:"* ]] || fail "$file:$at: the indentation changed"
+            cp "$plan/files/$file" "$file"
+          done < "$plan/changed.txt"
+
+          title=$(cat "$plan/report/title.txt")
+          [[ "$title" != *[[:cntrl:]]* && "$title" =~ ^deploy:\ pin\ images\ to\ main-[0-9a-f]{8}$ ]] ||
+            fail "unexpected PR title"
+          printf '%s\n' "$title" | cmp -s - "$plan/report/title.txt" || fail "title.txt holds more than one line"
+          body="$plan/report/body.md"
+          [ "$(wc -c < "$body")" -lt 60000 ] || fail "the PR body is 60000 bytes or more"
+
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           echo "::add-mask::$auth"
           remote="https://github.com/${GITHUB_REPOSITORY}.git"
@@ -103,7 +249,7 @@ jobs:
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$PIN_BRANCH" --base main \
                  --state open --json number --jq '.[0].number // empty')
 
-          if git diff --quiet -- helm/global/us-east; then
+          if git diff --quiet -- "${values_files[@]}"; then
             echo "pins already match the newest main images"
             if [ -n "$pr" ]; then
               gh pr close "$pr" --repo "$GITHUB_REPOSITORY" --delete-branch \
@@ -112,68 +258,10 @@ jobs:
             exit 0
           fi
 
-          # sha8 -> full sha through main's first-parent list, never bare
-          # rev-parse. Prints "<position> <sha>" (1 = tip) or nothing.
-          git rev-list --first-parent HEAD > "$RUNNER_TEMP/history"
-          locate() {
-            local hits
-            hits=$(grep -n "^$1" "$RUNNER_TEMP/history" || true)
-            [ "$(printf '%s' "$hits" | grep -c . || true)" = "1" ] && printf '%s %s' "${hits%%:*}" "${hits#*:}"
-            return 0
-          }
-          # Shorten main-<sha8>@sha256:<digest> for the table.
-          short() { if [[ "$1" == *@sha256:* ]]; then local d="${1#*@}"; echo "${1%%@*}@${d:0:19}"; else echo "$1"; fi; }
-
-          # Newest new pin names the PR. Oldest current pin starts the compare.
-          newest="" newest_n=999999999 oldest="" oldest_n=0
-          while IFS=$'\t' read -r _ _ current new _; do
-            [[ "$new" =~ ^main-([0-9a-f]{8})@sha256:[0-9a-f]{64}$ ]] || { echo "unexpected pin $new"; exit 1; }
-            read -r n sha <<<"$(locate "${BASH_REMATCH[1]}")"
-            if [ -n "${n:-}" ] && [ "$n" -lt "$newest_n" ]; then newest_n=$n; newest=$sha; fi
-            if [[ "$current" =~ ^main-([0-9a-f]{8})(@sha256:[0-9a-f]{64})?$ ]]; then
-              read -r n sha <<<"$(locate "${BASH_REMATCH[1]}")"
-              if [ -n "${n:-}" ] && [ "$n" -gt "$oldest_n" ]; then oldest_n=$n; oldest=$sha; fi
-            fi
-          done < <(tail -n +2 "$RUNNER_TEMP/pins.tsv")
-          [ -n "$newest" ] || { echo "could not place the new pins on main's history"; exit 1; }
-          title="deploy: pin images to main-${newest:0:8}"
-
-          body="$RUNNER_TEMP/body.md"
-          {
-            echo "Pins the production Helm values to the newest images built from main, by tag and digest (digests shortened below; the diff has them in full)."
-            echo
-            echo "| Image | Values file | Current pin | New pin |"
-            echo "|---|---|---|---|"
-            while IFS=$'\t' read -r image file current new status; do
-              new="\`$(short "$new")\`"; if [ "$status" = bump ]; then new="**$new**"; fi
-              echo "| \`$image\` | \`$file\` | \`$(short "$current")\` | $new |"
-            done < <(tail -n +2 "$RUNNER_TEMP/pins.tsv")
-            echo
-            if [ -n "$oldest" ]; then
-              echo "What ships: https://github.com/${GITHUB_REPOSITORY}/compare/${oldest}...${newest}"
-              echo
-              echo "<details><summary>First-parent commits in that range</summary>"
-              echo
-              echo '```'
-              # Backticks swapped out so a commit subject cannot close the fence.
-              git log --first-parent -n 60 --format='%h %s' "${oldest}..${newest}" | tr '`' "'"
-              echo '```'
-              echo
-              echo "</details>"
-            else
-              echo "No compare link: no current pin is a main-<sha8> build from this history."
-            fi
-            echo
-            echo "**Merging this PR deploys these images to production** (cluster \`videocall-us-east\`) through \`deploy-production.yaml\`."
-            echo "Leaving it open or closing it leaves the cluster alone. This PR is force-updated when newer images land."
-            echo
-            echo "Opened by \`pin-images-pr.yaml\` with the workflow token, so no CI runs on it; no PR check covers \`helm/\`."
-          } > "$body"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$PIN_BRANCH"
-          git add -- helm/global/us-east
+          git add -- "${values_files[@]}"
           git commit -q -m "$title"
 
           # Skip the force-push when the branch already holds exactly this tree

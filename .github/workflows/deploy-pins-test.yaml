@@ -1,0 +1,48 @@
+name: deploy-pins
+
+# Tests for the deploy-pins tool (deploy-pins/README.md). They need no
+# network: the registry, git and clock are faked.
+
+on:
+  pull_request:
+    paths:
+      - 'deploy-pins/**'
+      - 'deploy-pins.toml'
+      - 'helm/global/us-east/*/values.yaml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'nix/**'
+      - '.github/workflows/deploy-pins-test.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy-pins/**'
+      - 'deploy-pins.toml'
+      - '.github/workflows/deploy-pins-test.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: videocall-rs
+
+      - name: Format
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo fmt -p deploy-pins --check"
+
+      - name: Clippy
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo clippy --locked -p deploy-pins --all-targets -- -D warnings"
+
+      - name: Test
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo test --locked -p deploy-pins"

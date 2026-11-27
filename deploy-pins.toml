@@ -1,0 +1,88 @@
+# deploy-pins config: which Helm release runs which image, in deploy order.
+# Read by the deploy-pins tool (deploy-pins/README.md) in pin-images-pr.yaml,
+# deploy-preflight.yaml and deploy-production.yaml. Paths are relative to
+# this file.
+
+# Builds come from main's first-parent history, tagged main-<first 8 hex of
+# the commit> by the publish workflows (`${GITHUB_SHA::8}`).
+branch = "main"
+tag = "{branch}-{sha}"
+sha_length = 8
+github_repo = "security-union/videocall-rs"
+
+# Appended to the body of the pin PR.
+pr_note = """
+**Merging this PR deploys these images to production** (cluster `videocall-us-east`) through `deploy-production.yaml`.
+Leaving it open or closing it leaves the cluster alone. This PR is force-updated when newer images land.
+
+Opened by `pin-images-pr.yaml` with the workflow token, so no CI runs on it, the helm preflight check included. `deploy-production.yaml` runs that same preflight before it touches the cluster.
+"""
+
+# Every release spells out values_file on one line: pin-images-pr.yaml reads
+# those lines to decide which files the bot may commit.
+#
+# meeting-api goes first because clients re-fetch room tokens from it when a
+# relay restarts. The relays go one at a time, back to back, so clients can
+# fall back to the other transport while one restarts.
+
+[[release]]
+name = "meeting-api"
+helm_release = "meeting-api-us-east"
+chart_dir = "helm/global/us-east/meeting-api"
+values_file = "helm/global/us-east/meeting-api/values.yaml"
+image_key = "meeting-api.image"
+repository = "securityunion/videocall-meeting-api"
+
+# meeting-api aggregates the build info of itself, both relays and the UI.
+# A component it cannot reach is left out, which the gate reads as "missing".
+[release.version]
+url = "https://api.videocall.rs/api/v1/versions"
+select = { array = "/components", field = "service", equals = "meeting-api" }
+pointer = "/git_sha"
+
+[[release]]
+name = "webtransport"
+helm_release = "webtransport-us-east"
+chart_dir = "helm/global/us-east/webtransport"
+values_file = "helm/global/us-east/webtransport/values.yaml"
+image_key = "rustlemania-webtransport.image"
+repository = "securityunion/videocall-media-server"
+
+[release.version]
+url = "https://api.videocall.rs/api/v1/versions"
+select = { array = "/components", field = "service", equals = "webtransport-relay" }
+pointer = "/git_sha"
+
+[[release]]
+name = "websocket"
+helm_release = "websocket-us-east"
+chart_dir = "helm/global/us-east/websocket"
+values_file = "helm/global/us-east/websocket/values.yaml"
+image_key = "rustlemania-websocket.image"
+repository = "securityunion/videocall-media-server"
+
+[release.version]
+url = "https://api.videocall.rs/api/v1/versions"
+select = { array = "/components", field = "service", equals = "websocket-relay" }
+pointer = "/git_sha"
+
+[[release]]
+name = "videocall-ui"
+helm_release = "videocall-ui-us-east"
+chart_dir = "helm/global/us-east/videocall-ui"
+values_file = "helm/global/us-east/videocall-ui/values.yaml"
+image_key = "videocall-ui.image"
+repository = "securityunion/videocall-dioxus-ui"
+
+[release.version]
+url = "https://app.videocall.rs/version.json"
+pointer = "/git_sha"
+
+# The website reports no version, so the deploy only checks its rollout.
+[[release]]
+name = "videocall-website"
+helm_release = "videocall-website-us-east"
+chart_dir = "helm/global/us-east/videocall-website"
+values_file = "helm/global/us-east/videocall-website/values.yaml"
+image_key = "videocall-website.image"
+repository = "securityunion/video-call-rs-website"

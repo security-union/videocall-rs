@@ -142,8 +142,9 @@ sequenceDiagram
 |-------------|---------------|-------------|
 | Expired | `401 Unauthorized` | Token was valid but has expired. Client should fetch a fresh token. |
 | Invalid signature | `403 Forbidden` | Token has been tampered with. This incident is logged. |
-| Missing | `400 Bad Request` | No token provided. Use `/lobby?token=<JWT>`. |
+| Missing | `401 Unauthorized` | No token provided. Use `/lobby?token=<JWT>`. |
 | Room join denied | `403 Forbidden` | Token does not grant room join permission. |
+| Any other path | `404 Not Found` | Includes the removed `/lobby/{user_id}/{room}` form. |
 
 ## Meeting States
 

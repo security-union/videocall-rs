@@ -24,15 +24,17 @@ use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::token_validator::{self, TokenError};
 use actix::prelude::*;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
+use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 use videocall_meeting_types::token::RoomAccessTokenClaims;
+use web_transport_quinn::http::StatusCode;
 
 lazy_static::lazy_static! {
     static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
@@ -45,6 +47,18 @@ lazy_static::lazy_static! {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 }
+
+/// Longest a refused CONNECT holds its connection so the status reaches the client.
+const REJECT_LINGER: Duration = Duration::from_secs(3);
+
+/// Deadline for QUIC plus the HTTP/3 CONNECT: covers about three lost flights on a 300 ms link.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections at once between QUIC accept and session start (or the end of the linger).
+#[cfg(not(test))]
+const MAX_PENDING_HANDSHAKES: usize = 2048;
+#[cfg(test)]
+const MAX_PENDING_HANDSHAKES: usize = 16;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,25 +211,51 @@ pub async fn start(
     // Create Quinn endpoint with our custom config
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
 
-    let mut server = web_transport_quinn::Server::new(endpoint);
-
     info!(
         "listening on {} with {}s idle timeout and {}s keep-alive",
         opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
     );
 
-    // Accept new WebTransport connections
+    // Accept new WebTransport connections, keeping a handle so a refusal's status is sent.
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
     // actor requires the actix LocalSet context for spawn_local.
-    while let Some(request) = server.accept().await {
+    let handshake_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    while let Some(incoming) = endpoint.accept().await {
         trace_span!("New connection being attempted");
+        let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+            debug!("refusing connection: {MAX_PENDING_HANDSHAKES} handshakes already pending");
+            incoming.refuse();
+            continue;
+        };
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
         actix_rt::spawn(async move {
+            let handshake = async {
+                let conn = incoming
+                    .await
+                    .map_err(|err| format!("QUIC handshake failed: {err}"))?;
+                let request = web_transport_quinn::Request::accept(conn.clone())
+                    .await
+                    .map_err(|err| format!("WebTransport handshake failed: {err}"))?;
+                Ok::<_, String>((request, conn))
+            };
+            let (request, conn) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(err)) => {
+                    debug!("{err}");
+                    return;
+                }
+                Err(_) => {
+                    debug!("WebTransport handshake timed out after {HANDSHAKE_TIMEOUT:?}");
+                    return;
+                }
+            };
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
+                conn,
+                handshake_permit,
                 chat_server,
                 nats_client,
                 tracker_sender,
@@ -231,30 +271,49 @@ pub async fn start(
     Ok(())
 }
 
+/// Why a WebTransport CONNECT was refused.
+#[derive(Debug)]
+enum ConnectRejection {
+    NotFound,
+    Misconfigured,
+    Token(TokenError),
+}
+
+impl ConnectRejection {
+    /// 404 for another path, 401 for a missing or expired token, 403 for a refused one.
+    fn status(&self) -> StatusCode {
+        match self {
+            ConnectRejection::NotFound => StatusCode::NOT_FOUND,
+            ConnectRejection::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+            ConnectRejection::Token(TokenError::Missing) => StatusCode::UNAUTHORIZED,
+            ConnectRejection::Token(e) if e.is_retryable() => StatusCode::UNAUTHORIZED,
+            ConnectRejection::Token(_) => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
 /// Decide from the CONNECT URL alone whether it may join: only `/lobby?token=<JWT>`.
 fn authorize_connect(
     path: &str,
     token: Option<&str>,
     jwt_secret: &str,
-) -> anyhow::Result<RoomAccessTokenClaims> {
+) -> Result<RoomAccessTokenClaims, ConnectRejection> {
     if path.trim_end_matches('/') != "/lobby" {
-        return Err(anyhow!("Invalid path: expected /lobby?token=<JWT>"));
+        return Err(ConnectRejection::NotFound);
     }
     if jwt_secret.is_empty() {
-        return Err(anyhow!("JWT_SECRET not set"));
+        return Err(ConnectRejection::Misconfigured);
     }
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        TokenError::Missing.log("WT");
-        return Err(anyhow!("room access token is required"));
-    };
-    token_validator::decode_room_token(jwt_secret, token).map_err(|e| {
-        e.log("WT");
-        anyhow!("token validation failed: {}", e.client_message())
-    })
+    let token = token
+        .filter(|t| !t.is_empty())
+        .ok_or(ConnectRejection::Token(TokenError::Missing))?;
+    token_validator::decode_room_token(jwt_secret, token).map_err(ConnectRejection::Token)
 }
 
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
+    conn: quinn::Connection,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
@@ -271,7 +330,25 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-    let claims = authorize_connect(uri.path(), token.as_deref(), &jwt_secret)?;
+    let claims = match authorize_connect(uri.path(), token.as_deref(), &jwt_secret) {
+        Ok(claims) => claims,
+        Err(rejection) => {
+            match &rejection {
+                ConnectRejection::NotFound => {
+                    info!("WT connection rejected: unknown path {}", uri.path())
+                }
+                ConnectRejection::Misconfigured => error!("JWT_SECRET not set"),
+                ConnectRejection::Token(e) => e.log("WT"),
+            }
+            // The permit is held through the linger.
+            reject_connect(request, conn, rejection.status()).await;
+            drop(handshake_permit);
+            return Ok(());
+        }
+    };
+    // The session owns the connection now and no longer counts as pending.
+    drop(conn);
+    drop(handshake_permit);
     info!(
         "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
         claims.sub, claims.room, claims.display_name, claims.observer
@@ -304,6 +381,19 @@ async fn run_webtransport_connection_from_request(
         info!("closing session: {}", err);
     }
     Ok(())
+}
+
+/// Send the error status, then hold the connection until the client closes or `REJECT_LINGER`.
+async fn reject_connect(
+    request: web_transport_quinn::Request,
+    conn: quinn::Connection,
+    status: StatusCode,
+) {
+    if let Err(err) = request.close(status).await {
+        debug!("failed to send WebTransport rejection {status}: {err}");
+        return;
+    }
+    let _ = tokio::time::timeout(REJECT_LINGER, conn.closed()).await;
 }
 
 /// Handle a WebTransport session using the WtChatSession actor
@@ -528,6 +618,40 @@ mod tests {
         meeting: &str,
     ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
         connect_client_with_token(&token_for(user, meeting)).await
+    }
+
+    /// Connect to any path and query, keeping the raw error so tests can read the status.
+    async fn connect_raw(
+        path_and_query: &str,
+    ) -> Result<web_transport_quinn::Session, web_transport_quinn::ClientError> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url = url::Url::parse(&format!("{}{}", base.trim_end_matches('/'), path_and_query))
+            .expect("valid test URL");
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new()
+                .with_no_certificate_verification()
+                .expect("build client")
+        };
+        client.connect(url).await
+    }
+
+    /// Status of a refused CONNECT, parsed from `Debug` since web-transport-quinn's error types are private.
+    fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
+        let web_transport_quinn::ClientError::HttpError(inner) = err else {
+            return None;
+        };
+        let text = format!("{inner:?}");
+        ["WrongStatus(Some(", "ErrorStatus("]
+            .iter()
+            .find_map(|marker| text.split(marker).nth(1))
+            .and_then(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
     }
 
     /// Connect via the token-based endpoint: GET /lobby?token=<JWT>
@@ -1345,6 +1469,148 @@ mod tests {
         session.close(0u32, b"done");
     }
 
+    /// Accepts any certificate, for the raw-QUIC tests below.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// A QUIC connection with the WebTransport ALPN that never speaks HTTP/3.
+    async fn connect_silent_quic() -> Result<quinn::Connection, quinn::ConnectionError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config"),
+        ));
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let server = url::Url::parse(&base)
+            .expect("valid WEBTRANSPORT_URL")
+            .socket_addrs(|| Some(443))
+            .expect("resolve WEBTRANSPORT_URL")
+            .into_iter()
+            .next()
+            .expect("WEBTRANSPORT_URL resolves");
+        let local = if server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let mut endpoint =
+            quinn::Endpoint::client(local.parse().expect("bind addr")).expect("client endpoint");
+        endpoint.set_default_client_config(client_config);
+        endpoint
+            .connect(server, "localhost")
+            .expect("start QUIC connect")
+            .await
+    }
+
+    /// A silent client is closed once `HANDSHAKE_TIMEOUT` passes, and not before.
+    #[actix_rt::test]
+    async fn test_wt_silent_client_dropped_after_handshake_timeout() {
+        setup_jwt_wt().await;
+        let conn = connect_silent_quic().await.expect("QUIC handshake");
+        let started = std::time::Instant::now();
+        let closed =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(5), conn.closed())
+                .await
+                .expect("server should close a silent connection");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed + Duration::from_millis(500) >= HANDSHAKE_TIMEOUT,
+            "closed too early ({elapsed:?}): {closed:?}"
+        );
+    }
+
+    /// Over the cap a connection is refused at once; freed slots let a real client in.
+    #[actix_rt::test]
+    async fn test_wt_pending_handshake_cap_refuses_then_recovers() {
+        setup_jwt_wt().await;
+        let mut silent = Vec::new();
+        for _ in 0..MAX_PENDING_HANDSHAKES {
+            silent.push(connect_silent_quic().await.expect("within the cap"));
+        }
+
+        let started = std::time::Instant::now();
+        let refused = connect_silent_quic()
+            .await
+            .expect_err("over the cap must be refused");
+        assert!(
+            matches!(refused, quinn::ConnectionError::ConnectionClosed(_)),
+            "{refused:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "refused at once"
+        );
+
+        for conn in &silent {
+            conn.close(0u32.into(), b"bye");
+        }
+        drop(silent);
+        let mut admitted = None;
+        for _ in 0..20 {
+            match connect_client("alice", "wt-cap-room").await {
+                Ok(session) => {
+                    admitted = Some(session);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let session = admitted.expect("a real client gets in once the slots are free");
+        session.close(0u32, b"done");
+    }
+
     #[test]
     fn authorize_connect_decisions() {
         let token = token_for("alice", "room-1");
@@ -1353,24 +1619,30 @@ mod tests {
         )
         .expect("generate token");
         let refused = [
-            ("/lobby", None),                       // no token
-            ("/lobby", Some("")),                   // empty token
-            ("/lobby", Some("not.a.jwt")),          // bad token
-            ("/lobby", Some(expired.as_str())),     // expired token
-            ("/lobby/alice/room-1", None),          // removed path form
-            ("/lobby/alice/room-1", Some(&*token)), // removed path form, even with a token
+            ("/lobby", None, StatusCode::UNAUTHORIZED),     // no token
+            ("/lobby", Some(""), StatusCode::UNAUTHORIZED), // empty token
+            ("/lobby", Some("not.a.jwt"), StatusCode::FORBIDDEN), // bad token
+            ("/lobby", Some(expired.as_str()), StatusCode::UNAUTHORIZED), // expired token
+            ("/lobby/alice/room-1", None, StatusCode::NOT_FOUND), // removed path form
+            ("/lobby/alice/room-1", Some(&*token), StatusCode::NOT_FOUND), // removed path form, even with a token
         ];
-        for (path, token) in refused {
-            assert!(
-                authorize_connect(path, token, JWT_SECRET).is_err(),
-                "{path} {token:?} must be refused"
-            );
+        for (path, token, status) in refused {
+            let rejection = authorize_connect(path, token, JWT_SECRET).unwrap_err();
+            assert_eq!(rejection.status(), status, "{path} {token:?}");
         }
         let claims = authorize_connect("/lobby", Some(&token), JWT_SECRET).expect("valid token");
         assert_eq!(
             (claims.sub.as_str(), claims.room.as_str()),
             ("alice", "room-1")
         );
+    }
+
+    /// The refusal status must reach a real client (see `REJECT_LINGER`).
+    #[actix_rt::test]
+    async fn test_wt_refusal_status_reaches_the_client() {
+        setup_jwt_wt().await;
+        let err = connect_raw("/lobby").await.expect_err("must be refused");
+        assert_eq!(rejection_status(&err), Some(401), "got {err:?}");
     }
 
     #[actix_rt::test]

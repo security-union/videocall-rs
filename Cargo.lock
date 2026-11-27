@@ -4658,6 +4658,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "jsonwebtoken",
+ "lazy_static",
  "oauth2",
  "protobuf",
  "rand 0.8.7",

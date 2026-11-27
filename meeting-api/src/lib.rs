@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod constants;
 pub mod db;
 pub mod device_auth;
 pub mod error;

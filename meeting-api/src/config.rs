@@ -13,7 +13,13 @@
 
 //! Application configuration loaded from environment variables.
 
-use std::env;
+use crate::constants::{
+    AFTER_LOGIN_URL, ALLOWED_REDIRECT_URLS, COOKIE_DOMAIN, COOKIE_NAME, COOKIE_SECURE,
+    CORS_ALLOWED_ORIGIN, DATABASE_URL, DEVICE_TOKEN_AUDIENCE, JWT_SECRET, LISTEN_ADDR, NATS_URL,
+    OAUTH_AUTH_URL, OAUTH_CLIENT_ID, OAUTH_ISSUER, OAUTH_JWKS_URL, OAUTH_REDIRECT_URL,
+    OAUTH_SCOPES, OAUTH_SECRET, OAUTH_TOKEN_URL, OAUTH_USERINFO_URL, SERVICE_VERSION_URLS,
+    SESSION_TTL_SECS, TOKEN_TTL_SECS,
+};
 
 /// Configuration for the Meeting Backend API.
 #[derive(Debug, Clone)]
@@ -69,16 +75,16 @@ pub struct DeviceAuthConfig {
 
 impl DeviceAuthConfig {
     pub fn from_env(cors_allowed_origin: &[String]) -> Result<Self, String> {
-        let audience = env::var("DEVICE_TOKEN_AUDIENCE")
-            .ok()
+        let audience = DEVICE_TOKEN_AUDIENCE
+            .clone()
             .filter(|v| !v.trim().is_empty())
             .map(|s| {
                 parse_origin(s.trim())
                     .ok_or_else(|| format!("DEVICE_TOKEN_AUDIENCE is not an http(s) origin: {s}"))
             })
             .transpose()?;
-        let ui_origin = env::var("AFTER_LOGIN_URL")
-            .ok()
+        let ui_origin = AFTER_LOGIN_URL
+            .clone()
             .and_then(|url| parse_origin(url.trim()));
         let mut browser_origins = cors_allowed_origin.to_vec();
         browser_origins.extend(ui_origin.clone());
@@ -136,57 +142,62 @@ impl Config {
     ///   `AFTER_LOGIN_URL`
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     pub fn from_env() -> Result<Self, String> {
-        let database_url = env::var("DATABASE_URL")
-            .map_err(|_| "DATABASE_URL environment variable is required")?;
-        let jwt_secret =
-            env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
+        let database_url = DATABASE_URL
+            .clone()
+            .ok_or("DATABASE_URL environment variable is required")?;
+        let jwt_secret = JWT_SECRET
+            .clone()
+            .ok_or("JWT_SECRET environment variable is required")?;
 
-        let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
-        let token_ttl_secs = env::var("TOKEN_TTL_SECS")
-            .unwrap_or_else(|_| "60".to_string())
+        let listen_addr = LISTEN_ADDR
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0:8081".to_string());
+        let token_ttl_secs = TOKEN_TTL_SECS
+            .clone()
+            .unwrap_or_else(|| "60".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
-        let session_ttl_secs = env::var("SESSION_TTL_SECS")
-            .unwrap_or_else(|_| "315360000".to_string()) // ~10 years
+        let session_ttl_secs = SESSION_TTL_SECS
+            .clone()
+            .unwrap_or_else(|| "315360000".to_string()) // ~10 years
             .parse::<i64>()
             .map_err(|_| "SESSION_TTL_SECS must be a valid integer")?;
-        let cookie_domain = env::var("COOKIE_DOMAIN").ok().filter(|s| !s.is_empty());
-        let cookie_name = env::var("COOKIE_NAME")
-            .ok()
+        let cookie_domain = COOKIE_DOMAIN.clone().filter(|s| !s.is_empty());
+        let cookie_name = COOKIE_NAME
+            .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "session".to_string());
-        let cookie_secure = env::var("COOKIE_SECURE")
+        let cookie_secure = COOKIE_SECURE
+            .as_deref()
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let cors_allowed_origin: Vec<String> = env::var("CORS_ALLOWED_ORIGIN")
-            .ok()
+        let cors_allowed_origin: Vec<String> = CORS_ALLOWED_ORIGIN
+            .clone()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
             .unwrap_or_default();
-        let nats_url = env::var("NATS_URL").ok().filter(|s| !s.is_empty());
+        let nats_url = NATS_URL.clone().filter(|s| !s.is_empty());
 
         // Internal URLs for the aggregated /api/v1/versions endpoint.
         // Comma-separated list, e.g. "http://rustlemania-websocket:8080/version,http://rustlemania-webtransport:444/version"
-        let service_version_urls = env::var("SERVICE_VERSION_URLS")
-            .ok()
+        let service_version_urls = SERVICE_VERSION_URLS
+            .clone()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
 
-        let oauth = env::var("OAUTH_CLIENT_ID")
-            .ok()
+        let oauth = OAUTH_CLIENT_ID
+            .clone()
             .filter(|s| !s.is_empty())
             .map(|client_id| {
-                let client_secret = env::var("OAUTH_SECRET").ok().filter(|s| !s.is_empty());
-                let issuer = env::var("OAUTH_ISSUER").ok().filter(|s| !s.is_empty());
-                let auth_url = env::var("OAUTH_AUTH_URL").ok().filter(|s| !s.is_empty());
-                let token_url = env::var("OAUTH_TOKEN_URL").ok().filter(|s| !s.is_empty());
-                let jwks_url = env::var("OAUTH_JWKS_URL").ok().filter(|s| !s.is_empty());
-                let userinfo_url = env::var("OAUTH_USERINFO_URL")
-                    .ok()
-                    .filter(|s| !s.is_empty());
-                let scopes = env::var("OAUTH_SCOPES")
-                    .ok()
+                let client_secret = OAUTH_SECRET.clone().filter(|s| !s.is_empty());
+                let issuer = OAUTH_ISSUER.clone().filter(|s| !s.is_empty());
+                let auth_url = OAUTH_AUTH_URL.clone().filter(|s| !s.is_empty());
+                let token_url = OAUTH_TOKEN_URL.clone().filter(|s| !s.is_empty());
+                let jwks_url = OAUTH_JWKS_URL.clone().filter(|s| !s.is_empty());
+                let userinfo_url = OAUTH_USERINFO_URL.clone().filter(|s| !s.is_empty());
+                let scopes = OAUTH_SCOPES
+                    .clone()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "openid email profile".to_string());
 
@@ -216,19 +227,19 @@ impl Config {
                 Ok::<_, String>(OAuthConfig {
                     client_id,
                     client_secret,
-                    redirect_url: env::var("OAUTH_REDIRECT_URL")
-                        .map_err(|_| "OAUTH_REDIRECT_URL required when OAUTH_CLIENT_ID is set")?,
+                    redirect_url: OAUTH_REDIRECT_URL
+                        .clone()
+                        .ok_or("OAUTH_REDIRECT_URL required when OAUTH_CLIENT_ID is set")?,
                     issuer,
                     auth_url,
                     token_url,
                     jwks_url,
                     userinfo_url,
                     scopes,
-                    after_login_url: env::var("AFTER_LOGIN_URL")
-                        .unwrap_or_else(|_| "/".to_string()),
+                    after_login_url: AFTER_LOGIN_URL.clone().unwrap_or_else(|| "/".to_string()),
                     allowed_redirect_urls: {
-                        let urls: Vec<String> = env::var("ALLOWED_REDIRECT_URLS")
-                            .ok()
+                        let urls: Vec<String> = ALLOWED_REDIRECT_URLS
+                            .clone()
                             .filter(|s| !s.is_empty())
                             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
                             .unwrap_or_default();

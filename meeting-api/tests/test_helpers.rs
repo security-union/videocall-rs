@@ -61,6 +61,7 @@ pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
 pub const TEST_UI_ORIGIN: &str = "http://localhost:3001";
 pub const TEST_DEVICE_AUDIENCE: &str = "http://localhost:8081";
 
+/// The test `AppState` backed by the given pool (no OAuth).
 pub fn build_state(pool: DbPool) -> AppState {
     AppState {
         db: pool,
@@ -83,8 +84,14 @@ pub fn build_state(pool: DbPool) -> AppState {
     }
 }
 
+/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
 pub fn build_app(pool: DbPool) -> Router {
-    routes::router().with_state(build_state(pool))
+    build_app_with_state(build_state(pool))
+}
+
+/// Build the router from an explicit state (e.g. with OAuth configured).
+pub fn build_app_with_state(state: AppState) -> Router {
+    routes::router().with_state(state)
 }
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.

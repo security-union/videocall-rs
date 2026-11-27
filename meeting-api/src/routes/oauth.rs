@@ -19,17 +19,19 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use url::Url;
 
 use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
 
-use crate::auth::AuthUser;
+use crate::auth::{extract_cookie_token, AuthUser};
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
@@ -56,6 +58,43 @@ fn build_session_cookie(
         cookie.push_str(&format!("; Domain={d}"));
     }
     cookie
+}
+
+/// Name of the pre-login cookie that binds an OAuth login to the browser
+/// that started it (login CSRF). Derived from the session cookie name so
+/// environments sharing a parent domain never collide. With `Secure` it
+/// carries the `__Host-` prefix, so the browser only accepts it from this
+/// exact host: a sibling subdomain cannot plant a value of its choosing.
+fn login_cookie_name(state: &AppState) -> String {
+    if state.cookie_secure {
+        format!("__Host-{}-login", state.cookie_name)
+    } else {
+        format!("{}-login", state.cookie_name)
+    }
+}
+
+/// `Set-Cookie` for the pre-login cookie: host-only (no `Domain`),
+/// `SameSite=Lax` so it rides the top-level redirect back from the IdP, and
+/// as short-lived as the stored OAuth request. `max_age = 0` clears it.
+fn build_login_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+}
+
+/// The pre-login value is 32 random bytes, base64url: 43 characters.
+fn is_valid_binding(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Lowercase hex SHA-256: only the hash of the binding is stored.
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Build a `Set-Cookie` header that clears the session cookie.
@@ -92,6 +131,7 @@ pub struct CallbackQuery {
 /// redirects to the identity provider.
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, AppError> {
     let oauth_cfg = state
@@ -116,6 +156,15 @@ pub async fn login(
     });
     let return_to = return_to.as_deref();
 
+    // Bind this login to the browser that started it: the callback only
+    // completes where this cookie is present. A browser that already holds a
+    // valid one keeps it, so a login started in a second tab does not break
+    // one still running in the first.
+    let login_cookie = login_cookie_name(&state);
+    let binding = extract_cookie_token(&headers, &login_cookie)
+        .filter(|value| is_valid_binding(value))
+        .unwrap_or_else(|| CsrfToken::new_random_len(32).secret().clone());
+
     db_oauth::store_oauth_request(
         &state.db,
         pkce_challenge.as_str(),
@@ -123,6 +172,7 @@ pub async fn login(
         csrf_token.secret(),
         return_to,
         Some(nonce.secret()),
+        &sha256_hex(&binding),
     )
     .await?;
 
@@ -136,7 +186,19 @@ pub async fn login(
         Some(nonce.secret()),
     );
 
-    Ok(Redirect::to(&auth_url).into_response())
+    let mut response = Redirect::to(&auth_url).into_response();
+    let cookie = build_login_cookie(
+        &login_cookie,
+        &binding,
+        db_oauth::OAUTH_REQUEST_TTL_SECS,
+        state.cookie_secure,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie)
+            .map_err(|_| AppError::internal("failed to build login cookie header"))?,
+    );
+    Ok(response)
 }
 
 /// GET /login/callback?state=...&code=...
@@ -146,6 +208,7 @@ pub async fn login(
 /// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
 pub async fn callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, AppError> {
     let oauth_cfg = state
@@ -161,6 +224,24 @@ pub async fn callback(
                 videocall_meeting_types::APIError::internal_error("invalid OAuth state"),
             )
         })?;
+
+    // The row is consumed above, so a failed binding check also burns the
+    // state. Rows stored before the binding existed carry no hash and are
+    // accepted for their remaining TTL only.
+    if let Some(expected) = oauth_req.browser_binding_hash.as_deref() {
+        let presented = extract_cookie_token(&headers, &login_cookie_name(&state))
+            .map(|value| sha256_hex(&value))
+            .unwrap_or_default();
+        if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
+            tracing::info!("OAuth callback rejected: sign-in was started in another browser");
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                videocall_meeting_types::APIError::internal_error(
+                    "sign-in was started in a different browser; start it again here",
+                ),
+            ));
+        }
+    }
 
     let pkce_verifier = oauth_req
         .pkce_verifier
@@ -268,6 +349,14 @@ pub async fn callback(
         header::SET_COOKIE,
         HeaderValue::from_str(&session_cookie)
             .map_err(|_| AppError::internal("failed to build session cookie header"))?,
+    );
+    // The binding has done its job. A login still running in another tab of
+    // this browser now fails at its callback; that browser is signed in.
+    let clear_login = build_login_cookie(&login_cookie_name(&state), "", 0, state.cookie_secure);
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_login)
+            .map_err(|_| AppError::internal("failed to build login cookie header"))?,
     );
     Ok(response)
 }

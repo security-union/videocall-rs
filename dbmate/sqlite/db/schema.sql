@@ -5,7 +5,7 @@ CREATE TABLE oauth_requests (
     csrf_state TEXT UNIQUE,
     return_to TEXT,
     nonce TEXT
-);
+, created_at TEXT, browser_binding_hash TEXT);
 CREATE TABLE users (
     email TEXT PRIMARY KEY CHECK (length(email) <= 255),
     access_token TEXT,
@@ -86,7 +86,9 @@ CREATE TABLE devices (
     CHECK (idle_expires_at <= abs_expires_at)
 );
 CREATE INDEX idx_devices_user_live ON devices(user_id) WHERE revoked_at IS NULL;
+CREATE INDEX idx_oauth_requests_created_at ON oauth_requests(created_at);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20220807000000'),
-  ('20261125000000');
+  ('20261125000000'),
+  ('20261126000000');

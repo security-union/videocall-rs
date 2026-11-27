@@ -172,7 +172,9 @@ CREATE TABLE public.oauth_requests (
     pkce_verifier text,
     csrf_state text,
     return_to text,
-    nonce character varying(255)
+    nonce character varying(255),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    browser_binding_hash text
 );
 
 
@@ -405,6 +407,20 @@ CREATE INDEX idx_meetings_state ON public.meetings USING btree (state);
 
 
 --
+-- Name: idx_oauth_requests_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_oauth_requests_created_at ON public.oauth_requests USING btree (created_at);
+
+
+--
+-- Name: idx_oauth_requests_csrf_state; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_oauth_requests_csrf_state ON public.oauth_requests USING btree (csrf_state);
+
+
+--
 -- Name: idx_session_participants_active; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -464,4 +480,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260211000000'),
     ('20260302000000'),
     ('20260307000001'),
-    ('20261125000000');
+    ('20261125000000'),
+    ('20261126000000');

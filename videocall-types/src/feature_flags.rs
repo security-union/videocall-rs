@@ -16,11 +16,9 @@
 //! Flags are loaded lazily from environment variables on first access.
 //! Add new flags here as the project evolves.
 
+use crate::constants::{DATABASE_ENABLED, FEATURE_MEETING_MANAGEMENT};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
-
-/// Environment variable prefix for feature flags
-const ENV_PREFIX: &str = "FEATURE_";
 
 /// Override states for testing
 const OVERRIDE_NONE: u8 = 0;
@@ -46,8 +44,8 @@ impl FeatureFlags {
     /// Load feature flags from environment variables.
     fn from_env() -> Self {
         Self {
-            meeting_management: read_bool_env("MEETING_MANAGEMENT"),
-            database: read_bool_no_prefix("DATABASE_ENABLED"),
+            meeting_management: *FEATURE_MEETING_MANAGEMENT,
+            database: *DATABASE_ENABLED,
         }
     }
 
@@ -98,21 +96,10 @@ impl FeatureFlags {
     }
 }
 
-/// Read a boolean environment variable with the FEATURE_ prefix.
+/// Parse a flag's raw environment value.
 /// Returns false if not set or not a truthy value.
-fn read_bool_env(name: &str) -> bool {
-    let full_name = format!("{ENV_PREFIX}{name}");
-    std::env::var(&full_name)
-        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
-}
-
-/// Read a boolean environment variable without prefix (for legacy env vars like DATABASE_ENABLED).
-/// Returns false if not set or not a truthy value.
-fn read_bool_no_prefix(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
+pub(crate) fn parse_bool_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
 }
 
 #[cfg(test)]
@@ -120,47 +107,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_bool_env_not_set() {
-        // Ensure the env var is not set
-        std::env::remove_var("FEATURE_TEST_FLAG");
-        assert!(!read_bool_env("TEST_FLAG"));
+    fn test_parse_bool_flag_not_set() {
+        assert!(!parse_bool_flag(None));
     }
 
     #[test]
-    fn test_read_bool_env_truthy_values() {
-        std::env::set_var("FEATURE_TEST_TRUE", "true");
-        assert!(read_bool_env("TEST_TRUE"));
-
-        std::env::set_var("FEATURE_TEST_ONE", "1");
-        assert!(read_bool_env("TEST_ONE"));
-
-        std::env::set_var("FEATURE_TEST_YES", "yes");
-        assert!(read_bool_env("TEST_YES"));
-
-        std::env::set_var("FEATURE_TEST_TRUE_UPPER", "TRUE");
-        assert!(read_bool_env("TEST_TRUE_UPPER"));
-
-        // Cleanup
-        std::env::remove_var("FEATURE_TEST_TRUE");
-        std::env::remove_var("FEATURE_TEST_ONE");
-        std::env::remove_var("FEATURE_TEST_YES");
-        std::env::remove_var("FEATURE_TEST_TRUE_UPPER");
+    fn test_parse_bool_flag_truthy_values() {
+        assert!(parse_bool_flag(Some("true")));
+        assert!(parse_bool_flag(Some("1")));
+        assert!(parse_bool_flag(Some("yes")));
+        assert!(parse_bool_flag(Some("TRUE")));
     }
 
     #[test]
-    fn test_read_bool_env_falsy_values() {
-        std::env::set_var("FEATURE_TEST_FALSE", "false");
-        assert!(!read_bool_env("TEST_FALSE"));
-
-        std::env::set_var("FEATURE_TEST_ZERO", "0");
-        assert!(!read_bool_env("TEST_ZERO"));
-
-        std::env::set_var("FEATURE_TEST_RANDOM", "random");
-        assert!(!read_bool_env("TEST_RANDOM"));
-
-        // Cleanup
-        std::env::remove_var("FEATURE_TEST_FALSE");
-        std::env::remove_var("FEATURE_TEST_ZERO");
-        std::env::remove_var("FEATURE_TEST_RANDOM");
+    fn test_parse_bool_flag_falsy_values() {
+        assert!(!parse_bool_flag(Some("false")));
+        assert!(!parse_bool_flag(Some("0")));
+        assert!(!parse_bool_flag(Some("random")));
     }
 }

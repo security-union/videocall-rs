@@ -8590,6 +8590,7 @@ name = "videocall-types"
 version = "7.0.0"
 dependencies = [
  "anyhow",
+ "lazy_static",
  "protobuf",
  "serde",
  "serde_json",

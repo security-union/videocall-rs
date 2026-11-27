@@ -1,0 +1,71 @@
+name: macOS CLI Keychain
+
+# videocall-cli device key storage against the REAL macOS keychain: the happy
+# path and the fallback paths (keychain refuses on save, older keychain item,
+# logout while the keychain refuses). The backend is the mock from
+# nix/tests/mock-meeting-api.py; the scenarios are in
+# videocall-cli/tests/macos-keychain.sh.
+#
+# macOS minutes cost ten times Linux ones, so the paths are narrow and the
+# build is cached. The scenarios replace the default keychain, which is fine
+# on a throwaway runner and never to be run on a developer machine.
+on:
+  pull_request:
+    paths:
+      - 'videocall-cli/**'
+      - 'videocall-meeting-client/**'
+      - 'videocall-meeting-types/**'
+      - 'nix/tests/mock-meeting-api.py'
+      - '.github/workflows/macos-cli-keychain.yaml'
+
+jobs:
+  keychain:
+    name: videocall-cli keychain (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CLI: ${{ github.workspace }}/target/debug/videocall-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build videocall-cli
+        run: cargo build --locked -p videocall-cli
+
+      - name: Python for the mock backend
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet cryptography
+          echo "MOCK_PYTHON=$RUNNER_TEMP/venv/bin/python3" >> "$GITHUB_ENV"
+
+      # Started once and shared: starting it per scenario cost 35 s each.
+      - name: Start the mock backend
+        run: |
+          nohup "$RUNNER_TEMP/venv/bin/python3" nix/tests/mock-meeting-api.py 18081 \
+            > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for _ in $(seq 1 120); do
+            curl -sf --max-time 2 http://127.0.0.1:18081/version >/dev/null && exit 0
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/mock.log"; exit 1
+
+      - name: Keychain works, login and logout
+        run: videocall-cli/tests/macos-keychain.sh works
+
+      - name: Keychain refuses on save, key goes to a private file
+        run: videocall-cli/tests/macos-keychain.sh refuses-on-save
+
+      - name: Older keychain item, then a refusing keychain, the file wins
+        run: videocall-cli/tests/macos-keychain.sh older-item-then-refuse
+
+      - name: Logout while the keychain refuses
+        run: videocall-cli/tests/macos-keychain.sh logout-refused
+
+      # A locked keychain does not refuse, it blocks (measured on the runner).
+      # Informational: records whether the CLI errors or blocks.
+      - name: Locked keychain (informational)
+        continue-on-error: true
+        run: videocall-cli/tests/macos-keychain.sh locked

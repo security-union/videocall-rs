@@ -66,6 +66,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut opt = Opt::parse();
 
+    // Auth commands need no camera, so they skip the permission prompt.
+    if let Mode::Auth(auth) = &opt.mode {
+        return videocall_cli::auth::run(&auth.command).await;
+    }
+
     // if os is mac os we need to ask for permission for camera and microphone
     initialize().await;
 
@@ -86,13 +91,14 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 Some(_index) => {
-                    stream(s.clone()).await;
+                    stream(s.clone()).await?;
                 }
             }
         }
         Mode::Info(i) => {
             get_info(i).await?;
         }
+        Mode::Auth(_) => {}
     };
 
     Ok(())

@@ -18,6 +18,8 @@
 
 mod audio_producer;
 mod config;
+mod constants;
+mod token;
 mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
 mod webtransport_client;
@@ -26,6 +28,7 @@ use audio_producer::AudioProducer;
 use config::{BotConfig, ClientConfig};
 // Removed unused Arc import
 use std::time::Duration;
+use token::RoomTokenSigner;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{error, info, warn};
@@ -44,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = BotConfig::from_env_or_default()?;
     info!("Loaded configuration for {} clients", config.clients.len());
+
+    let signer = RoomTokenSigner::from_env()?;
 
     let server_url = config.server_url()?;
     let ramp_up_delay = Duration::from_millis(config.ramp_up_delay_ms.unwrap_or(1000));
@@ -64,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
         );
 
         let server_url_clone = server_url.clone();
+        let signer = signer.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_client(client_config, server_url_clone, insecure).await {
+            if let Err(e) = run_client(client_config, server_url_clone, insecure, signer).await {
                 error!("Client failed: {}", e);
             }
         });
@@ -97,12 +103,13 @@ async fn run_client(
     config: ClientConfig,
     server_url: url::Url,
     insecure: bool,
+    signer: RoomTokenSigner,
 ) -> anyhow::Result<()> {
     info!("Initializing client: {}", config.user_id);
 
     // Create WebTransport client and connect
     let mut client = WebTransportClient::new(config.clone());
-    client.connect(&server_url, insecure).await?;
+    client.connect(&server_url, insecure, &signer).await?;
 
     // Create packet channel for media producers
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);

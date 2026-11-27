@@ -20,24 +20,20 @@
 //! Verified scenarios:
 //! - Valid tokens issued by meeting-api allow connection via `GET /lobby?token=`
 //! - Expired / invalid / unauthorized tokens are rejected
-//! - The deprecated `GET /lobby/{email}/{room}` works only when FF=off
-//! - The deprecated endpoint returns 410 Gone when FF=on
+//! - A missing token is rejected
+//! - The removed `GET /lobby/{email}/{room}` form is refused (404)
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};
 use futures_util::StreamExt;
 use protobuf::Message as ProtoMessage;
 use sec_api::{
-    actors::chat_server::ChatServer,
-    lobby::{ws_connect, ws_connect_authenticated},
-    models::AppState,
-    server_diagnostics::ServerDiagnostics,
-    session_manager::SessionManager,
+    actors::chat_server::ChatServer, lobby::ws_connect_authenticated, models::AppState,
+    server_diagnostics::ServerDiagnostics, session_manager::SessionManager,
 };
 use serial_test::serial;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TOKEN_TTL_SECS: i64 = 60;
@@ -71,7 +67,6 @@ async fn start_real_ws_server(port: u16) {
             App::new()
                 .app_data(web::Data::new(state.clone()))
                 .service(ws_connect_authenticated)
-                .service(ws_connect)
         })
         .bind(format!("127.0.0.1:{port}"))
         .expect("Failed to bind JWT test server")
@@ -81,8 +76,19 @@ async fn start_real_ws_server(port: u16) {
 }
 
 async fn wait_for_server(port: u16) {
-    // Probe with the deprecated endpoint (FF is off during setup)
-    let url = format!("ws://127.0.0.1:{port}/lobby/probe/probe");
+    let token = meeting_api::token::generate_room_token(
+        JWT_SECRET,
+        TOKEN_TTL_SECS,
+        "probe",
+        "probe",
+        false,
+        "probe",
+    )
+    .expect("generate probe token");
+    let url = format!(
+        "ws://127.0.0.1:{port}/lobby?token={token}",
+        token = urlencoding::encode(&token)
+    );
     for _ in 0..50 {
         if tokio_tungstenite::connect_async(&url).await.is_ok() {
             return;
@@ -92,9 +98,7 @@ async fn wait_for_server(port: u16) {
     panic!("WS server not ready after 5 seconds on port {port}");
 }
 
-/// Ensure the server is started and the FF is off (clean slate).
 async fn setup(port: u16) {
-    FeatureFlags::clear_meeting_management_override();
     std::env::set_var("JWT_SECRET", JWT_SECRET);
     start_real_ws_server(port).await;
     wait_for_server(port).await;
@@ -123,16 +127,15 @@ async fn try_connect_with_token(
     }
 }
 
-/// Connect via the deprecated path-based endpoint: GET /lobby/{email}/{room}
-async fn try_connect_deprecated(
+/// Open a WebSocket to any path; the HTTP status if the upgrade is refused.
+async fn try_connect_raw(
     port: u16,
-    email: &str,
-    room: &str,
+    path_and_query: &str,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     u16,
 > {
-    let url = format!("ws://127.0.0.1:{port}/lobby/{email}/{room}");
+    let url = format!("ws://127.0.0.1:{port}{path_and_query}");
     match tokio_tungstenite::connect_async(&url).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
@@ -293,46 +296,34 @@ async fn test_token_identity_extracted_from_jwt() {
 }
 
 // =========================================================================
-// Tests: deprecated endpoint with REAL handlers
+// Tests: the unauthenticated forms are gone
 // =========================================================================
 
 #[actix_rt::test]
 #[serial]
-async fn test_deprecated_endpoint_works_when_ff_off() {
+async fn test_path_form_is_refused() {
     let port = JWT_PORT + 5;
     setup(port).await;
-    FeatureFlags::set_meeting_management_override(false);
 
-    let result = try_connect_deprecated(port, "alice", "jwt-room-6").await;
-    assert!(
-        result.is_ok(),
-        "deprecated endpoint with FF=off should allow connection"
+    let result = try_connect_raw(port, "/lobby/alice/jwt-room-6").await;
+    assert_eq!(
+        result.err(),
+        Some(404),
+        "the removed path form must not open a WebSocket"
     );
-
-    let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
-        .await
-        .expect("should receive MEETING_STARTED");
-    drop(ws);
-
-    FeatureFlags::clear_meeting_management_override();
 }
 
 #[actix_rt::test]
 #[serial]
-async fn test_deprecated_endpoint_returns_gone_when_ff_on() {
+async fn test_missing_token_is_refused() {
     let port = JWT_PORT + 6;
     setup(port).await;
-    FeatureFlags::set_meeting_management_override(true);
 
-    let result = try_connect_deprecated(port, "alice", "jwt-room-7").await;
-    assert!(
-        result.is_err(),
-        "deprecated endpoint with FF=on should return 410 Gone"
-    );
-    assert_eq!(result.unwrap_err(), 410);
-
-    FeatureFlags::clear_meeting_management_override();
+    // The query extractor answers 400 without `token`; an empty token fails validation (403).
+    for (path, status) in [("/lobby", 400), ("/lobby?token=", 403)] {
+        let result = try_connect_raw(port, path).await;
+        assert_eq!(result.err(), Some(status), "{path} must be refused");
+    }
 }
 
 // =========================================================================

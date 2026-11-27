@@ -251,6 +251,8 @@ env:
 
 **Redirect URL host:** `/login` sets a short-lived, host-only `<COOKIE_NAME>-login` cookie (`__Host-<COOKIE_NAME>-login` when `COOKIE_SECURE` is on), and the callback refuses the login without it. So `OAUTH_REDIRECT_URL` has to point at the same host that served `/login`.
 
+**CLI device login** uses the normal browser login, so nothing extra is registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to meeting-api's public origin to turn it on; the approval page is the app at the `AFTER_LOGIN_URL` origin.
+
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top
 2. If `OAUTH_ISSUER` is not set → `OAUTH_AUTH_URL` + `OAUTH_TOKEN_URL` must be set manually

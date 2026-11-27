@@ -37,25 +37,52 @@
 //! ```
 
 pub mod auth;
+pub mod device_browser;
+#[cfg(feature = "device-session")]
+pub mod device_session;
+pub mod devices;
 pub mod error;
 pub mod meetings;
 pub mod participants;
 pub mod waiting_room;
 
 pub use error::ApiError;
+/// Re-exported so callers build the `reqwest::Client` from the same version.
+pub use reqwest;
 pub use videocall_meeting_types;
+
+use std::sync::Arc;
 
 use reqwest::Client;
 
+/// Mints a fresh bearer token for each request. Implementations must never log the token.
+pub trait TokenSource: Send + Sync {
+    /// `None` sends the request without credentials, so it fails with 401.
+    fn token(&self) -> Option<String>;
+}
+
 /// How the client authenticates with the meeting API.
-#[derive(Debug, Clone)]
+/// `Debug` never prints the bearer token.
+#[derive(Clone)]
 pub enum AuthMode {
     /// Browser mode: send credentials (cookies) automatically via `fetch`.
     /// This is the mode used by `dioxus-ui` and other WASM frontends.
     Cookie,
     /// Bearer token mode: attach `Authorization: Bearer <token>` to every
-    /// request. Used by CLI tools, mobile apps, and integration tests.
+    /// request. Used by mobile apps and integration tests.
     Bearer(String),
+    /// Ask the [`TokenSource`] for a new token for every request.
+    Signed(Arc<dyn TokenSource>),
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Cookie => f.write_str("Cookie"),
+            AuthMode::Bearer(_) => f.write_str("Bearer([REDACTED])"),
+            AuthMode::Signed(_) => f.write_str("Signed([REDACTED])"),
+        }
+    }
 }
 
 /// A typed REST client for the videocall.rs meeting API.
@@ -77,10 +104,15 @@ impl MeetingApiClient {
     /// * `base_url` - e.g. `"http://localhost:8081"`
     /// * `auth` - how to authenticate requests
     pub fn new(base_url: &str, auth: AuthMode) -> Self {
+        Self::with_http(Client::new(), base_url, auth)
+    }
+
+    /// Create a client on a shared [`reqwest::Client`], reusing its connection pool.
+    pub fn with_http(http: Client, base_url: &str, auth: AuthMode) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
-            http: Client::new(),
+            http,
         }
     }
 
@@ -110,6 +142,11 @@ impl MeetingApiClient {
         self.apply_auth(self.http.patch(self.url(path)))
     }
 
+    #[cfg(feature = "device-session")]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -129,6 +166,12 @@ impl MeetingApiClient {
             AuthMode::Bearer(token) => {
                 builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             }
+            AuthMode::Signed(source) => match source.token() {
+                Some(token) => {
+                    builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                }
+                None => builder,
+            },
         }
     }
 }
@@ -190,5 +233,21 @@ pub(crate) async fn parse_status_only(response: reqwest::Response) -> Result<(),
             let text = response.text().await.unwrap_or_default();
             Err(ApiError::ServerError { status, body: text })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_bearer_token() {
+        let client = MeetingApiClient::new(
+            "http://localhost:8081",
+            AuthMode::Bearer("secret-jwt-value".to_string()),
+        );
+        let printed = format!("{client:?}");
+        assert!(!printed.contains("secret-jwt-value"), "{printed}");
+        assert!(printed.contains("Bearer([REDACTED])"));
     }
 }

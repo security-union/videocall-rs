@@ -6,6 +6,8 @@ use dioxus::prelude::*;
 use videocall_theme::Card;
 
 use crate::components::login::Login;
+use crate::pages::device_authorize::DeviceAuthorizePage;
+use crate::pages::devices::DevicesPage;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
 use crate::pages::meeting_settings::MeetingSettingsPage;
@@ -16,6 +18,10 @@ pub enum Route {
     Home {},
     #[route("/login")]
     Login {},
+    #[route("/devices", DevicesPage)]
+    Devices {},
+    #[route("/devices/authorize?:request", DeviceAuthorizePage)]
+    DeviceAuthorize { request: String },
     #[route("/meeting/:id/settings")]
     MeetingSettings { id: String },
     #[route("/meeting/:id", MeetingPage)]

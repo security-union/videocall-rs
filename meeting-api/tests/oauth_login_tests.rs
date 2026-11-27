@@ -39,8 +39,6 @@ use test_helpers::*;
 use tower::ServiceExt;
 use url::form_urlencoded;
 
-const TEST_UI_ORIGIN: &str = "http://localhost:3001";
-
 fn sha256_hex(value: &str) -> String {
     Sha256::digest(value.as_bytes())
         .iter()

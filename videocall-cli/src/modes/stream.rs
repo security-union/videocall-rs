@@ -17,6 +17,8 @@
  */
 
 use tokio::sync::mpsc::channel;
+use videocall_cli::auth::store::Store;
+use videocall_cli::auth::{ApiOrigin, Credentials};
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
 use videocall_cli::consumers::dead_synk::DeadSynk;
@@ -29,7 +31,7 @@ use videocall_cli::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
-pub async fn stream(opt: Stream) {
+pub async fn stream(opt: Stream) -> anyhow::Result<()> {
     // The CLI can only JOIN an existing call. The meeting must be created first
     // by a user from a browser at https://videocall.rs — the API no longer lets
     // the CLI create a call, so if nobody created it in the browser this stream
@@ -60,7 +62,6 @@ pub async fn stream(opt: Stream) {
     if !valid_framerates.contains(&framerate) {
         panic!("invalid framerate: {framerate}, we currently support only {valid_framerates:?}",);
     }
-    let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index.clone().unwrap();
     let send_test_pattern = opt.send_test_pattern;
     let audio_device = opt.audio_device.clone();
@@ -68,12 +69,17 @@ pub async fn stream(opt: Stream) {
     let bitrate_kbps = opt.bitrate_kbps;
     let cpu_used = opt.vp9_cpu_used;
     let frame_format = opt.frame_format;
-    let mut client: CameraSynks = if local_streaming {
-        CameraSynks::DeadSynk(DeadSynk::new(opt))
+    let (user_id, mut client) = if local_streaming {
+        let user_id = "offline-streaming-test".to_string();
+        (user_id, CameraSynks::DeadSynk(DeadSynk::new(opt)))
     } else {
-        CameraSynks::CameraSynk(Box::new(WebTransportClient::new(opt)))
+        let api = ApiOrigin::from_url(&opt.api.api_url)?;
+        let creds = Credentials::load(Store::open_default()?, api).await?;
+        let user_id = videocall_cli::room::join(&creds, &opt.meeting_id).await?;
+        let client = WebTransportClient::new(opt, creds, user_id.clone());
+        (user_id, CameraSynks::CameraSynk(Box::new(client)))
     };
-    client.connect().await.expect("failed to connect");
+    client.connect().await?;
     let camera_config = CameraConfig {
         width,
         height,
@@ -113,4 +119,5 @@ pub async fn stream(opt: Stream) {
             tracing::debug!("Packet sent successfully to WebTransport client");
         }
     }
+    Ok(())
 }

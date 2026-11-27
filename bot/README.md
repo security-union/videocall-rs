@@ -11,6 +11,10 @@ Enhanced bot that streams synthetic audio and video to videocall-rs for load tes
 - **Linear Ramp-up**: Configurable delay between client starts
 - **Multi-Client Support**: Run multiple synthetic clients per container
 
+## Authentication
+
+The relay only accepts `/lobby?token=<JWT>`. The bot signs its own room tokens with `JWT_SECRET` from the environment, so it only works against a deployment whose secret you hold, and it exits if the variable is missing.
+
 ## Configuration
 
 ### Option 1: YAML Configuration File (Recommended)

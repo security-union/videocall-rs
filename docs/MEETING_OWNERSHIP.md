@@ -92,23 +92,11 @@ videocall.rs is composed of two independent services that communicate through a 
 
 **Media Server** (existing WebSocket/WebTransport server):
 - Handles real-time audio/video/data transport
-- When `FEATURE_MEETING_MANAGEMENT=true`, validates room access tokens on every connection attempt
+- Validates the room access token on every connection attempt (`/lobby?token=<JWT>` is the only connection path)
 - Extracts identity, room, and permissions from the JWT claims
-- **Rejects connections without a valid, signed token** (when meeting management is enabled)
-- When `FEATURE_MEETING_MANAGEMENT=false` (default), allows connections without a token for backward compatibility
+- **Rejects connections without a valid, signed token**
 - Does not create, manage, or track meetings -- it is stateless with respect to meeting lifecycle
 - Relays media via NATS pub/sub
-
-### Feature Flag
-
-JWT validation on the Media Server is gated behind the `FEATURE_MEETING_MANAGEMENT` environment variable:
-
-| Value | Behavior |
-|-------|----------|
-| `true` | JWT validation is **enforced**. Connections without a valid token are rejected. |
-| `false` (default) | JWT validation is **disabled**. Connections are accepted without a token (backward compatible). |
-
-This allows the meeting management system to be deployed incrementally. Once the UI is updated to obtain and present tokens, the feature flag can be flipped to `true` to enforce token-based access.
 
 ### Local Development Setup
 
@@ -126,7 +114,7 @@ The UI's `apiBaseUrl` defaults to `http://localhost:8081` (the meeting-api). The
 
 Separating the Meeting Backend from the Media Server provides:
 
-- **Enforced access control**: When meeting management is enabled, a client cannot connect to a media session without first going through the Meeting Backend's admission flow. There is no way to bypass the waiting room.
+- **Enforced access control**: A client cannot connect to a media session without first going through the Meeting Backend's admission flow. There is no way to bypass the waiting room.
 - **Single source of truth**: All meeting state lives in the Meeting Backend's database. The Media Server does not maintain its own parallel participant tracking.
 - **Independent scaling**: The Meeting Backend (REST API + database) and Media Server (real-time transport) have different scaling characteristics and can be scaled independently.
 - **Clean separation of concerns**: Business logic (meetings, ownership, admission) is fully separated from transport logic (media relay, codecs, NATS).
@@ -145,6 +133,8 @@ The system uses two separate JWTs with different purposes and delivery mechanism
 |-------|---------|----------|----------|----------|
 | **Session JWT** | Authenticates user to the Meeting Backend | `Set-Cookie` (HttpOnly, Secure, SameSite=Lax) or `Authorization: Bearer` | Configurable (default: long-lived) | Yes (cookie) |
 | **Room Access JWT** | Authorizes room join on the Media Server | JSON response body | Configurable TTL (short) | N/A |
+
+`videocall-cli` uses a third kind, a **device JWT** signed by a per-machine key the user approved in the web app. It works only on get meeting, join and status, and never yields a host token. See [CLI Device Authentication](MEETING_API.md#cli-device-authentication).
 
 ### Session JWT Claims
 
@@ -208,6 +198,7 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `OAUTH_USERINFO_URL` | No | -- | UserInfo endpoint fallback when ID token lacks email |
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated OAuth scopes |
 | `AFTER_LOGIN_URL` | No | `/` | Redirect target after successful OAuth login |
+| `DEVICE_TOKEN_AUDIENCE` | No | -- | meeting-api's public origin (e.g. `https://api.videocall.rs`); `aud` of device JWTs. Unset disables CLI device login |
 
 ---
 
@@ -309,18 +300,6 @@ The Media Server validates:
 4. Issuer matches `videocall-meeting-backend`
 
 Invalid, expired, or unauthorized tokens are rejected with HTTP 401.
-
-**Deprecated (path-based, unauthenticated)**:
-```
-GET /lobby/{email}/{room}
-```
-
-> **Deprecated**: This endpoint exists only for backward compatibility when `FEATURE_MEETING_MANAGEMENT=false`. When `FEATURE_MEETING_MANAGEMENT=true`, it returns **HTTP 410 Gone**. Clients should migrate to the token-based endpoint.
-
-- **WebSocket**: `ws://host:8080/lobby/{email}/{room}`
-- **WebTransport**: `https://host:4433/lobby/{email}/{room}`
-
-No authentication is performed. The email and room are taken directly from the URL path.
 
 ---
 

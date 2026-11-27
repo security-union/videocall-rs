@@ -31,7 +31,7 @@ use url::Url;
 
 use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
 
-use crate::auth::{cookie_value, AuthUser};
+use crate::auth::{extract_cookie_token, AuthUser};
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
@@ -161,7 +161,7 @@ pub async fn login(
     // valid one keeps it, so a login started in a second tab does not break
     // one still running in the first.
     let login_cookie = login_cookie_name(&state);
-    let binding = cookie_value(&headers, &login_cookie)
+    let binding = extract_cookie_token(&headers, &login_cookie)
         .filter(|value| is_valid_binding(value))
         .unwrap_or_else(|| CsrfToken::new_random_len(32).secret().clone());
 
@@ -229,7 +229,7 @@ pub async fn callback(
     // state. Rows stored before the binding existed carry no hash and are
     // accepted for their remaining TTL only.
     if let Some(expected) = oauth_req.browser_binding_hash.as_deref() {
-        let presented = cookie_value(&headers, &login_cookie_name(&state))
+        let presented = extract_cookie_token(&headers, &login_cookie_name(&state))
             .map(|value| sha256_hex(&value))
             .unwrap_or_default();
         if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {

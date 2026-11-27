@@ -31,14 +31,15 @@ const LINK_CLASS: &str =
 // same room, so the SSR markup carries an obvious placeholder to swap out.
 const PLACEHOLDER_MEETING_ID: &str = "your-meeting-id";
 
-/// Builds the TRY rung's two-line terminal block for a given meeting id.
+/// Builds the TRY rung's three-line terminal block for a given meeting id.
 /// Declared once so the visible `<pre>`, the clipboard payload, and the fallback
 /// render can never drift apart. Verified against the repo: `cargo install` +
 /// `videocall-cli stream` from the README Usage section.
 fn try_command(meeting_id: &str) -> String {
     format!(
         "cargo install videocall-cli\n\
-         videocall-cli stream --user-id cam-01 --meeting-id {meeting_id} --video-device-index 0"
+         videocall-cli auth login\n\
+         videocall-cli stream --meeting-id {meeting_id} --video-device-index 0"
     )
 }
 
@@ -253,8 +254,8 @@ fn TryRow() -> impl IntoView {
                     <span class="section-index" aria-hidden="true">"01"</span>
                     <span class="section-index text-fg" aria-hidden="true">"TRY"</span>
                 </div>
-                <h3 class="text-h3 text-fg mt-3">"Stream a camera in two commands"</h3>
-                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No browser, no build — just a camera and a meeting id."</p>
+                <h3 class="text-h3 text-fg mt-3">"Stream a camera in three commands"</h3>
+                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. Each robot gets its own key, made on the machine and never copied off it. You approve it once from your laptop or phone, even over SSH with auth login --remote. Every machine shows up at app.videocall.rs/devices, and you can revoke one without touching the rest."</p>
             </div>
             <div class="md:col-span-8 lg:col-span-9">
                 <div class="relative">
@@ -274,12 +275,12 @@ fn TryRow() -> impl IntoView {
                         Some(id) => view! {
                             "Then open "
                             <a href=format!("https://app.videocall.rs/meeting/{id}") class=LINK_CLASS>{format!("app.videocall.rs/meeting/{id}")}</a>
-                            " in any browser. Same meeting id, so the Pi's camera and your browser land in the same call — and the id is fresh on every visit, so you get a private room."
+                            " in any browser to create the meeting, then run the command. Same meeting id, so the Pi's camera and your browser land in the same call."
                         }.into_any(),
                         None => view! {
                             "Then open "
                             <a href="https://app.videocall.rs" class=LINK_CLASS>"app.videocall.rs"</a>
-                            " in any browser and pick any meeting id — swap it in for "
+                            " in any browser, create a meeting, and swap its id in for "
                             <span class="font-mono text-fg">{PLACEHOLDER_MEETING_ID}</span>
                             " in the command above so the Pi's camera and your browser land in the same call."
                         }.into_any(),

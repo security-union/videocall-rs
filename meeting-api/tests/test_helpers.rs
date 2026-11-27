@@ -15,13 +15,20 @@
 
 #![allow(dead_code)]
 
+use axum::body::Body;
 use axum::http;
 use axum::response::Response;
 use axum::Router;
+use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
-use meeting_api::db::DbPool;
+use meeting_api::config::DeviceAuthConfig;
+use meeting_api::db::{self, DbPool};
 use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
+use tower::ServiceExt;
+use videocall_meeting_types::device::crypto::{self, DeviceKey};
+use videocall_meeting_types::device::{DeviceTokenClaims, CLI_ISSUER};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -51,15 +58,8 @@ pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
         .await;
 }
 
-/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
-pub fn build_app(pool: DbPool) -> Router {
-    build_app_with_state(build_state(pool))
-}
-
-/// Build the router from an explicit state (e.g. with OAuth configured).
-pub fn build_app_with_state(state: AppState) -> Router {
-    routes::router().with_state(state)
-}
+pub const TEST_UI_ORIGIN: &str = "http://localhost:3001";
+pub const TEST_DEVICE_AUDIENCE: &str = "http://localhost:8081";
 
 /// The test `AppState` backed by the given pool (no OAuth).
 pub fn build_state(pool: DbPool) -> AppState {
@@ -76,7 +76,22 @@ pub fn build_state(pool: DbPool) -> AppState {
         nats: None,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
+        device: DeviceAuthConfig {
+            audience: Some(TEST_DEVICE_AUDIENCE.to_string()),
+            ui_origin: Some(TEST_UI_ORIGIN.to_string()),
+            browser_origins: vec![TEST_UI_ORIGIN.to_string()],
+        },
     }
+}
+
+/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
+pub fn build_app(pool: DbPool) -> Router {
+    build_app_with_state(build_state(pool))
+}
+
+/// Build the router from an explicit state (e.g. with OAuth configured).
+pub fn build_app_with_state(state: AppState) -> Router {
+    routes::router().with_state(state)
 }
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.
@@ -101,4 +116,132 @@ pub async fn response_json<T: DeserializeOwned>(resp: Response) -> T {
         .expect("collect body")
         .to_bytes();
     serde_json::from_slice(&bytes).expect("deserialize response body")
+}
+
+pub async fn send(state: &AppState, req: http::Request<Body>) -> Response {
+    routes::router()
+        .with_state(state.clone())
+        .oneshot(req)
+        .await
+        .expect("oneshot")
+}
+
+pub fn bearer(method: &str, uri: &str, token: &str) -> http::request::Builder {
+    http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+}
+
+pub fn unique_user() -> String {
+    format!(
+        "dev-{}@test.local",
+        crypto::random_b64url(16).unwrap().to_lowercase()
+    )
+}
+
+pub fn new_key() -> DeviceKey {
+    DeviceKey::generate().expect("key")
+}
+
+pub fn sign_eddsa<T: Serialize>(key: &DeviceKey, kid: Option<&str>, claims: &T) -> String {
+    key.sign_claims(kid, claims).expect("sign")
+}
+
+pub fn device_claims(sub: &str, aud: &str, iat: i64, exp: i64) -> DeviceTokenClaims {
+    DeviceTokenClaims {
+        iss: CLI_ISSUER.to_string(),
+        sub: sub.to_string(),
+        aud: aud.to_string(),
+        iat,
+        exp,
+        jti: crypto::random_b64url(16).unwrap(),
+    }
+}
+
+pub fn device_jwt(key: &DeviceKey, device_id: &str) -> String {
+    let now = Utc::now().timestamp();
+    let claims = device_claims(device_id, TEST_DEVICE_AUDIENCE, now, now + 120);
+    sign_eddsa(key, Some(device_id), &claims)
+}
+
+pub struct TestDevice {
+    pub id: String,
+    pub key: DeviceKey,
+    pub user_id: String,
+}
+
+impl TestDevice {
+    pub fn token(&self) -> String {
+        device_jwt(&self.key, &self.id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Fixture {
+    Live,
+    /// Live, last used two hours ago (due for a touch).
+    Stale,
+    Revoked,
+    IdleExpired,
+}
+
+/// Insert a device directly, skipping the sign-in flow.
+pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> TestDevice {
+    let key = new_key();
+    let id = crypto::random_b64url(16).unwrap();
+    let now = Utc::now();
+    let day = Duration::days(1);
+    let (last_used, idle, abs) = match fixture {
+        Fixture::Live | Fixture::Revoked => (now, now + day * 90, now + day * 365),
+        Fixture::Stale => {
+            let used = now - Duration::hours(2);
+            (used, used + day * 90, now + day * 365)
+        }
+        Fixture::IdleExpired => (now - day * 91, now - day, now + day * 200),
+    };
+    let device = db::devices::NewDevice {
+        id: &id,
+        public_key: &key.public_key_b64(),
+        fingerprint: &key.fingerprint(),
+        name: "fixture",
+        user_id,
+        user_name: &format!("Name of {user_id}"),
+        now: last_used,
+        idle_expires_at: idle,
+        abs_expires_at: abs,
+    };
+    let inserted = db::devices::insert_device_capped(pool, &device, i64::MAX)
+        .await
+        .expect("insert device");
+    assert_eq!(inserted, db::devices::CappedInsert::Inserted);
+    if matches!(fixture, Fixture::Revoked) {
+        assert!(db::devices::revoke(pool, &id, user_id, "user", now)
+            .await
+            .unwrap());
+    }
+    TestDevice {
+        id,
+        key,
+        user_id: user_id.to_string(),
+    }
+}
+
+pub async fn codes_of(pool: &DbPool, user: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM device_auth_codes WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+pub async fn delete_device_data(pool: &DbPool, users: &[&str]) {
+    for user in users {
+        for table in ["devices", "device_auth_codes"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+    }
 }

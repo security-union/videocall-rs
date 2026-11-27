@@ -33,7 +33,7 @@ use sec_api::{
         AuthRequest,
     },
     db::{get_pool, PostgresPool},
-    lobby::{ws_connect, ws_connect_authenticated},
+    lobby::ws_connect_authenticated,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
@@ -326,7 +326,6 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-                .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
@@ -354,7 +353,6 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-                .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
         } else {
             // OAuth configured but database disabled - skip OAuth routes
@@ -371,7 +369,6 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-                .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
         }
     })

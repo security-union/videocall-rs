@@ -13,6 +13,7 @@
 
 //! Application configuration loaded from environment variables.
 
+use crate::constants::{AFTER_LOGIN_URL, DEVICE_TOKEN_AUDIENCE};
 use std::env;
 
 /// Configuration for the Meeting Backend API.
@@ -50,6 +51,40 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    pub device: DeviceAuthConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeviceAuthConfig {
+    /// `DEVICE_TOKEN_AUDIENCE`, the `aud` of every device JWT; `None` disables device auth.
+    pub audience: Option<String>,
+    /// Origin of `AFTER_LOGIN_URL`; read directly so device login doesn't need OAuth.
+    pub ui_origin: Option<String>,
+    /// `CORS_ALLOWED_ORIGIN` plus `ui_origin`, compared as exact strings.
+    pub browser_origins: Vec<String>,
+}
+
+impl DeviceAuthConfig {
+    pub fn from_env(cors_allowed_origin: &[String]) -> Result<Self, String> {
+        let audience = DEVICE_TOKEN_AUDIENCE
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .map(|s| {
+                parse_origin(s.trim())
+                    .ok_or_else(|| format!("DEVICE_TOKEN_AUDIENCE is not an http(s) origin: {s}"))
+            })
+            .transpose()?;
+        let ui_origin = AFTER_LOGIN_URL
+            .clone()
+            .and_then(|url| parse_origin(url.trim()));
+        let mut browser_origins = cors_allowed_origin.to_vec();
+        browser_origins.extend(ui_origin.clone());
+        Ok(Self {
+            audience,
+            ui_origin,
+            browser_origins,
+        })
+    }
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -120,7 +155,7 @@ impl Config {
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
+        let cors_allowed_origin: Vec<String> = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
@@ -206,6 +241,8 @@ impl Config {
             })
             .transpose()?;
 
+        let device = DeviceAuthConfig::from_env(&cors_allowed_origin)?;
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -219,6 +256,7 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            device,
         })
     }
 
@@ -266,5 +304,37 @@ impl Config {
         );
 
         Ok(())
+    }
+}
+
+/// The ASCII origin of an absolute http(s) URL.
+pub fn parse_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::parse_origin;
+
+    #[test]
+    fn parse_origin_normalizes() {
+        assert_eq!(
+            parse_origin("https://api.videocall.rs/").as_deref(),
+            Some("https://api.videocall.rs")
+        );
+        assert_eq!(
+            parse_origin("http://localhost:8081").as_deref(),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            parse_origin("https://api.videocall.rs:443").as_deref(),
+            Some("https://api.videocall.rs")
+        );
+        assert_eq!(parse_origin("ftp://x"), None);
+        assert_eq!(parse_origin("not a url"), None);
     }
 }

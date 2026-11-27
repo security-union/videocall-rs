@@ -56,8 +56,39 @@ pub async fn upsert_host(
         .await
 }
 
+/// Admit the meeting creator joining through the CLI. Unlike [`upsert_host`], never grants
+/// host: an existing row keeps its `is_host` and `display_name`.
+pub async fn upsert_creator_via_cli(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<ParticipantRow, sqlx::Error> {
+    let query = format!(
+        r#"
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', FALSE, $3, {SQL_NOW})
+        ON CONFLICT (meeting_id, user_id)
+        DO UPDATE SET status = 'admitted',
+                      admitted_at = COALESCE(meeting_participants.admitted_at, {SQL_NOW}),
+                      left_at = NULL,
+                      updated_at = {SQL_NOW},
+                      display_name = COALESCE(meeting_participants.display_name, $3)
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .bind(display_name)
+        .fetch_one(pool)
+        .await
+}
+
 /// Atomically join a meeting as an attendee, respecting the current
 /// `waiting_room_enabled` setting.
+///
+/// `keep_stored_name` (CLI): keep a stored display name, only fill an empty one.
 ///
 /// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where
 /// `auto_admitted` is `true` when the participant was immediately admitted
@@ -74,8 +105,10 @@ pub async fn join_attendee(
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
+    keep_stored_name: bool,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
-    with_busy_retry(|| join_attendee_tx(pool, meeting_id, user_id, display_name)).await
+    with_busy_retry(|| join_attendee_tx(pool, meeting_id, user_id, display_name, keep_stored_name))
+        .await
 }
 
 async fn join_attendee_tx(
@@ -83,7 +116,13 @@ async fn join_attendee_tx(
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
+    keep_stored_name: bool,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    let name_update = if keep_stored_name {
+        "COALESCE(meeting_participants.display_name, $3)"
+    } else {
+        "COALESCE($3, meeting_participants.display_name)"
+    };
     let mut tx = begin_write_tx(pool).await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
@@ -102,7 +141,7 @@ async fn join_attendee_tx(
             VALUES ($1, $2, 'waiting', FALSE, $3)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL, updated_at = {SQL_NOW},
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = {name_update}
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );
@@ -120,7 +159,7 @@ async fn join_attendee_tx(
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = {SQL_NOW}, left_at = NULL,
                           updated_at = {SQL_NOW},
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = {name_update}
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );

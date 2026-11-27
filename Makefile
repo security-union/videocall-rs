@@ -203,7 +203,7 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1 && \
 		cargo test -p videocall-meeting-types && \
-		cargo test -p videocall-meeting-types --features device-crypto && \
+		cargo test -p videocall-meeting-types --features device-crypto,room-token && \
 		cargo test -p videocall-meeting-client --features device-session && \
 		cargo test -p videocall-cli --lib auth::"
 

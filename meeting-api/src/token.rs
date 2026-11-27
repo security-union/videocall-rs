@@ -101,7 +101,8 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
 // Room access token
 // ---------------------------------------------------------------------------
 
-/// Sign a room access token for the given participant.
+/// Sign a room access token for the given participant; see
+/// [`videocall_meeting_types::token::generate_room_token`].
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,
@@ -110,22 +111,13 @@ pub fn generate_room_token(
     is_host: bool,
     display_name: &str,
 ) -> Result<String, AppError> {
-    let now = Utc::now().timestamp();
-    let claims = RoomAccessTokenClaims {
-        sub: user_id.to_string(),
-        room: room.to_string(),
-        room_join: true,
+    videocall_meeting_types::token::generate_room_token(
+        secret,
+        ttl_secs,
+        user_id,
+        room,
         is_host,
-        display_name: display_name.to_string(),
-        observer: false,
-        exp: now + ttl_secs,
-        iss: RoomAccessTokenClaims::ISSUER.to_string(),
-    };
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        display_name,
     )
     .map_err(|e| {
         tracing::error!("Failed to sign JWT: {e}");
@@ -173,8 +165,6 @@ pub fn generate_observer_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{decode, DecodingKey, Validation};
-    use videocall_meeting_types::RoomAccessTokenClaims;
 
     const TEST_SECRET: &str = "super-secret-test-key";
 
@@ -217,83 +207,5 @@ mod tests {
         let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
         assert!(claims.iat >= before);
         assert!(claims.iat <= after);
-    }
-
-    // -----------------------------------------------------------------------
-    // Room access token tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn token_round_trips_with_correct_claims() {
-        let token =
-            generate_room_token(TEST_SECRET, 600, "user@test.com", "room-42", true, "Alice")
-                .expect("should sign");
-
-        let mut validation = Validation::default();
-        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
-        let data = decode::<RoomAccessTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
-            &validation,
-        )
-        .expect("should decode");
-
-        assert_eq!(data.claims.sub, "user@test.com");
-        assert_eq!(data.claims.room, "room-42");
-        assert!(data.claims.is_host);
-        assert_eq!(data.claims.display_name, "Alice");
-        assert!(data.claims.room_join);
-    }
-
-    #[test]
-    fn issuer_is_videocall_meeting_backend() {
-        let token = generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob")
-            .expect("should sign");
-
-        let mut validation = Validation::default();
-        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
-        let data = decode::<RoomAccessTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
-            &validation,
-        )
-        .expect("should decode");
-
-        assert_eq!(data.claims.iss, "videocall-meeting-backend");
-    }
-
-    #[test]
-    fn exp_is_now_plus_ttl() {
-        let ttl = 900_i64;
-        let before = Utc::now().timestamp();
-        let token =
-            generate_room_token(TEST_SECRET, ttl, "a@b.com", "r", false, "X").expect("should sign");
-        let after = Utc::now().timestamp();
-
-        // Decode without signature or expiry validation to inspect the raw
-        // `exp` claim. v10 replaced `Validation::insecure_disable_signature_validation`
-        // with the explicit `dangerous::insecure_decode` entry point.
-        let data = jsonwebtoken::dangerous::insecure_decode::<RoomAccessTokenClaims>(&token)
-            .expect("should decode");
-
-        assert!(data.claims.exp >= before + ttl);
-        assert!(data.claims.exp <= after + ttl);
-    }
-
-    #[test]
-    fn room_join_is_always_true() {
-        let token =
-            generate_room_token(TEST_SECRET, 60, "a@b.com", "r", false, "X").expect("should sign");
-
-        let mut validation = Validation::default();
-        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
-        let data = decode::<RoomAccessTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
-            &validation,
-        )
-        .expect("should decode");
-
-        assert!(data.claims.room_join);
     }
 }

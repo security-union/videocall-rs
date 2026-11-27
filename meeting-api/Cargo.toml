@@ -23,7 +23,7 @@ postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 
 [dependencies]
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0", features = ["device-crypto"] }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0", features = ["device-crypto", "room-token"] }
 videocall-types = { path = "../videocall-types", version = "7.0.0" }
 
 async-nats = "0.50.0"

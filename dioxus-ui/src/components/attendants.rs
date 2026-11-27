@@ -1019,14 +1019,6 @@ pub fn AttendantsComponent(
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
     let display_peers = client.sorted_peer_keys();
-    let peers_for_display: Vec<String> = display_peers
-        .iter()
-        .map(|session_id| {
-            client
-                .get_peer_user_id(session_id)
-                .unwrap_or_else(|| session_id.clone())
-        })
-        .collect();
     let num_display_peers = display_peers.len();
     let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
@@ -1622,7 +1614,9 @@ pub fn AttendantsComponent(
                     // PeerList's diagnostics task isn't aborted on unmount.
                     if peer_list_open() {
                         PeerList {
-                            peers: peers_for_display.clone(),
+                            // Session ids: one row per session, even when two
+                            // sessions share a user id (browser tab + CLI).
+                            peers: display_peers.clone(),
                             onclose: move |_| peer_list_open.set(false),
                             self_muted: !mic_enabled(),
                             self_speaking: local_speaking(),

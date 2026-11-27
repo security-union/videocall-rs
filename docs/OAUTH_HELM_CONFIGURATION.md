@@ -249,6 +249,8 @@ env:
 | `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |
 | `ALLOWED_REDIRECT_URLS` | No | — | Comma-separated list of additional allowed redirect origins (e.g. `https://app2.example.com`). The origin of `AFTER_LOGIN_URL` is implicitly allowed. |
 
+**CLI device login** uses the normal browser login, so nothing extra is registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to meeting-api's public origin to turn it on; the approval page is the app at the `AFTER_LOGIN_URL` origin.
+
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top
 2. If `OAUTH_ISSUER` is not set → `OAUTH_AUTH_URL` + `OAUTH_TOKEN_URL` must be set manually

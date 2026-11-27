@@ -13,18 +13,22 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod cli_login;
+pub mod devices_api;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
 pub mod waiting_room;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     routing::{delete, get, patch, post},
     Router,
 };
 
 use serde::{Deserialize, Serialize};
+
+use videocall_meeting_types::device as devices;
 
 use crate::state::AppState;
 
@@ -146,5 +150,25 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
+        )
+        .route(devices::CLI_AUTHORIZE_PATH, get(cli_login::authorize))
+        .route(
+            devices::DEVICES_PATH,
+            post(devices_api::register)
+                .layer(DefaultBodyLimit::max(devices_api::MAX_REGISTER_BODY))
+                .get(devices_api::list_devices),
+        )
+        .route(
+            devices::DEVICE_AUTHORIZATIONS_PATH,
+            post(devices_api::create_authorization)
+                .layer(DefaultBodyLimit::max(devices_api::MAX_REGISTER_BODY)),
+        )
+        .route(
+            devices::DEVICES_ME_PATH,
+            get(devices_api::me).delete(devices_api::revoke_me),
+        )
+        .route(
+            "/api/v1/devices/{device_id}",
+            delete(devices_api::revoke_device),
         )
 }

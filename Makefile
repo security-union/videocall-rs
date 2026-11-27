@@ -126,6 +126,7 @@ dev-meeting-api: ## Watch the meeting REST/auth API (:8081)
 	$(DEV_ENV) LISTEN_ADDR=0.0.0.0:8081 \
 	TOKEN_TTL_SECS=60 COOKIE_SECURE=false \
 	AFTER_LOGIN_URL=http://localhost:3001 ALLOWED_REDIRECT_URLS=http://localhost:3001 \
+	DEVICE_TOKEN_AUDIENCE=http://localhost:8081 \
 	cargo watch -x 'run --bin meeting-api'
 
 dev-metrics: ## Watch the client-metrics server (:9091)
@@ -200,7 +201,11 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		cargo clippy --workspace $(CLIPPY_EXCLUDES) -- -D warnings && \
 		cargo fmt --all --check && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
-		cargo test -p meeting-api -- --nocapture --test-threads=1"
+		cargo test -p meeting-api -- --nocapture --test-threads=1 && \
+		cargo test -p videocall-meeting-types && \
+		cargo test -p videocall-meeting-types --features device-crypto,room-token && \
+		cargo test -p videocall-meeting-client --features device-session && \
+		cargo test -p videocall-cli --lib auth::"
 
 check-backend-down: ensure-nix ## Stop the check-backend middleware and delete its state
 	-nix-shell default.nix -A shells.dev --run "process-compose down -p $(IT_PC_PORT)"

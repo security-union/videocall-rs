@@ -34,6 +34,52 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
+-- Name: device_auth_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.device_auth_codes (
+    code_hash text NOT NULL,
+    user_id text NOT NULL,
+    user_name text NOT NULL,
+    public_key text NOT NULL,
+    device_name text NOT NULL,
+    code_challenge text NOT NULL,
+    redirect_uri text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT device_auth_codes_code_challenge_check CHECK (((length(code_challenge) >= 43) AND (length(code_challenge) <= 128))),
+    CONSTRAINT device_auth_codes_code_hash_check CHECK ((length(code_hash) = 64)),
+    CONSTRAINT device_auth_codes_device_name_check CHECK (((length(device_name) >= 1) AND (length(device_name) <= 64))),
+    CONSTRAINT device_auth_codes_public_key_check CHECK ((length(public_key) = 43))
+);
+
+
+--
+-- Name: devices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.devices (
+    id text NOT NULL,
+    public_key text NOT NULL,
+    fingerprint text NOT NULL,
+    name text NOT NULL,
+    user_id text NOT NULL,
+    user_name text NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    last_used_at timestamp with time zone NOT NULL,
+    idle_expires_at timestamp with time zone NOT NULL,
+    abs_expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    revoked_reason text,
+    CONSTRAINT devices_check CHECK ((idle_expires_at <= abs_expires_at)),
+    CONSTRAINT devices_fingerprint_check CHECK ((length(fingerprint) = 19)),
+    CONSTRAINT devices_id_check CHECK ((length(id) = 22)),
+    CONSTRAINT devices_name_check CHECK (((length(name) >= 1) AND (length(name) <= 64))),
+    CONSTRAINT devices_public_key_check CHECK ((length(public_key) = 43)),
+    CONSTRAINT devices_revoked_reason_check CHECK (((revoked_reason IS NULL) OR (revoked_reason = ANY (ARRAY['user'::text, 'device'::text]))))
+);
+
+
+--
 -- Name: meeting_participants; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -209,6 +255,30 @@ ALTER TABLE ONLY public.session_participants ALTER COLUMN id SET DEFAULT nextval
 
 
 --
+-- Name: device_auth_codes device_auth_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.device_auth_codes
+    ADD CONSTRAINT device_auth_codes_pkey PRIMARY KEY (code_hash);
+
+
+--
+-- Name: devices devices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.devices
+    ADD CONSTRAINT devices_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: devices devices_public_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.devices
+    ADD CONSTRAINT devices_public_key_key UNIQUE (public_key);
+
+
+--
 -- Name: meeting_participants meeting_participants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -262,6 +332,27 @@ ALTER TABLE ONLY public.meeting_participants
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (email);
+
+
+--
+-- Name: idx_device_auth_codes_expires_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_device_auth_codes_expires_at ON public.device_auth_codes USING btree (expires_at);
+
+
+--
+-- Name: idx_device_auth_codes_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_device_auth_codes_user_id ON public.device_auth_codes USING btree (user_id);
+
+
+--
+-- Name: idx_devices_user_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_devices_user_live ON public.devices USING btree (user_id) WHERE (revoked_at IS NULL);
 
 
 --
@@ -372,4 +463,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260203000003'),
     ('20260211000000'),
     ('20260302000000'),
-    ('20260307000001');
+    ('20260307000001'),
+    ('20261125000000');

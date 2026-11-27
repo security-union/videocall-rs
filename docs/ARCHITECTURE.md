@@ -165,7 +165,7 @@ message MediaPacket {
 2. **Packet Wrapping**: The message is wrapped in a `PacketWrapper` with appropriate type 
 3. **Transport Layer**: The packet is sent via WebSocket or WebTransport to the server
 4. **Server Processing**: 
-   - The server extracts the room ID from the connection URL `lobby/{email}/{room}` 
+   - The server takes the room ID and identity from the room access token in the connection URL `/lobby?token=<JWT>`
 
 5. **NATS Subject Formation**:
    - Messages are published to subject: `room.{room_id}.{sender_id}`

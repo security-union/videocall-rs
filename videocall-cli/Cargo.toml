@@ -24,7 +24,7 @@ depends = "libc6 (>= 2.34), libasound2-dev (>=1.2.8), libv4l-dev (>=1.22.1), lib
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { version = "4.0.32", features = ["derive"] }
+clap = { version = "4.0.32", features = ["derive", "env"] }
 protobuf = "3.3.0"
 web-transport-quinn = { workspace = true }
 tokio = { version = "1.32.0", features = ["full"] }
@@ -39,6 +39,32 @@ image = "0.25.5"
 # libvpx backend is opt-in via the `libvpx` feature below.
 videocall-codecs = { path = "../videocall-codecs", version = "0.1.17" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.10", features = ["input-native", "output-threaded"] }
+# Device-key login (`videocall-cli auth ...`) and meeting join: all HTTP to
+# meeting-api goes through videocall-meeting-client.
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2", features = ["device-session"] }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+secrecy = "0.10"
+webbrowser = { version = "1", features = ["hardened"] }
+
+# geteuid() for the key file's ownership check.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# OS keychain on macOS and Windows. Linux uses the 0600 file: the Secret
+# Service backends need libdbus (breaks the Pi cross-build) or a desktop
+# session keyring (absent on headless machines).
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+httpdate = "1"
 
 
 [dependencies.videocall-types]

@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod device_auth;
 pub mod error;
 pub mod nats_events;
 pub mod oauth;

@@ -17,6 +17,7 @@
 //! and its consumers (clients, frontend, integration tests).
 //! It is intentionally framework-agnostic — no actix-web, no database types.
 
+pub mod device;
 pub mod error;
 pub mod requests;
 pub mod responses;

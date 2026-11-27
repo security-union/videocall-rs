@@ -32,6 +32,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::{ClientBuilder, Session};
 
 use crate::config::ClientConfig;
+use crate::token::RoomTokenSigner;
 
 pub struct WebTransportClient {
     config: ClientConfig,
@@ -48,7 +49,12 @@ impl WebTransportClient {
         }
     }
 
-    pub async fn connect(&mut self, server_url: &Url, insecure: bool) -> anyhow::Result<()> {
+    pub async fn connect(
+        &mut self,
+        server_url: &Url,
+        insecure: bool,
+        signer: &RoomTokenSigner,
+    ) -> anyhow::Result<()> {
         info!(
             "Connecting client {} to {}",
             self.config.user_id, server_url
@@ -64,16 +70,20 @@ impl WebTransportClient {
             ClientBuilder::new().with_system_roots()?
         };
 
-        // Construct full URL with lobby path
-        let full_url = format!(
-            "{}/lobby/{}/{}",
-            server_url.as_str().trim_end_matches('/'),
-            self.config.user_id,
-            self.config.meeting_id
-        );
-        let connection_url = Url::parse(&full_url)?;
+        let token = signer.mint(&self.config.user_id, &self.config.meeting_id)?;
+        let mut connection_url = Url::parse(&format!(
+            "{}/lobby",
+            server_url.as_str().trim_end_matches('/')
+        ))?;
+        connection_url
+            .query_pairs_mut()
+            .append_pair("token", &token);
 
-        info!("Connecting to {}", connection_url);
+        // Don't log `connection_url`: its query string is a bearer credential.
+        info!(
+            "Opening WebTransport session for {} in room {}",
+            self.config.user_id, self.config.meeting_id
+        );
         let session = client.connect(connection_url).await?;
         info!(
             "WebTransport session established for {}",

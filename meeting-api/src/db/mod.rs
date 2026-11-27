@@ -32,6 +32,8 @@ compile_error!(
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!("enable exactly one database backend feature: `postgres` or `sqlite`");
 
+pub mod device_codes;
+pub mod devices;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;

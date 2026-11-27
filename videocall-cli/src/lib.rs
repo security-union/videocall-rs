@@ -16,8 +16,10 @@
  * conditions.
  */
 
+pub mod auth;
 pub mod cli_args;
 pub mod consumers;
 
 pub mod producers;
+pub mod room;
 pub mod video_encoder;

@@ -38,6 +38,14 @@ pub enum ApiError {
     #[error("Server error ({status}): {body}")]
     ServerError { status: u16, body: String },
 
+    /// An error from the device endpoints in their `{"error","error_description"}` shape.
+    #[error("device API error ({status}): {error}")]
+    Device {
+        status: u16,
+        error: String,
+        error_description: String,
+    },
+
     /// A network or transport error.
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
@@ -45,4 +53,8 @@ pub enum ApiError {
     /// A configuration error (e.g. missing base URL).
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[cfg(feature = "device-session")]
+    #[error(transparent)]
+    Key(#[from] videocall_meeting_types::device::crypto::KeyError),
 }

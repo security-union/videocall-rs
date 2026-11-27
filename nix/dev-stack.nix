@@ -375,6 +375,7 @@ let
     export COOKIE_SECURE="''${COOKIE_SECURE:-false}"
     export AFTER_LOGIN_URL="''${AFTER_LOGIN_URL:-http://localhost:3001}"
     export ALLOWED_REDIRECT_URLS="''${ALLOWED_REDIRECT_URLS:-http://localhost:3001}"
+    export DEVICE_TOKEN_AUDIENCE="''${DEVICE_TOKEN_AUDIENCE:-http://localhost:8081}"
     # process-compose's own REST API defaults to :8080, which shadows the
     # websocket server on 127.0.0.1 — park it well out of the way.
     # PC_PORT_NUM is process-compose's native env knob; overridable so a
@@ -415,6 +416,7 @@ let
       export COOKIE_SECURE="''${COOKIE_SECURE:-false}"
       export AFTER_LOGIN_URL="''${AFTER_LOGIN_URL:-http://localhost:3001}"
       export ALLOWED_REDIRECT_URLS="''${ALLOWED_REDIRECT_URLS:-http://localhost:3001}"
+      export DEVICE_TOKEN_AUDIENCE="''${DEVICE_TOKEN_AUDIENCE:-http://localhost:8081}"
       export UI_ENDPOINT="''${UI_ENDPOINT:-http://localhost:3001}"
       export API_BASE_URL="''${API_BASE_URL:-http://localhost:8081}"
       export ACTIX_UI_BACKEND_URL="''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}"

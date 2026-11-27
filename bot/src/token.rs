@@ -41,7 +41,7 @@ impl RoomTokenSigner {
 
     /// Environment only, so the secret is never committed next to the client list.
     pub fn from_env() -> anyhow::Result<Self> {
-        let secret = std::env::var("JWT_SECRET").map_err(|_| {
+        let secret = crate::constants::JWT_SECRET.clone().ok_or_else(|| {
             anyhow!(
                 "JWT_SECRET is not set. The bot signs its own room tokens with the relay's secret."
             )

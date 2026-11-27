@@ -30,15 +30,6 @@ pub struct AppState {
     pub session_manager: SessionManager,
 }
 
-pub struct AppConfig {
-    pub oauth_client_id: String,
-    pub oauth_secret: String,
-    pub oauth_redirect_url: String,
-    pub oauth_auth_url: String,
-    pub oauth_token_url: String,
-    pub after_login_url: String,
-}
-
 /// Build NATS subject and queue name for room subscriptions
 /// Used by both WebSocket and WebTransport implementations
 pub fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {

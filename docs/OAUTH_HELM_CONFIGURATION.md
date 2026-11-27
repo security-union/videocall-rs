@@ -253,6 +253,8 @@ env:
 
 **CLI device login** uses the normal browser login, so nothing extra is registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to meeting-api's public origin to turn it on; the approval page is the app at the `AFTER_LOGIN_URL` origin.
 
+The WebSocket and WebTransport relays take no OAuth configuration. For authentication they only need `JWT_SECRET`, the same value meeting-api signs room access tokens with.
+
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top
 2. If `OAUTH_ISSUER` is not set → `OAUTH_AUTH_URL` + `OAUTH_TOKEN_URL` must be set manually

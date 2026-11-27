@@ -95,6 +95,7 @@ videocall.rs is composed of two independent services that communicate through a 
 - Validates the room access token on every connection attempt (`/lobby?token=<JWT>` is the only connection path)
 - Extracts identity, room, and permissions from the JWT claims
 - **Rejects connections without a valid, signed token**
+- Has no login routes of its own and reads no OAuth configuration; meeting-api owns login
 - Does not create, manage, or track meetings -- it is stateless with respect to meeting lifecycle
 - Relays media via NATS pub/sub
 

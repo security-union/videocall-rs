@@ -109,13 +109,11 @@ impl ScreenShareState {
 }
 
 /// Build the WebSocket and WebTransport lobby URLs for the media server.
-#[allow(unused_variables)]
-fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<String>) {
-    #[cfg(feature = "media-server-jwt-auth")]
+///
+/// The relays only accept `/lobby?token=<room JWT>`; identity and meeting
+/// come from the token's claims.
+fn build_lobby_urls(token: &str) -> (Vec<String>, Vec<String>) {
     let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
-
-    #[cfg(not(feature = "media-server-jwt-auth"))]
-    let lobby_url = |base: &str| format!("{base}/lobby/{user_id}/{id}");
 
     let websocket_urls = actix_websocket_base()
         .unwrap_or_default()
@@ -212,11 +210,9 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 /// Refreshes the room token, rebuilds lobby URLs, updates the client, and
 /// reconnects.  On failure it retries with increasing delay (1s → 2s → 4s →
 /// 8s → 16s cap) plus ±25% random jitter.  Gives up after 10 attempts.
-#[cfg(feature = "media-server-jwt-auth")]
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    current_display_name: Signal<String>,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -243,8 +239,7 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let latest_display_name = current_display_name();
-                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
+                    let (ws, wt) = build_lobby_urls(&new_token);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -261,7 +256,6 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        current_display_name,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -269,55 +263,6 @@ fn schedule_reconnect(
                 }
             }
         });
-    })
-    .forget();
-}
-
-/// Schedule a reconnection attempt with exponential backoff (non-JWT path).
-///
-/// Retries with increasing delay (1s → 2s → 4s → 8s → 16s cap) plus ±25%
-/// random jitter.  Gives up after 10 attempts.
-#[cfg(not(feature = "media-server-jwt-auth"))]
-fn schedule_reconnect_no_jwt(
-    client_cell: Rc<RefCell<Option<VideoCallClient>>>,
-    mut connection_error: Signal<Option<String>>,
-    attempt: u32,
-) {
-    let delay_ms = match reconnect_delay_ms(attempt) {
-        Some(d) => d,
-        None => {
-            connection_error.set(Some(
-                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
-            ));
-            return;
-        }
-    };
-
-    log::info!(
-        "Scheduling reconnect attempt {}/{} in {}ms",
-        attempt + 1,
-        MAX_RECONNECT_ATTEMPTS,
-        delay_ms
-    );
-
-    Timeout::new(delay_ms, move || {
-        let reconnect_needed = {
-            if let Some(client) = client_cell.borrow_mut().as_mut() {
-                if let Err(e) = client.connect() {
-                    log::error!("Reconnection failed: {e:?}");
-                    true
-                } else {
-                    connection_error.set(None);
-                    false
-                }
-            } else {
-                true
-            }
-        };
-
-        if reconnect_needed {
-            schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
-        }
     })
     .forget();
 }
@@ -556,21 +501,14 @@ pub fn AttendantsComponent(
     // callback can access the client for reconnection. The cell is populated
     // right after VideoCallClient::new().
     let client = use_hook(|| {
-        #[cfg(feature = "media-server-jwt-auth")]
         let token = {
             let t = room_token.clone();
-            assert!(
-                !t.is_empty(),
-                "media-server-jwt-auth is enabled but room_token is empty"
-            );
+            assert!(!t.is_empty(), "room_token is empty");
             t
         };
-        #[cfg(not(feature = "media-server-jwt-auth"))]
-        let token = String::new();
 
         let initial_display_name = current_display_name();
-        let (websocket_urls, webtransport_urls) =
-            build_lobby_urls(&token, &initial_display_name, &id);
+        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
@@ -609,26 +547,13 @@ pub fn AttendantsComponent(
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
 
-                    #[cfg(feature = "media-server-jwt-auth")]
-                    {
-                        let client_cell = client_cell.clone();
-                        let meeting_id = id.clone();
-                        let current_display_name = current_display_name;
-                        schedule_reconnect(
-                            client_cell,
-                            meeting_id,
-                            current_display_name,
-                            connection_error,
-                            meeting_ended_message,
-                            0,
-                        );
-                    }
-
-                    #[cfg(not(feature = "media-server-jwt-auth"))]
-                    {
-                        let client_cell = client_cell.clone();
-                        schedule_reconnect_no_jwt(client_cell, connection_error, 0);
-                    }
+                    schedule_reconnect(
+                        client_cell.clone(),
+                        id.clone(),
+                        connection_error,
+                        meeting_ended_message,
+                        0,
+                    );
                 })
             },
             on_peer_added: VcCallback::from(move |session_id: String| {

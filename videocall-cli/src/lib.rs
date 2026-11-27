@@ -18,6 +18,7 @@
 
 pub mod auth;
 pub mod cli_args;
+pub mod constants;
 pub mod consumers;
 
 pub mod producers;

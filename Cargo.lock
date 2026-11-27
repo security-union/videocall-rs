@@ -8331,6 +8331,7 @@ dependencies = [
  "httpdate",
  "image 0.25.9",
  "keyring",
+ "lazy_static",
  "libc",
  "protobuf",
  "ropus",

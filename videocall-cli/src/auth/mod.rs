@@ -44,6 +44,7 @@ use videocall_meeting_types::device::{
 };
 
 use crate::cli_args::{AuthCommand, LoginArgs};
+use crate::constants::{env_lookup, COMPUTERNAME, HOSTNAME};
 use loopback::{LoopbackError, LoopbackServer, LOGIN_TIMEOUT};
 use store::{Store, StoreError, StoredDevice};
 
@@ -178,9 +179,7 @@ pub(crate) fn device_name(requested: Option<&str>, hostname: &str) -> Result<Str
 }
 
 fn hostname() -> String {
-    let from_env = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .ok();
+    let from_env = HOSTNAME.clone().or_else(|| COMPUTERNAME.clone());
     from_env
         .or_else(|| {
             String::from_utf8(std::process::Command::new("hostname").output().ok()?.stdout).ok()
@@ -289,8 +288,7 @@ pub async fn run(command: &AuthCommand) -> anyhow::Result<()> {
 async fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), AuthError> {
     let api = ApiOrigin::from_url(&args.api.api_url)?;
     let name = device_name(args.name.as_deref(), hostname().trim())?;
-    let remote =
-        args.remote || !browser_expected(|key| std::env::var(key).ok(), std::env::consts::OS);
+    let remote = args.remote || !browser_expected(env_lookup, std::env::consts::OS);
     if remote && !args.remote {
         println!("No browser here, so logging in with --remote.");
     }

@@ -128,7 +128,7 @@ impl Store {
     pub fn open_default() -> Result<Self, StoreError> {
         #[allow(deprecated)] // `home_dir` is correct on every platform we ship.
         let home = std::env::home_dir();
-        let dir = config_dir_from(|key| std::env::var(key).ok(), home, cfg!(windows))
+        let dir = config_dir_from(crate::constants::env_lookup, home, cfg!(windows))
             .ok_or(StoreError::NoConfigDir)?;
         Ok(Self::with_dir(dir, true))
     }

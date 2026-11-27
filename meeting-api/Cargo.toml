@@ -28,7 +28,7 @@ videocall-types = { path = "../videocall-types", version = "7.0.0" }
 
 async-nats = "0.50.0"
 protobuf = "3.3.0"
-lazy_static = "1.4.0"
+lazy_static = { workspace = true }
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

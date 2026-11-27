@@ -46,7 +46,7 @@ videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 secrecy = "0.10"
-lazy_static = "1.4.0"
+lazy_static = { workspace = true }
 webbrowser = { version = "1", features = ["hardened"] }
 
 # geteuid() for the key file's ownership check.

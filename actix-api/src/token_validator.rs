@@ -15,8 +15,8 @@
 //!
 //! Validates tokens issued by the Meeting Backend (meeting-api) before allowing
 //! a client to connect to the Media Server. Mirrors the approach used by LiveKit:
-//! parse JWT, verify HMAC signature, check `room_join == true`, and ensure the
-//! room and identity match the connection request.
+//! parse JWT, verify HMAC signature, check `room_join == true` (or `observer`),
+//! and take identity and room from the claims.
 
 use jsonwebtoken::{DecodingKey, Validation};
 use regex::Regex;
@@ -34,7 +34,7 @@ lazy_static::lazy_static! {
 /// Errors that can occur during room token validation.
 #[derive(Debug)]
 pub enum TokenError {
-    /// No token was provided but one is required (FF=on).
+    /// No token was provided. Every connection needs one.
     Missing,
     /// Token could not be decoded or signature is invalid.
     Invalid(String),
@@ -42,16 +42,6 @@ pub enum TokenError {
     Expired,
     /// The `room_join` claim is `false`; participant is not authorized to join.
     RoomJoinDenied,
-    /// The `room` claim does not match the room in the connection URL.
-    RoomMismatch {
-        token_room: String,
-        requested_room: String,
-    },
-    /// The `sub` claim does not match the user ID/identity in the connection URL.
-    IdentityMismatch {
-        token_identity: String,
-        requested_identity: String,
-    },
     /// A claim value contains characters that are unsafe for use in NATS subjects
     /// (dots, wildcards `*` / `>`, spaces, etc.). This indicates either a tampered
     /// JWT or a bug in the token-issuing service.
@@ -65,20 +55,6 @@ impl fmt::Display for TokenError {
             TokenError::Invalid(msg) => write!(f, "invalid token: {msg}"),
             TokenError::Expired => write!(f, "token has expired"),
             TokenError::RoomJoinDenied => write!(f, "token does not grant room join permission"),
-            TokenError::RoomMismatch {
-                token_room,
-                requested_room,
-            } => write!(
-                f,
-                "token room '{token_room}' does not match requested room '{requested_room}'"
-            ),
-            TokenError::IdentityMismatch {
-                token_identity,
-                requested_identity,
-            } => write!(
-                f,
-                "token identity '{token_identity}' does not match '{requested_identity}'"
-            ),
             TokenError::UnsafeIdentifier { field, value } => write!(
                 f,
                 "token {field} '{value}' contains characters unsafe for NATS subjects"
@@ -189,46 +165,6 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
     Ok(claims)
 }
 
-/// Validate a JWT room access token against expected room and identity.
-///
-/// Validate a JWT room access token against expected room and identity.
-///
-/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{user_id}/{room}`
-/// endpoint. Prefer [`decode_room_token`] for the new token-based endpoint where
-/// identity and room are extracted from the JWT claims directly.
-///
-/// Decodes the token with HMAC-SHA256 using `secret`, then checks:
-/// 1. Signature is valid
-/// 2. Token is not expired (`exp`)
-/// 3. Issuer matches `RoomAccessTokenClaims::ISSUER`
-/// 4. `room_join` is `true`
-/// 5. `room` matches `expected_room`
-/// 6. `sub` matches `expected_email`
-pub fn validate_room_token(
-    secret: &str,
-    token: &str,
-    expected_room: &str,
-    expected_email: &str,
-) -> Result<RoomAccessTokenClaims, TokenError> {
-    let claims = decode_room_token(secret, token)?;
-
-    if claims.room != expected_room {
-        return Err(TokenError::RoomMismatch {
-            token_room: claims.room.clone(),
-            requested_room: expected_room.to_string(),
-        });
-    }
-
-    if claims.sub != expected_email {
-        return Err(TokenError::IdentityMismatch {
-            token_identity: claims.sub.clone(),
-            requested_identity: expected_email.to_string(),
-        });
-    }
-
-    Ok(claims)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,33 +260,6 @@ mod tests {
         assert!(matches!(result, Err(TokenError::Invalid(_))));
     }
 
-    // -- validate_room_token tests (deprecated, with URL cross-check) --
-
-    #[test]
-    fn valid_token_succeeds() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "alice@test.com");
-        assert!(result.is_ok());
-        let claims = result.unwrap();
-        assert_eq!(claims.sub, "alice@test.com");
-        assert_eq!(claims.room, "room-1");
-        assert!(claims.room_join);
-    }
-
-    #[test]
-    fn room_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-A", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-B", "alice@test.com");
-        assert!(matches!(result, Err(TokenError::RoomMismatch { .. })));
-    }
-
-    #[test]
-    fn identity_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "bob@test.com");
-        assert!(matches!(result, Err(TokenError::IdentityMismatch { .. })));
-    }
-
     // -- TokenError classification tests --
 
     #[test]
@@ -386,26 +295,6 @@ mod tests {
         assert!(!err.is_retryable());
         assert!(!err.is_suspicious());
         assert_eq!(err.client_message(), "access denied");
-    }
-
-    #[test]
-    fn room_mismatch_is_not_retryable_and_not_suspicious() {
-        let err = TokenError::RoomMismatch {
-            token_room: "a".to_string(),
-            requested_room: "b".to_string(),
-        };
-        assert!(!err.is_retryable());
-        assert!(!err.is_suspicious());
-    }
-
-    #[test]
-    fn identity_mismatch_is_not_retryable_and_not_suspicious() {
-        let err = TokenError::IdentityMismatch {
-            token_identity: "a@test.com".to_string(),
-            requested_identity: "b@test.com".to_string(),
-        };
-        assert!(!err.is_retryable());
-        assert!(!err.is_suspicious());
     }
 
     // -- End-to-end: decode produces correct classification --

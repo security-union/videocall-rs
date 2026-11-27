@@ -13,6 +13,7 @@
 
 //! Application configuration loaded from environment variables.
 
+use crate::constants::{AFTER_LOGIN_URL, DEVICE_TOKEN_AUDIENCE};
 use std::env;
 
 /// Configuration for the Meeting Backend API.
@@ -65,16 +66,16 @@ pub struct DeviceAuthConfig {
 
 impl DeviceAuthConfig {
     pub fn from_env(cors_allowed_origin: &[String]) -> Result<Self, String> {
-        let audience = env::var("DEVICE_TOKEN_AUDIENCE")
-            .ok()
+        let audience = DEVICE_TOKEN_AUDIENCE
+            .clone()
             .filter(|v| !v.trim().is_empty())
             .map(|s| {
                 parse_origin(s.trim())
                     .ok_or_else(|| format!("DEVICE_TOKEN_AUDIENCE is not an http(s) origin: {s}"))
             })
             .transpose()?;
-        let ui_origin = env::var("AFTER_LOGIN_URL")
-            .ok()
+        let ui_origin = AFTER_LOGIN_URL
+            .clone()
             .and_then(|url| parse_origin(url.trim()));
         let mut browser_origins = cors_allowed_origin.to_vec();
         browser_origins.extend(ui_origin.clone());

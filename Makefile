@@ -109,8 +109,8 @@ DEV_ENV := NATS_URL=localhost:4222 \
 	RUST_LOG=debug,async_nats=info
 
 dev-websocket: ## Watch the websocket server (:8080)
-	$(DEV_ENV) ACTIX_PORT=8080 UI_ENDPOINT=http://localhost:3001 \
-	DATABASE_ENABLED=false SERVICE_TYPE=websocket REGION=us-east SERVER_ID=server-1 \
+	$(DEV_ENV) ACTIX_PORT=8080 \
+	SERVICE_TYPE=websocket REGION=us-east SERVER_ID=server-1 \
 	cargo watch -x 'run --bin websocket_server'
 
 dev-webtransport: ## Watch the webtransport server (udp :4433)
@@ -185,7 +185,6 @@ check-backend: ensure-nix ## Backend integration tests against throwaway native 
 		nix-shell default.nix -A shells.dev --run "dev-stack -D postgres postgres-init nats"
 	NATS_URL=localhost:$(IT_NATS_PORT) \
 	DATABASE_URL="postgres://postgres:docker@localhost:$(IT_PG_PORT)/actix-api-db?sslmode=disable" \
-	DATABASE_ENABLED=true \
 	WEBTRANSPORT_URL=https://127.0.0.1:4433 \
 	HEALTH_URL=http://127.0.0.1:5321/healthz \
 	INSECURE=true \

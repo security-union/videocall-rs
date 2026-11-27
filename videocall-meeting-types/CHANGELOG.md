@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/security-union/videocall-rs/compare/videocall-meeting-types-v0.2.0...videocall-meeting-types-v0.3.0) - 2026-11-27
+
+### Added
+
+- [**breaking**] close the relay path; videocall-cli logs in with a device key ([#956](https://github.com/security-union/videocall-rs/pull/956))
+
 ## [0.2.0](https://github.com/security-union/videocall-rs/compare/videocall-meeting-types-v0.1.2...videocall-meeting-types-v0.2.0) - 2026-06-30
 
 ### Added

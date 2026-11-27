@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v4.1.2...videocall-cli-v5.0.0) - 2026-11-27
+
+### Added
+
+- [**breaking**] close the relay path; videocall-cli logs in with a device key ([#956](https://github.com/security-union/videocall-rs/pull/956))
+
+### Other
+
+- env vars added by device login live in constants.rs ([#967](https://github.com/security-union/videocall-rs/pull/967))
+
 ## [4.1.2](https://github.com/security-union/videocall-rs/compare/videocall-cli-v4.1.1...videocall-cli-v4.1.2) - 2026-11-22
 
 ### Other

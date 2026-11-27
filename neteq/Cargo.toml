@@ -1,6 +1,6 @@
 [package]
 name = "neteq"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Rust port of Google WebRTC NetEq: adaptive jitter buffer and packet loss concealment for audio"
 license = "(MIT OR Apache-2.0) AND BSD-3-Clause"

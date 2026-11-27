@@ -1,6 +1,6 @@
 [package]
 name = "videocall-meeting-client"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
@@ -12,7 +12,7 @@ categories = ["network-programming"]
 description = "Cross-platform REST client for the videocall.rs meeting API"
 
 [dependencies]
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.0" }
 # rustls instead of reqwest's default native-tls, so native consumers (the
 # videocall-cli Raspberry Pi cross-build in particular) don't link OpenSSL.
 # `rustls-tls-native-roots` trusts the OS root store, like native-tls did, and

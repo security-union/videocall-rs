@@ -3,7 +3,12 @@
 # Usage: ./deploy.sh [--restart] [--services SERVICE1,SERVICE2,...] [other options]
 #
 # Options:
-#   --restart              Restart core deployments to pull latest images
+#   --restart              Restart core deployments. meeting-api, websocket,
+#                         webtransport and videocall-ui are pinned by digest, so
+#                         they restart on the same image; this does not ship a
+#                         newer build (merge the pin PR for that, see helm/README.md,
+#                         "Deploying to production"). metrics-api and
+#                         engineering-vlog still run :latest and pull it again.
 #   --services SERVICES    Deploy only specific services (comma-separated)
 #                         Available services: websocket, webtransport, ingress-nginx,
 #                         engineering-vlog, matomo, videocall-ui,
@@ -142,7 +147,7 @@ if [[ "$RESTART_MODE" == "true" ]]; then
     if [[ -n "$SERVICES_FILTER" ]]; then
         echo "🔄 Restarting filtered services: $SERVICES_FILTER"
     else
-        echo "🔄 Restarting all core deployments to pull latest images..."
+        echo "🔄 Restarting all core deployments (pinned charts restart on their pinned image; :latest charts re-pull)..."
     fi
     
     # US East context

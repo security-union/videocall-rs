@@ -43,7 +43,14 @@
 1. Start the kubernetes dashboard locally 
 ```kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard-kong-proxy 8443:443```
 
-## Updating the website
+## Deploying to production
 
-1. Update the tag in the videocall-website/values.yaml file
-1. Run ```helm dependency update && helm upgrade videocall-website . -f values.yaml```
+Production is one cluster, `videocall-us-east`. Five charts there are pinned: meeting-api, webtransport, websocket, videocall-ui and videocall-website. Each `helm/global/us-east/<chart>/values.yaml` names its image as `tag: main-<sha8>@sha256:<digest>`, so the pin is the exact image bytes, and `pullPolicy` is `IfNotPresent`. Those five never follow `latest`. Other charts in the cluster, such as metrics-api and engineering-vlog, still run `:latest`.
+
+1. A merge to main builds images tagged `main-<sha8>`. The publish workflows are path-filtered, so not every merge builds every image.
+1. When a build finishes, `.github/workflows/pin-images-pr.yaml` runs `scripts/pin-main-images.sh` and opens one rolling PR, `deploy: pin images to main-<sha8>`, listing the old and new pins with a compare link.
+1. Merging that PR runs `.github/workflows/deploy-production.yaml`. It upgrades meeting-api, webtransport, websocket, videocall-ui and videocall-website in that order. After each rollout it waits until that service reports the pinned sha on `https://api.videocall.rs/api/v1/versions` or `https://app.videocall.rs/version.json` before it starts the next one. The website has no version endpoint, so it only gets the rollout check.
+
+Only a change to one of those five values files starts a deploy. Leave the pin PR alone and nothing ships. A PR that changes a chart (its `Chart.yaml`, templates, or the `helm/<chart>` dependency) deploys nothing when it merges. The chart change goes out with the next pin merge, because `helm upgrade` applies the whole chart, or when someone runs the workflow by hand.
+
+To ship a specific build, change the pin by hand in a PR. `scripts/pin-main-images.sh --check` prints the newest builds without writing anything. If a step fails, the workflow stops before the next release and rolls nothing back, so check `helm history <release>` and decide.

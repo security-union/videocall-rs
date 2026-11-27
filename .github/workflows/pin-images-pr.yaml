@@ -1,0 +1,194 @@
+name: Pin production images
+
+# When an image publish run on main finishes, open (or refresh) one rolling
+# PR that pins helm/global/us-east/* to the newest main-<sha8> images.
+# Merging that PR is the deploy: deploy-production.yaml runs on the merge.
+#
+# workflow_run jobs get a write token, so this workflow only ever checks out
+# and runs code from main, and never interpolates event data into `run:`.
+
+on:
+  workflow_run:
+    workflows:
+      - Publish API to Docker image
+      - Publish Meeting API to Docker image
+      - Publish Dioxus UI to Docker image
+      - Publish Website to Docker image
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pin-images-pr
+  cancel-in-progress: false
+
+env:
+  PIN_BRANCH: deploy/pin-images
+  PUBLISH_WORKFLOWS: >-
+    upload-api-docker-hub.yaml
+    upload-meeting-api-docker-hub.yaml
+    upload-dioxus-ui-docker-hub.yaml
+    upload-website-docker-hub.yaml
+
+jobs:
+  pin:
+    name: Open or refresh the pin PR
+    # Dispatch only from main; workflow_run only for runs of main in this
+    # repository. Failed publish runs count too: the script only pins tags
+    # that exist, and skipping them would leave no PR when the last sibling
+    # to finish is the one that failed.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the rolling PR branch
+      pull-requests: write # create, edit, close the PR
+      actions: read # see whether publish runs are still going
+    env:
+      TRIGGER_WORKFLOW: ${{ github.event.workflow_run.name }}
+      TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+      TRIGGER_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+    steps:
+      - name: Wait for the other publish runs
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "triggered by: ${TRIGGER_WORKFLOW:-workflow_dispatch} ${TRIGGER_SHA:0:8} ${TRIGGER_CONCLUSION:-}"
+          busy=""
+          for wf in $PUBLISH_WORKFLOWS; do
+            n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" --branch main \
+                  --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+            if [ "$n" != "0" ]; then busy="$busy $wf"; fi
+          done
+          if [ -n "$busy" ]; then
+            # Their completion re-triggers this workflow; acting now would
+            # pin a mix of old and new images.
+            echo "still publishing on main:$busy. Exiting; the next completion re-runs this."
+            echo "busy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "busy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out main
+        if: steps.gate.outputs.busy == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0 # the script walks up to 200 first-parent commits
+          persist-credentials: false
+
+      - name: Resolve newest main images
+        if: steps.gate.outputs.busy == 'false'
+        run: |
+          scripts/pin-main-images.sh > "$RUNNER_TEMP/pins.tsv"
+          column -t -s $'\t' "$RUNNER_TEMP/pins.tsv"
+
+      - name: Open, refresh or close the PR
+        if: steps.gate.outputs.busy == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$PIN_BRANCH" --base main \
+                 --state open --json number --jq '.[0].number // empty')
+
+          if git diff --quiet -- helm/global/us-east; then
+            echo "pins already match the newest main images"
+            if [ -n "$pr" ]; then
+              gh pr close "$pr" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                --comment "Closing: main already pins the newest images, so this PR has nothing left to ship."
+            fi
+            exit 0
+          fi
+
+          # sha8 -> full sha through main's first-parent list, never bare
+          # rev-parse. Prints "<position> <sha>" (1 = tip) or nothing.
+          git rev-list --first-parent HEAD > "$RUNNER_TEMP/history"
+          locate() {
+            local hits
+            hits=$(grep -n "^$1" "$RUNNER_TEMP/history" || true)
+            [ "$(printf '%s' "$hits" | grep -c . || true)" = "1" ] && printf '%s %s' "${hits%%:*}" "${hits#*:}"
+            return 0
+          }
+          # Shorten main-<sha8>@sha256:<digest> for the table.
+          short() { if [[ "$1" == *@sha256:* ]]; then local d="${1#*@}"; echo "${1%%@*}@${d:0:19}"; else echo "$1"; fi; }
+
+          # Newest new pin names the PR. Oldest current pin starts the compare.
+          newest="" newest_n=999999999 oldest="" oldest_n=0
+          while IFS=$'\t' read -r _ _ current new _; do
+            [[ "$new" =~ ^main-([0-9a-f]{8})@sha256:[0-9a-f]{64}$ ]] || { echo "unexpected pin $new"; exit 1; }
+            read -r n sha <<<"$(locate "${BASH_REMATCH[1]}")"
+            if [ -n "${n:-}" ] && [ "$n" -lt "$newest_n" ]; then newest_n=$n; newest=$sha; fi
+            if [[ "$current" =~ ^main-([0-9a-f]{8})(@sha256:[0-9a-f]{64})?$ ]]; then
+              read -r n sha <<<"$(locate "${BASH_REMATCH[1]}")"
+              if [ -n "${n:-}" ] && [ "$n" -gt "$oldest_n" ]; then oldest_n=$n; oldest=$sha; fi
+            fi
+          done < <(tail -n +2 "$RUNNER_TEMP/pins.tsv")
+          [ -n "$newest" ] || { echo "could not place the new pins on main's history"; exit 1; }
+          title="deploy: pin images to main-${newest:0:8}"
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Pins the production Helm values to the newest images built from main, by tag and digest (digests shortened below; the diff has them in full)."
+            echo
+            echo "| Image | Values file | Current pin | New pin |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r image file current new status; do
+              new="\`$(short "$new")\`"; if [ "$status" = bump ]; then new="**$new**"; fi
+              echo "| \`$image\` | \`$file\` | \`$(short "$current")\` | $new |"
+            done < <(tail -n +2 "$RUNNER_TEMP/pins.tsv")
+            echo
+            if [ -n "$oldest" ]; then
+              echo "What ships: https://github.com/${GITHUB_REPOSITORY}/compare/${oldest}...${newest}"
+              echo
+              echo "<details><summary>First-parent commits in that range</summary>"
+              echo
+              echo '```'
+              # Backticks swapped out so a commit subject cannot close the fence.
+              git log --first-parent -n 60 --format='%h %s' "${oldest}..${newest}" | tr '`' "'"
+              echo '```'
+              echo
+              echo "</details>"
+            else
+              echo "No compare link: no current pin is a main-<sha8> build from this history."
+            fi
+            echo
+            echo "**Merging this PR deploys these images to production** (cluster \`videocall-us-east\`) through \`deploy-production.yaml\`."
+            echo "Leaving it open or closing it leaves the cluster alone. This PR is force-updated when newer images land."
+            echo
+            echo "Opened by \`pin-images-pr.yaml\` with the workflow token, so no CI runs on it; no PR check covers \`helm/\`."
+          } > "$body"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$PIN_BRANCH"
+          git add -- helm/global/us-east
+          git commit -q -m "$title"
+
+          # Skip the force-push when the branch already holds exactly this tree
+          # on top of the same main, so reviews and the timeline stay quiet.
+          if git -c http.extraheader="$auth" fetch -q "$remote" "refs/heads/$PIN_BRANCH" 2>/dev/null \
+             && git diff --quiet HEAD FETCH_HEAD \
+             && [ "$(git rev-parse FETCH_HEAD^)" = "$(git rev-parse HEAD^)" ]; then
+            echo "$PIN_BRANCH is already up to date"
+          else
+            git -c http.extraheader="$auth" push -q --force "$remote" "HEAD:refs/heads/$PIN_BRANCH"
+          fi
+
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$PIN_BRANCH" \
+              --title "$title" --body-file "$body"
+          fi

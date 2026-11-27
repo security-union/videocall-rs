@@ -1,0 +1,251 @@
+name: Deploy production
+
+# Deploys the pinned images in helm/global/us-east/* to the one production
+# cluster, one release at a time, and waits for each new build to answer on
+# its version endpoint before touching the next. The usual trigger is merging
+# the PR that pin-images-pr.yaml opens.
+#
+# Only the five values files trigger this. A PR that edits a chart (Chart.yaml,
+# templates, the file:// dependency charts) does not roll production with the
+# old image; the chart change ships with the next pin merge, since helm upgrade
+# applies the whole chart, or with a manual dispatch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - helm/global/us-east/meeting-api/values.yaml
+      - helm/global/us-east/webtransport/values.yaml
+      - helm/global/us-east/websocket/values.yaml
+      - helm/global/us-east/videocall-ui/values.yaml
+      - helm/global/us-east/videocall-website/values.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to videocall-us-east
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # Time budget, every step using its whole allowance:
+    #   setup + preflight                          ~4 min
+    #   5 x helm upgrade (no --wait)   5 x  60 s =  5 min (normally seconds)
+    #   5 x rollout status             5 x 150 s = 12.5 min
+    #   4 x version gate (no website)  4 x  90 s =  6 min
+    #   final check + diagnostics                  ~1 min
+    #   total                                      28.5 min < 30
+    # The loop stops at the first failure, so diagnostics always get printed.
+    timeout-minutes: 30
+    env:
+      CLUSTER: videocall-us-east
+      KUBE_CONTEXT: do-nyc1-videocall-us-east
+      NAMESPACE: default
+      HELM_TIMEOUT: 60s
+      ROLLOUT_TIMEOUT: 150s
+      GATE_SECONDS: "90"
+      VERSIONS_URL: https://api.videocall.rs/api/v1/versions
+      UI_VERSION_URL: https://app.videocall.rs/version.json
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # preflight checks each pinned sha is on main's history
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.15.4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Configure kubectl
+        run: |
+          doctl kubernetes cluster kubeconfig save "$CLUSTER"
+          kubectl config use-context "$KUBE_CONTEXT"
+          kubectl version
+          helm version --short
+
+      # Render every chart and check its image before touching the cluster,
+      # so a broken chart or a bad pin stops the run with nothing deployed.
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          # chart, expected image repo, version component (- = none), in
+          # deploy order. meeting-api first: clients re-fetch room tokens from
+          # it when a relay restarts. Relays one at a time, so clients can
+          # fall back to the other transport while one restarts.
+          {
+            printf '%s\t%s\t%s\n' meeting-api securityunion/videocall-meeting-api meeting-api
+            printf '%s\t%s\t%s\n' webtransport securityunion/videocall-media-server webtransport-relay
+            printf '%s\t%s\t%s\n' websocket securityunion/videocall-media-server websocket-relay
+            printf '%s\t%s\t%s\n' videocall-ui securityunion/videocall-dioxus-ui dioxus-ui
+            printf '%s\t%s\t%s\n' videocall-website securityunion/video-call-rs-website -
+          } > "$RUNNER_TEMP/charts.tsv"
+          git rev-list --first-parent HEAD > "$RUNNER_TEMP/history"
+          : > "$RUNNER_TEMP/plan.tsv"
+          : > "$RUNNER_TEMP/status.tsv"
+          fail() {
+            echo "::error::$chart: $*"
+            echo "preflight ($chart): $*" > "$RUNNER_TEMP/failure"
+            exit 1
+          }
+          while IFS=$'\t' read -r chart want_repo component; do
+            dir="helm/global/us-east/$chart"
+            release="$chart-us-east"
+            ( cd "$dir" && helm dependency update >/dev/null ) || fail "helm dependency update failed"
+            helm template "$release" "$dir" -f "$dir/values.yaml" -n "$NAMESPACE" > "$RUNNER_TEMP/$chart.yaml" ||
+              fail "helm template failed"
+            images=$(sed -n -E 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' "$RUNNER_TEMP/$chart.yaml" | sort -u)
+            [ "$(printf '%s\n' "$images" | grep -c .)" = "1" ] || fail "renders more or fewer than one image: $images"
+            [[ "$images" =~ ^([a-z0-9./-]+):(main-([0-9a-f]{8}))@(sha256:[0-9a-f]{64})$ ]] ||
+              fail "image '$images' is not <repo>:main-<sha8>@sha256:<digest>"
+            repo="${BASH_REMATCH[1]}" tag="${BASH_REMATCH[2]}" sha8="${BASH_REMATCH[3]}" digest="${BASH_REMATCH[4]}"
+            [ "$repo" = "$want_repo" ] || fail "image repo '$repo' is not the expected '$want_repo'"
+            # Resolve sha8 through main's first-parent list, not rev-parse,
+            # so a prefix can only match a commit that main actually has.
+            [ "$(grep -c "^$sha8" "$RUNNER_TEMP/history" || true)" = "1" ] ||
+              fail "$tag is not exactly one commit on main's first-parent history"
+            # Public, anonymous registry check that the tag still points at
+            # the pinned digest. A mismatch means the tag was re-pushed.
+            token=$(curl -sS --fail --retry 4 --retry-delay 5 \
+              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repo:pull" | jq -r .token) ||
+              fail "no registry token for $repo"
+            served=$(curl -sS --fail --retry 4 --retry-delay 5 -I -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://registry-1.docker.io/v2/$repo/manifests/$tag" | tr -d '\r' |
+              awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }') ||
+              fail "$repo:$tag not found in the registry"
+            [ "$served" = "$digest" ] || fail "$repo:$tag now serves '$served', pin says $digest (tag re-pushed?)"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$release" "$repo:$tag@$digest" "$sha8" "$component" >> "$RUNNER_TEMP/plan.tsv"
+            printf '%s\tnot attempted\n' "$release" >> "$RUNNER_TEMP/status.tsv"
+          done < "$RUNNER_TEMP/charts.tsv"
+          column -t -s $'\t' "$RUNNER_TEMP/plan.tsv"
+
+      - name: Deploy releases in order
+        run: |
+          set -euo pipefail
+          set_status() { sed -i "s|^$1\t.*|$1\t$2|" "$RUNNER_TEMP/status.tsv"; }
+          # The git_sha a component reports. It shows the new build is up and
+          # answering: a liveness signal, not an integrity control (the digest
+          # pin is that).
+          live_sha() {
+            local component="$1" url filter got
+            if [ "$component" = dioxus-ui ]; then
+              url="$UI_VERSION_URL" filter='.git_sha // empty'
+            else
+              # shellcheck disable=SC2016 # $s is a jq variable, not shell
+              url="$VERSIONS_URL" filter='[.components[]? | select(.service == $s) | .git_sha] | first // empty'
+            fi
+            got=$(curl -sS --max-time 10 -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" 2>/dev/null |
+              jq -r --arg s "$component" "$filter" 2>/dev/null || true)
+            echo "${got:-unreachable-or-missing}"
+          }
+          wait_for_version() {
+            local component="$1" want="$2" deadline got
+            deadline=$(( $(date +%s) + GATE_SECONDS ))
+            while :; do
+              got=$(live_sha "$component")
+              echo "$component reports $got, want $want"
+              [ "$got" = "$want" ] && return 0
+              [ "$(date +%s)" -lt "$deadline" ] || return 1
+              sleep 5
+            done
+          }
+          diagnose() {
+            local release="$1" selector
+            echo "::group::diagnostics for $release"
+            selector=$(kubectl get deploy "$release" -n "$NAMESPACE" -o json 2>/dev/null \
+              | jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' || true)
+            kubectl get deploy "$release" -n "$NAMESPACE" -o wide || true
+            if [ -n "$selector" ]; then
+              kubectl get pods -n "$NAMESPACE" -o wide -l "$selector" || true
+            else
+              kubectl get pods -n "$NAMESPACE" -o wide || true
+            fi
+            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -n 40 || true
+            helm history "$release" -n "$NAMESPACE" --max 5 || true
+            echo "::endgroup::"
+          }
+          stop() {
+            local release="$1" stage="$2"
+            echo "::endgroup::"
+            set_status "$release" "failed: $stage"
+            echo "$stage failed for $release" > "$RUNNER_TEMP/failure"
+            diagnose "$release"
+            echo "::error::$release: $stage failed. Stopped before the next release. Nothing was rolled back."
+            exit 1
+          }
+          while IFS=$'\t' read -r chart release image sha8 component; do
+            dir="helm/global/us-east/$chart"
+            echo "::group::$release -> $image"
+            ( cd "$dir" && helm upgrade --install "$release" . -f values.yaml -n "$NAMESPACE" --timeout "$HELM_TIMEOUT" ) ||
+              stop "$release" "helm upgrade"
+            kubectl rollout status "deploy/$release" -n "$NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" ||
+              stop "$release" "rollout"
+            # No readiness probes here, so a finished rollout only means the
+            # container started. Wait for the new build to answer before the
+            # next release; a crash-looping relay stops the run right here.
+            if [ "$component" != "-" ]; then
+              wait_for_version "$component" "$sha8" || stop "$release" "version gate"
+            fi
+            revision=$(helm history "$release" -n "$NAMESPACE" --max 1 -o json | jq -r '.[0].revision')
+            set_status "$release" "deployed (revision $revision)"
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/plan.tsv"
+
+          # One pass over everything, a few tries for network blips only: an
+          # earlier release may have fallen over while later ones rolled.
+          bad=""
+          for attempt in 1 2 3; do
+            bad=""
+            while IFS=$'\t' read -r _ _ _ sha8 component; do
+              [ "$component" = "-" ] && continue
+              got=$(live_sha "$component")
+              [ "$got" = "$sha8" ] || bad="$bad $component=$got(want $sha8)"
+            done < "$RUNNER_TEMP/plan.tsv"
+            if [ -z "$bad" ]; then
+              echo "all components report their pinned sha"
+              exit 0
+            fi
+            echo "final check attempt $attempt:$bad"
+            sleep 5
+          done
+          echo "final version check:$bad" > "$RUNNER_TEMP/failure"
+          echo "::error::after all rollouts, components disagree with their pins:$bad"
+          exit 1
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Production deploy (${CLUSTER}, namespace ${NAMESPACE})"
+            echo
+            echo "Commit: \`${GITHUB_SHA:0:8}\`"
+            echo
+            if [ -s "$RUNNER_TEMP/failure" ]; then
+              echo "**Failed:** $(cat "$RUNNER_TEMP/failure"). Nothing was rolled back."
+            elif [ -s "$RUNNER_TEMP/status.tsv" ] && ! grep -qv 'deployed' "$RUNNER_TEMP/status.tsv"; then
+              echo "All releases deployed and reporting their pinned sha. The website has no version endpoint, so it is checked by rollout status only."
+            else
+              echo "Did not finish: cancelled, timed out, or failed during setup."
+            fi
+            echo
+            if [ -s "$RUNNER_TEMP/plan.tsv" ]; then
+              echo "| Release | Image | Result |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r _ release image _ _; do
+                result=$(awk -F'\t' -v r="$release" '$1 == r { print $2 }' "$RUNNER_TEMP/status.tsv")
+                echo "| \`$release\` | \`$image\` | $result |"
+              done < "$RUNNER_TEMP/plan.tsv"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

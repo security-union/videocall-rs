@@ -73,3 +73,76 @@ impl RoomAccessTokenClaims {
     /// The expected issuer value for tokens produced by the Meeting Backend.
     pub const ISSUER: &'static str = "videocall-meeting-backend";
 }
+
+/// Sign a room access token for the given participant (HS256 with the
+/// relay's `secret`, valid `ttl_secs`).
+#[cfg(feature = "room-token")]
+pub fn generate_room_token(
+    secret: &str,
+    ttl_secs: i64,
+    user_id: &str,
+    room: &str,
+    is_host: bool,
+    display_name: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let claims = RoomAccessTokenClaims {
+        sub: user_id.to_string(),
+        room: room.to_string(),
+        room_join: true,
+        is_host,
+        display_name: display_name.to_string(),
+        observer: false,
+        exp: now + ttl_secs,
+        iss: RoomAccessTokenClaims::ISSUER.to_string(),
+    };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+#[cfg(all(test, feature = "room-token"))]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{decode, DecodingKey, Validation};
+
+    #[test]
+    fn room_token_round_trips_with_relay_claims() {
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        };
+        let before = now();
+        let token = generate_room_token("secret", 900, "user@test.com", "room-42", true, "Alice")
+            .expect("should sign");
+        let after = now();
+
+        let mut validation = Validation::default();
+        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+        let claims = decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(b"secret"),
+            &validation,
+        )
+        .expect("should decode")
+        .claims;
+        assert_eq!(claims.sub, "user@test.com");
+        assert_eq!(claims.room, "room-42");
+        assert_eq!(claims.display_name, "Alice");
+        assert_eq!(claims.iss, "videocall-meeting-backend");
+        assert!(claims.is_host && claims.room_join && !claims.observer);
+        assert!((before + 900..=after + 900).contains(&claims.exp));
+        assert!(decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(b"wrong"),
+            &validation
+        )
+        .is_err());
+    }
+}

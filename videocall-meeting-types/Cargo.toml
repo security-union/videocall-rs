@@ -19,6 +19,8 @@ description = "Shared API types for the videocall.rs meeting backend"
 device-crypto = [
     "dep:ed25519-dalek", "dep:ed25519", "dep:jsonwebtoken", "dep:getrandom", "dep:secrecy", "dep:subtle",
 ]
+# Room access token signing (meeting-api, bot). Off by default for the same reason.
+room-token = ["dep:jsonwebtoken"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -984,6 +984,7 @@
   .list-row-label {
     flex: 1 1 auto;
     min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .list-row-subtitle {
@@ -1143,6 +1144,7 @@
 
   .alert-title {
     font: var(--text-headline);
+    overflow-wrap: anywhere;
   }
 
   .alert-message {

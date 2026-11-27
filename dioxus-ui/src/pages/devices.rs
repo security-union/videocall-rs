@@ -6,7 +6,8 @@ use videocall_meeting_client::ApiError;
 use videocall_meeting_types::device::DeviceListItem;
 use videocall_theme::{
     icons, Alert, AlertActions, AlertMessage, AlertTitle, Button, ButtonVariant, Card, Icon,
-    IconButton, ListFooter, ListGroup, ListRow, ListRowValue, Scrim, Spinner, Toolbar,
+    IconButton, ListFooter, ListGroup, ListRow, ListRowLabel, ListRowValue, Scrim, Spinner,
+    Toolbar,
 };
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -171,7 +172,7 @@ pub fn DevicesPage() -> Element {
         },
         ListState::Loaded(devices) => rsx! {
             section { class: "settings-group",
-                ListGroup { list: true, class: "device-list",
+                ListGroup { list: true,
                     for device in devices {
                         DeviceRow {
                             key: "{device.id}",
@@ -188,7 +189,7 @@ pub fn DevicesPage() -> Element {
     };
 
     rsx! {
-        div { class: "surface-grouped settings-page devices-page",
+        div { class: "surface-grouped settings-page",
             div { class: "settings-container",
                 Toolbar { header: true, class: "settings-toolbar",
                     IconButton {
@@ -210,7 +211,6 @@ pub fn DevicesPage() -> Element {
                 Scrim { onclick: move |_| close_dialog(),
                     // Focus starts on Cancel, the safe choice.
                     div {
-                        class: "device-revoke-dialog",
                         onmounted: move |evt: MountedEvent| {
                             focus_marked_button(&evt);
                         },
@@ -269,15 +269,13 @@ fn DeviceRow(device: DeviceListItem, on_revoke: EventHandler<DeviceListItem>) ->
     let expires = format_date(device.expires_at);
     let label = format!("Revoke {}", device.name);
     rsx! {
-        ListRow { list_item: true, class: "device-row", "data-testid": "device-row",
-            div { class: "list-row-label stack gap-1",
-                span { class: "text-headline device-name", "{device.name}" }
-                span { class: "fingerprint text-mono text-footnote", "data-testid": "fingerprint", "{device.fingerprint}" }
-                span { class: "text-footnote text-secondary device-dates",
-                    span { class: "device-date", "Added {created}" }
-                    span { class: "device-date", "Last used {last_used}" }
-                    span { class: "device-date", "Expires {expires}" }
-                }
+        ListRow { list_item: true, "data-testid": "device-row",
+            ListRowLabel { class: "stack gap-1",
+                span { class: "text-headline", "{device.name}" }
+                span { class: "text-mono text-footnote", "data-testid": "fingerprint", "{device.fingerprint}" }
+                span { class: "text-footnote text-secondary", "Added {created}" }
+                span { class: "text-footnote text-secondary", "Last used {last_used}" }
+                span { class: "text-footnote text-secondary", "Expires {expires}" }
             }
             ListRowValue {
                 Button {

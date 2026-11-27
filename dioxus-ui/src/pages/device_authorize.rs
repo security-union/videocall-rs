@@ -15,8 +15,8 @@ use videocall_meeting_types::device::{
 };
 use videocall_meeting_types::responses::ProfileResponse;
 use videocall_theme::{
-    icons, Button, ButtonVariant, Card, Field, Icon, ListFooter, ListGroup, ListHeader, ListRow,
-    ListRowLabel, ListRowValue, TextField, Toolbar,
+    icons, Badge, BadgeTone, Button, ButtonVariant, Card, Field, Icon, ListFooter, ListGroup,
+    ListHeader, ListRow, ListRowLabel, ListRowValue, Switch, TextField, Toolbar,
 };
 
 use crate::auth::logout;
@@ -152,7 +152,7 @@ pub fn DeviceAuthorizePage(request: String) -> Element {
         None => rsx! { OutcomeView { outcome: Outcome::InvalidLink, on_retry: |_| {} } },
     };
     rsx! {
-        div { class: "surface-grouped settings-page devices-page",
+        div { class: "surface-grouped settings-page",
             div { class: "settings-container",
                 Toolbar { header: true, class: "settings-toolbar",
                     h1 { class: "toolbar-title", "Approve a device" }
@@ -282,13 +282,15 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
             ListHeader { "Device" }
             ListGroup {
                 ListRow {
-                    ListRowLabel { "Name" }
-                    ListRowValue { "data-testid": "device-authorize-name", "{request.body.device_name}" }
+                    ListRowLabel { class: "stack gap-1",
+                        span { "Name" }
+                        span { class: "text-secondary", "data-testid": "device-authorize-name", "{request.body.device_name}" }
+                    }
                 }
                 ListRow {
                     ListRowLabel { "Fingerprint" }
                     ListRowValue {
-                        span { class: "fingerprint text-mono", "data-testid": "fingerprint", "{request.fingerprint}" }
+                        span { class: "text-mono", "data-testid": "fingerprint", "{request.fingerprint}" }
                     }
                 }
                 ListRow {
@@ -301,28 +303,45 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
             ListFooter { "Check this fingerprint matches your terminal." }
         }
 
-        Card { class: "device-consent-warning", role: "note",
-            Icon { glyph: &icons::ALERT, size: "20", "aria-hidden": "true" }
-            p { class: "text-callout",
-                "Only approve if you just ran "
-                code { "videocall-cli auth login" }
-                " yourself, on a device you own. If someone sent you this link or asked you to open it, choose Deny: approving lets that device join meetings as you."
+        section { class: "settings-group",
+            ListGroup { role: "note",
+                ListRow {
+                    ListRowLabel { class: "stack gap-2 text-callout",
+                        span {
+                            Badge { tone: BadgeTone::Warning,
+                                Icon { glyph: &icons::ALERT, size: "14", "aria-hidden": "true" }
+                                "Warning"
+                            }
+                        }
+                        span {
+                            "Only approve if you just ran "
+                            code { "videocall-cli auth login" }
+                            " yourself, on a device you own. If someone sent you this link or asked you to open it, choose Deny: approving lets that device join meetings as you."
+                        }
+                    }
+                }
             }
         }
 
         if is_remote {
-            label { class: "device-consent-check",
-                input {
-                    r#type: "checkbox",
-                    checked: confirmed(),
-                    disabled: submitting,
-                    onchange: move |evt: FormEvent| confirmed.set(evt.checked()),
+            section { class: "settings-group",
+                ListGroup {
+                    ListRow {
+                        ListRowLabel { id: "device-consent-label", "I started this sign-in myself, on a device I own." }
+                        ListRowValue {
+                            Switch {
+                                enabled: confirmed(),
+                                on_toggle: move |on| confirmed.set(on),
+                                disabled: submitting,
+                                labelled_by: "device-consent-label",
+                            }
+                        }
+                    }
                 }
-                span { "I started this sign-in myself, on a device I own." }
             }
         }
 
-        div { class: "row device-consent-actions",
+        div { class: "row",
             Button { class: "grow", disabled: submitting, onclick: on_deny, "Deny" }
             Button {
                 variant: ButtonVariant::Prominent,

@@ -11,9 +11,7 @@
  * at your option.
  */
 
-//! The device JSON API. Browser routes answer in the `APIResponse`
-//! envelope; the CLI routes answer bare JSON with `DeviceErrorResponse`
-//! on failure.
+//! The device JSON API: browser routes use the `APIResponse` envelope, CLI routes bare JSON.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -38,16 +36,13 @@ use crate::device_auth::{
     self, is_valid_code_verifier, verify_device_jwt, AllowedStates, DeviceAuthError,
 };
 use crate::error::AppError;
-use crate::secrets::{ct_eq, random_base64url, sha256_hex};
 use crate::state::AppState;
 
-/// Largest accepted body on the two POST routes.
 pub const MAX_REGISTER_BODY: usize = 4 * 1024;
 /// A device dies after this long unused.
 pub const DEVICE_IDLE_TTL_SECS: i64 = 90 * 24 * 3600;
 /// A device dies this long after approval, used or not.
 pub const DEVICE_ABS_TTL_SECS: i64 = 365 * 24 * 3600;
-/// Live devices per user.
 pub const MAX_DEVICES_PER_USER: i64 = 10;
 /// Code lifetimes: loopback delivery is immediate, a remote code is pasted.
 pub const LOOPBACK_CODE_TTL_SECS: i64 = 60;
@@ -65,8 +60,7 @@ fn error(status: StatusCode, error: &str, description: &str) -> Response {
         .into_response()
 }
 
-/// One description for every rejected grant, so a caller cannot tell a
-/// wrong code from a wrong verifier, redirect or key.
+/// One description for every rejected grant, so callers can't tell which check failed.
 fn invalid_grant() -> Response {
     error(
         StatusCode::BAD_REQUEST,
@@ -75,8 +69,8 @@ fn invalid_grant() -> Response {
     )
 }
 
-fn server_error(e: sqlx::Error) -> Response {
-    tracing::error!("database error: {e}");
+fn server_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!("device API error: {e}");
     error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "server_error",
@@ -92,7 +86,6 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
 }
 
-/// `POST /api/v1/devices`
 pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(audience) = state.device.audience.clone() else {
         return error(
@@ -122,10 +115,10 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         return invalid_grant();
     }
 
-    // Burn the code first, in its own autocommitted statement: whatever
-    // fails below, it cannot be tried again.
+    // Burn the code first, autocommitted: whatever fails below, it can't be tried again.
     let now = Utc::now();
-    let row = match db_codes::consume_code(&state.db, &sha256_hex(&request.code), now).await {
+    let row = match db_codes::consume_code(&state.db, &crypto::sha256_hex(&request.code), now).await
+    {
         Ok(Some(row)) => row,
         Ok(None) => {
             tracing::info!("device registration rejected: unknown, used or expired code");
@@ -138,7 +131,7 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         if request.redirect_uri != row.redirect_uri {
             return Err("redirect_uri mismatch");
         }
-        if !ct_eq(
+        if !crypto::ct_eq(
             &codes::code_challenge_s256(&request.code_verifier),
             &row.code_challenge,
         ) {
@@ -160,7 +153,10 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     };
 
-    let device_id = random_base64url(16);
+    let device_id = match crypto::random_b64url(16) {
+        Ok(device_id) => device_id,
+        Err(e) => return server_error(e),
+    };
     let fingerprint = fingerprint(&raw_key);
     let abs_expires_at = now + Duration::seconds(DEVICE_ABS_TTL_SECS);
     let idle_expires_at = now + Duration::seconds(DEVICE_IDLE_TTL_SECS);
@@ -211,7 +207,6 @@ pub async fn register(State(state): State<AppState>, headers: HeaderMap, body: B
         .into_response()
 }
 
-/// Authenticate the calling device from its bearer JWT.
 async fn calling_device(
     state: &AppState,
     headers: &HeaderMap,
@@ -233,7 +228,6 @@ async fn calling_device(
     }
 }
 
-/// `GET /api/v1/devices/me`
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let row = match calling_device(&state, &headers, AllowedStates::LiveApproved).await {
         Ok(row) => row,
@@ -257,7 +251,6 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
-/// `DELETE /api/v1/devices/me`
 pub async fn revoke_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let row = match calling_device(&state, &headers, AllowedStates::AnyNotRevoked).await {
         Ok(row) => row,
@@ -271,10 +264,6 @@ pub async fn revoke_me(State(state): State<AppState>, headers: HeaderMap) -> Res
         Err(e) => server_error(e),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Browser routes
-// ---------------------------------------------------------------------------
 
 pub(super) fn api_error(status: StatusCode, code: &str, message: &str) -> AppError {
     AppError::new(
@@ -295,11 +284,8 @@ pub(super) fn not_configured() -> AppError {
     )
 }
 
-/// CSRF guard for the state-changing browser routes. The session cookie is
-/// `SameSite=Lax` but shared with sibling subdomains, so the exact `Origin`
-/// allowlist is the control: a missing `Origin`, `Origin: null` or any other
-/// origin gets 403. With `require_json`, anything but `application/json`
-/// (which an HTML form cannot send) gets 415.
+/// CSRF guard: the cookie is `SameSite=Lax` but shared with sibling subdomains, so the exact
+/// `Origin` allowlist is the control. `require_json` refuses what an HTML form can send.
 pub fn check_browser_write(
     state: &AppState,
     headers: &HeaderMap,
@@ -335,10 +321,7 @@ fn no_store<T: serde::Serialize>(result: T) -> Response {
         .into_response()
 }
 
-/// `POST /api/v1/devices/authorizations`: approve a CLI login. Every check
-/// runs before anything is written; then the user's previous code and all
-/// expired codes are replaced by the new code's SHA-256. The code itself
-/// goes only into the response.
+/// `POST /api/v1/devices/authorizations`. Every check runs before anything is written.
 pub async fn create_authorization(
     State(state): State<AppState>,
     user: AuthUser,
@@ -391,13 +374,16 @@ pub async fn create_authorization(
         ));
     }
 
-    let code = random_base64url(32);
+    let code = crypto::random_b64url(32).map_err(|e| {
+        tracing::error!("device API error: {e}");
+        AppError::internal("internal error")
+    })?;
     let ttl = match target {
         RedirectUri::Loopback { .. } => LOOPBACK_CODE_TTL_SECS,
         RedirectUri::Remote => REMOTE_CODE_TTL_SECS,
     };
     let row = DeviceCodeRow {
-        code_hash: sha256_hex(&code),
+        code_hash: crypto::sha256_hex(&code),
         user_id: user.user_id,
         user_name: user.name,
         public_key: request.public_key,
@@ -431,7 +417,6 @@ pub async fn create_authorization(
     }))
 }
 
-/// `GET /api/v1/devices`: the signed-in user's live devices.
 pub async fn list_devices(
     State(state): State<AppState>,
     user: AuthUser,
@@ -451,8 +436,7 @@ pub async fn list_devices(
     Ok(no_store(items))
 }
 
-/// `DELETE /api/v1/devices/{id}`. Unknown ids and other users' devices get
-/// the same 404.
+/// Unknown ids and other users' devices get the same 404.
 pub async fn revoke_device(
     State(state): State<AppState>,
     user: AuthUser,

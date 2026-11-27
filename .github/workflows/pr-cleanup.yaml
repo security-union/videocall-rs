@@ -21,6 +21,7 @@ jobs:
   cleanup:
     name: Cleanup preview environment
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       slot_existed: ${{ steps.find-slot.outputs.exists }}
       slot: ${{ steps.find-slot.outputs.slot }}
@@ -108,6 +109,7 @@ jobs:
     needs: cleanup
     if: always() && needs.cleanup.result == 'success' && needs.cleanup.outputs.slot_existed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Post cleanup success comment
         uses: actions/github-script@v7
@@ -136,6 +138,7 @@ jobs:
     needs: cleanup
     if: always() && needs.cleanup.result == 'failure'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Comment on cleanup failure
         uses: actions/github-script@v7

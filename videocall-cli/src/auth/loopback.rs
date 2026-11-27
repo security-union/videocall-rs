@@ -16,8 +16,6 @@
  * conditions.
  */
 
-//! Loopback browser login (RFC 8252 section 7.3) with PKCE (RFC 7636).
-//!
 //! `state` is checked before anything else, so a request from any other
 //! page on this machine neither uses up the one callback nor ends the login.
 
@@ -26,40 +24,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use videocall_meeting_types::device::{code_challenge_s256, RedirectUri};
+use videocall_meeting_client::device_session::ct_eq;
+use videocall_meeting_types::device::RedirectUri;
 
-use super::random_b64url;
-
-/// How long the human has to finish in the browser.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// A PKCE S256 verifier and its challenge.
-pub struct Pkce {
-    pub verifier: SecretString,
-    pub challenge: String,
-}
-
-impl Pkce {
-    /// A verifier from 32 CSPRNG bytes (43 characters).
-    pub fn generate() -> Result<Self, getrandom::Error> {
-        Ok(Self::from_verifier(random_b64url(32)?))
-    }
-
-    fn from_verifier(verifier: String) -> Self {
-        let challenge = code_challenge_s256(&verifier);
-        Self {
-            verifier: SecretString::from(verifier),
-            challenge,
-        }
-    }
-}
-
-/// Why the loopback login produced no code.
 #[derive(Debug, thiserror::Error)]
 pub enum LoopbackError {
     #[error("login cancelled in the browser. Nothing was saved.")]
@@ -72,16 +45,13 @@ pub enum LoopbackError {
     Io(#[from] std::io::Error),
 }
 
-/// What one request to the listener means.
 #[derive(Debug)]
 enum Outcome {
     /// Not ours (wrong path, or no matching `state`): answer, keep waiting.
     Ignored,
-    /// Ours: ends the login.
     Done(Result<SecretString, LoopbackError>),
 }
 
-/// Judge one request line, e.g. `GET /callback?code=…&state=… HTTP/1.1`.
 fn judge(request_line: &str, expected_state: &str) -> Outcome {
     let Some(query) = request_line
         .strip_prefix("GET /callback?")
@@ -102,7 +72,7 @@ fn judge(request_line: &str, expected_state: &str) -> Outcome {
         }
     }
     match states.as_slice() {
-        [state] if bool::from(state.as_bytes().ct_eq(expected_state.as_bytes())) => {}
+        [state] if ct_eq(state, expected_state) => {}
         _ => return Outcome::Ignored,
     }
     Outcome::Done(match (errors.as_slice(), codes.as_slice()) {
@@ -150,7 +120,6 @@ async fn read_request_line(stream: &mut TcpStream) -> Option<String> {
         .flatten()
 }
 
-/// A listener on `127.0.0.1:{ephemeral}` waiting for one callback.
 pub struct LoopbackServer {
     listener: TcpListener,
     port: u16,
@@ -168,7 +137,6 @@ impl LoopbackServer {
         RedirectUri::Loopback { port: self.port }.as_uri()
     }
 
-    /// Serve until our callback arrives or `timeout` passes, then close.
     pub async fn wait_for_code(
         self,
         expected_state: &str,
@@ -223,16 +191,6 @@ mod tests {
     use secrecy::ExposeSecret;
 
     const STATE: &str = "state-0123456789abcdef";
-
-    #[test]
-    fn pkce_matches_rfc7636_appendix_b() {
-        let pkce = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into());
-        assert_eq!(
-            pkce.challenge,
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        assert_eq!(Pkce::generate().unwrap().verifier.expose_secret().len(), 43);
-    }
 
     #[test]
     fn judging_requests() {

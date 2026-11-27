@@ -16,9 +16,6 @@
  * conditions.
  */
 
-//! Joining a meeting through meeting-api with this machine's device key,
-//! and minting the room token the relay's `/lobby` requires.
-
 use std::time::Duration;
 
 use anyhow::bail;
@@ -27,7 +24,6 @@ use videocall_meeting_client::ApiError;
 
 use crate::auth::{AuthError, Credentials};
 
-/// How often to ask whether the meeting started or the host admitted us.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Network trouble or a 5xx/429 from meeting-api: worth trying again.
@@ -52,8 +48,6 @@ fn meeting_error(error: AuthError, meeting_id: &str) -> anyhow::Error {
     }
 }
 
-/// Run `call` every [`POLL_INTERVAL`] until `done` returns a result.
-/// Transient errors are logged and retried.
 async fn poll<T, Fut>(
     mut call: impl FnMut() -> Fut,
     mut done: impl FnMut(T) -> Option<anyhow::Result<()>>,
@@ -75,8 +69,7 @@ where
     }
 }
 
-/// Join `meeting_id` and wait until the meeting is running and the host has
-/// admitted us. Returns the user id meeting-api assigned.
+/// Returns the user id meeting-api assigned.
 pub async fn join(creds: &Credentials, meeting_id: &str) -> anyhow::Result<String> {
     let id = meeting_id.to_string();
     loop {
@@ -138,8 +131,7 @@ pub async fn join(creds: &Credentials, meeting_id: &str) -> anyhow::Result<Strin
     }
 }
 
-/// A room token for one relay connection attempt. Never reuse one: CLI room
-/// tokens expire after 300 s.
+/// Never reuse one: CLI room tokens expire after 300 s.
 pub async fn room_token(creds: &Credentials, meeting_id: &str) -> Result<SecretString, AuthError> {
     let id = meeting_id.to_string();
     creds

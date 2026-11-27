@@ -58,6 +58,7 @@ jobs:
   plan:
     name: 📋 Deployment Planning
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       deployment_matrix: ${{ steps.plan.outputs.deployment_matrix }}
       requires_rollback_prep: ${{ steps.plan.outputs.requires_rollback_prep }}
@@ -106,6 +107,7 @@ jobs:
   pre-deployment:
     name: 🔍 Pre-Deployment Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: plan
     steps:
       - name: Checkout
@@ -165,6 +167,7 @@ jobs:
   deploy:
     name: 🚀 Deploy to ${{ matrix.region }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [plan, pre-deployment]
     strategy:
       matrix: ${{ fromJson(needs.plan.outputs.deployment_matrix) }}
@@ -332,6 +335,7 @@ jobs:
   post-deployment:
     name: 🎯 Post-Deployment Validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [plan, deploy]
     if: ${{ always() && needs.deploy.result == 'success' && github.event.inputs.dry_run != 'true' && github.event.inputs.restart_only != 'true' }}
     steps:
@@ -430,6 +434,7 @@ jobs:
   notify:
     name: 📢 Deployment Notification
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [plan, deploy, post-deployment]
     if: always()
     steps:

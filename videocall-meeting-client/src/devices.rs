@@ -11,59 +11,23 @@
  * at your option.
  */
 
-//! `videocall-cli` device login and device self-management. A 401 is
-//! [`ApiError::NotAuthenticated`]; errors in the device endpoints'
-//! `{"error","error_description"}` shape are [`ApiError::Device`].
+//! `videocall-cli` device login and self-management.
 
 use videocall_meeting_types::device::{
     DeviceErrorResponse, DeviceStatusResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    CLI_AUTHORIZE_PATH, CLI_CLIENT_ID, CODE_CHALLENGE_METHOD_S256, DEVICES_ME_PATH, DEVICES_PATH,
+    DEVICES_ME_PATH, DEVICES_PATH,
 };
 
 use crate::error::ApiError;
 use crate::MeetingApiClient;
 use videocall_meeting_types::{APIError, APIResponse};
 
-/// Inputs of [`MeetingApiClient::cli_authorize_url`].
-#[derive(Debug, Clone, Copy)]
-pub struct CliAuthorizeParams<'a> {
-    /// `http://127.0.0.1:{port}/callback`, or
-    /// [`CLI_REMOTE_REDIRECT_URI`](videocall_meeting_types::device::CLI_REMOTE_REDIRECT_URI).
-    pub redirect_uri: &'a str,
-    /// `BASE64URL(SHA256(code_verifier))`.
-    pub code_challenge: &'a str,
-    /// Random `state`, checked on the loopback callback.
-    pub state: &'a str,
-    /// The new device's Ed25519 public key, base64url (43 chars).
-    pub public_key: &'a str,
-    /// Device name shown on the consent page.
-    pub device_name: &'a str,
-}
-
 impl MeetingApiClient {
-    /// The browser URL that starts the login (`{base}/cli/authorize?…`).
-    pub fn cli_authorize_url(&self, params: &CliAuthorizeParams<'_>) -> Result<String, ApiError> {
-        let mut url = reqwest::Url::parse(&self.url(CLI_AUTHORIZE_PATH))
-            .map_err(|e| ApiError::Config(format!("bad base URL: {e}")))?;
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", CLI_CLIENT_ID)
-            .append_pair("redirect_uri", params.redirect_uri)
-            .append_pair("code_challenge", params.code_challenge)
-            .append_pair("code_challenge_method", CODE_CHALLENGE_METHOD_S256)
-            .append_pair("state", params.state)
-            .append_pair("public_key", params.public_key)
-            .append_pair("device_name", params.device_name);
-        Ok(url.into())
-    }
-
     fn register_request(&self, request: &RegisterDeviceRequest) -> reqwest::RequestBuilder {
-        // Unauthenticated by design: the code, verifier and registration JWS
-        // are the proof.
+        // Unauthenticated by design: the code, verifier and registration JWS are the proof.
         self.http.post(self.url(DEVICES_PATH)).json(request)
     }
 
-    /// Exchange an authorization code for an approved device.
     pub async fn register_device(
         &self,
         request: &RegisterDeviceRequest,
@@ -72,15 +36,13 @@ impl MeetingApiClient {
         Ok(success(response).await?.json().await?)
     }
 
-    /// The calling device's record.
     pub async fn device_me(&self) -> Result<DeviceStatusResponse, ApiError> {
         let response = self.get(DEVICES_ME_PATH).send().await?;
         Ok(success(response).await?.json().await?)
     }
 
-    /// The server's clock in Unix seconds, from the `Date` header of an
-    /// unauthenticated `GET /version`, so a device with a wrong clock can
-    /// still sign tokens the server accepts.
+    /// The server's clock, from the `Date` header of an unauthenticated `GET /version`.
+    #[cfg(feature = "device-session")]
     pub async fn server_time(&self) -> Option<i64> {
         let response = self.http.get(self.url("/version")).send().await.ok()?;
         let date = response
@@ -93,14 +55,12 @@ impl MeetingApiClient {
         i64::try_from(secs).ok()
     }
 
-    /// Revoke the calling device.
     pub async fn delete_device_me(&self) -> Result<(), ApiError> {
         let response = self.delete(DEVICES_ME_PATH).send().await?;
         success(response).await.map(drop)
     }
 }
 
-/// The response if it is a 2xx, else its [`ApiError`].
 pub(crate) async fn success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
@@ -113,10 +73,8 @@ pub(crate) async fn success(response: reqwest::Response) -> Result<reqwest::Resp
     Err(device_error_from_body(status, &text))
 }
 
-/// Any 404 is [`ApiError::NotFound`] whatever the body says (callers treat
-/// it as "already gone"). Otherwise the code comes from either shape the
-/// server uses: `{"success":false,"result":{"code","message"}}` or
-/// `{"error","error_description"}`.
+/// Any 404 is [`ApiError::NotFound`] (callers treat it as already gone); otherwise the code
+/// comes from either the `APIResponse` or the OAuth error shape.
 pub(crate) fn device_error_from_body(status: u16, text: &str) -> ApiError {
     if status == 404 {
         return ApiError::NotFound(text.to_string());
@@ -163,39 +121,6 @@ mod tests {
             AuthMode::Signed(counter.clone()),
         );
         (counter, client)
-    }
-
-    #[test]
-    fn authorize_url_shape() {
-        let (_, client) = signed();
-        let url = client
-            .cli_authorize_url(&CliAuthorizeParams {
-                redirect_uri: "http://127.0.0.1:5000/callback",
-                code_challenge: "challenge",
-                state: "st&ate=x",
-                public_key: "pk",
-                device_name: "videocall-cli on pi4",
-            })
-            .unwrap();
-        let url = reqwest::Url::parse(&url).unwrap();
-        assert_eq!(
-            url.origin().ascii_serialization(),
-            "https://api.example.com"
-        );
-        assert_eq!(url.path(), "/cli/authorize");
-        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        let get = |k: &str| {
-            pairs
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get("response_type"), Some("code"));
-        assert_eq!(get("client_id"), Some("videocall-cli"));
-        assert_eq!(get("redirect_uri"), Some("http://127.0.0.1:5000/callback"));
-        assert_eq!(get("code_challenge_method"), Some("S256"));
-        assert_eq!(get("state"), Some("st&ate=x"));
-        assert_eq!(get("device_name"), Some("videocall-cli on pi4"));
     }
 
     #[test]

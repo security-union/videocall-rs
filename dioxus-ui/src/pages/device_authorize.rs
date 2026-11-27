@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `/devices/authorize`: the signed-in human approves or denies a
-//! `videocall-cli auth login`. `/cli/authorize` on the API redirects here
-//! with the CLI's query unchanged.
-//!
-//! Safety rules: a query the shared helpers reject gets no Approve button;
-//! the account shown comes from `GET /profile`; Approve renders only after
-//! that, has no default focus and ignores script clicks; the page never
-//! navigates to a URL from the query; a remote code lives in component
-//! state only.
+//! The page never navigates to a URL from the query; a remote code lives in
+//! component state only.
 
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -22,8 +15,8 @@ use videocall_meeting_types::device::{
 };
 use videocall_meeting_types::responses::ProfileResponse;
 use videocall_theme::{
-    icons, Button, ButtonVariant, Card, Field, Icon, ListFooter, ListGroup, ListHeader, ListRow,
-    ListRowLabel, ListRowValue, TextField, Toolbar,
+    icons, Badge, BadgeTone, Button, ButtonVariant, Card, Field, Icon, ListFooter, ListGroup,
+    ListHeader, ListRow, ListRowLabel, ListRowValue, Switch, TextField, Toolbar,
 };
 
 use crate::auth::logout;
@@ -31,18 +24,15 @@ use crate::constants::meeting_api_client;
 use crate::pages::devices::{redirect_to_login, BackHome, Busy, Notice};
 use crate::routing::Route;
 
-/// A checked `/cli/authorize` query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizeRequest {
     pub redirect: RedirectUri,
     /// Computed from `public_key`, never read from the query.
     pub fingerprint: String,
-    /// What Approve sends, `confirm` aside.
     pub body: CreateDeviceAuthorizationRequest,
 }
 
-/// Parse the query. `None` for anything the API would reject, and for a
-/// repeated parameter (which value did the person see?).
+/// `None` for anything the API would reject, and for a repeated parameter.
 pub fn parse_authorize_query(query: &str) -> Option<AuthorizeRequest> {
     let url = reqwest::Url::parse(&format!("http://query.invalid/?{query}")).ok()?;
     let mut pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -102,7 +92,6 @@ pub fn checked_redirect_to(port: u16, redirect_to: &str) -> Option<&str> {
         .then_some(redirect_to)
 }
 
-/// Every way the page can end without a code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     InvalidLink,
@@ -152,9 +141,7 @@ enum Phase {
     Done(Outcome),
 }
 
-/// Route target. `request` is the CLI's query, base64url-encoded by the
-/// API so the router's percent-decoding and address-bar rewrite cannot
-/// change it.
+/// `request` is base64url so the router's percent-decoding cannot change it.
 #[component]
 pub fn DeviceAuthorizePage(request: String) -> Element {
     let inner = match decode_authorize_request(&request)
@@ -165,7 +152,7 @@ pub fn DeviceAuthorizePage(request: String) -> Element {
         None => rsx! { OutcomeView { outcome: Outcome::InvalidLink, on_retry: |_| {} } },
     };
     rsx! {
-        div { class: "surface-grouped settings-page devices-page",
+        div { class: "surface-grouped settings-page",
             div { class: "settings-container",
                 Toolbar { header: true, class: "settings-toolbar",
                     h1 { class: "toolbar-title", "Approve a device" }
@@ -197,8 +184,7 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
                 }
                 Err(ApiError::NotAuthenticated) => redirect_to_login(),
                 Err(e) => {
-                    // Info, not error: warn and above go to Matomo with the
-                    // page URL, which here holds the login request.
+                    // Info, not error: warn and above go to Matomo with the page URL.
                     log::info!("device authorize: profile failed: {e}");
                     phase.set(Phase::Done(Outcome::ProfileFailed));
                 }
@@ -242,7 +228,6 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
                 }
                 Ok(_) => phase.set(Phase::Done(Outcome::ApproveFailed)),
                 Err(e) => {
-                    // Info, not warn: see the profile failure above.
                     log::info!("device authorize: approve failed: {e}");
                     phase.set(Phase::Done(Outcome::from_api(&e)));
                 }
@@ -297,13 +282,15 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
             ListHeader { "Device" }
             ListGroup {
                 ListRow {
-                    ListRowLabel { "Name" }
-                    ListRowValue { "data-testid": "device-authorize-name", "{request.body.device_name}" }
+                    ListRowLabel { class: "stack gap-1",
+                        span { "Name" }
+                        span { class: "text-secondary", "data-testid": "device-authorize-name", "{request.body.device_name}" }
+                    }
                 }
                 ListRow {
                     ListRowLabel { "Fingerprint" }
                     ListRowValue {
-                        span { class: "fingerprint text-mono", "data-testid": "fingerprint", "{request.fingerprint}" }
+                        span { class: "text-mono", "data-testid": "fingerprint", "{request.fingerprint}" }
                     }
                 }
                 ListRow {
@@ -316,28 +303,45 @@ fn DeviceConsent(request: AuthorizeRequest) -> Element {
             ListFooter { "Check this fingerprint matches your terminal." }
         }
 
-        Card { class: "device-consent-warning", role: "note",
-            Icon { glyph: &icons::ALERT, size: "20", "aria-hidden": "true" }
-            p { class: "text-callout",
-                "Only approve if you just ran "
-                code { "videocall-cli auth login" }
-                " yourself, on a device you own. If someone sent you this link or asked you to open it, choose Deny: approving lets that device join meetings as you."
+        section { class: "settings-group",
+            ListGroup { role: "note",
+                ListRow {
+                    ListRowLabel { class: "stack gap-2 text-callout",
+                        span {
+                            Badge { tone: BadgeTone::Warning,
+                                Icon { glyph: &icons::ALERT, size: "14", "aria-hidden": "true" }
+                                "Warning"
+                            }
+                        }
+                        span {
+                            "Only approve if you just ran "
+                            code { "videocall-cli auth login" }
+                            " yourself, on a device you own. If someone sent you this link or asked you to open it, choose Deny: approving lets that device join meetings as you."
+                        }
+                    }
+                }
             }
         }
 
         if is_remote {
-            label { class: "device-consent-check",
-                input {
-                    r#type: "checkbox",
-                    checked: confirmed(),
-                    disabled: submitting,
-                    onchange: move |evt: FormEvent| confirmed.set(evt.checked()),
+            section { class: "settings-group",
+                ListGroup {
+                    ListRow {
+                        ListRowLabel { id: "device-consent-label", "I started this sign-in myself, on a device I own." }
+                        ListRowValue {
+                            Switch {
+                                enabled: confirmed(),
+                                on_toggle: move |on| confirmed.set(on),
+                                disabled: submitting,
+                                labelled_by: "device-consent-label",
+                            }
+                        }
+                    }
                 }
-                span { "I started this sign-in myself, on a device I own." }
             }
         }
 
-        div { class: "row device-consent-actions",
+        div { class: "row",
             Button { class: "grow", disabled: submitting, onclick: on_deny, "Deny" }
             Button {
                 variant: ButtonVariant::Prominent,
@@ -457,14 +461,10 @@ mod tests {
         }
     }
 
-    /// The API's `request=` form survives the router untouched, so the
-    /// router's percent-decoding cannot reach `+` or `%`.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn encoded_request_survives_the_router() {
         use videocall_meeting_types::device::encode_authorize_request;
-        // `videocall-cli auth login --name "C++ rig"`, and a state holding
-        // `+` and `%`.
         let raw = query("http://127.0.0.1:5000/callback", "")
             .replace(
                 "state=abcdefghijklmnopqrstuvwxyz",

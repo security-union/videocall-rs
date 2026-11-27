@@ -299,7 +299,7 @@ The Media Server validates:
 3. `room_join == true`
 4. Issuer matches `videocall-meeting-backend`
 
-A missing or expired token is rejected with HTTP 401, an invalid one (bad signature, wrong issuer, `room_join` false) with HTTP 403. Any other path, including the removed `/lobby/{email}/{room}` form, returns HTTP 404.
+Invalid, expired, or unauthorized tokens are rejected with HTTP 401.
 
 ---
 

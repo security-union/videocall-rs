@@ -11,10 +11,7 @@
  * at your option.
  */
 
-//! Device management from a signed-in browser session. These routes answer
-//! in the standard `APIResponse` envelope; a failure with a machine-readable
-//! code is [`ApiError::Device`] whichever error shape the server used, so
-//! callers match on one variant.
+//! Device management from a browser session; any coded failure is [`ApiError::Device`].
 
 use videocall_meeting_types::device::{
     is_valid_device_id, CreateDeviceAuthorizationRequest, CreateDeviceAuthorizationResponse,
@@ -27,10 +24,7 @@ use crate::error::ApiError;
 use crate::MeetingApiClient;
 
 impl MeetingApiClient {
-    /// Approve a CLI login (`POST /api/v1/devices/authorizations`).
-    ///
-    /// Sent as JSON, so the browser adds `Content-Type: application/json`
-    /// and its `Origin`, which the server requires on this route.
+    /// JSON, so the browser adds the `Content-Type` and `Origin` the server requires.
     pub async fn authorize_device(
         &self,
         request: &CreateDeviceAuthorizationRequest,
@@ -43,16 +37,12 @@ impl MeetingApiClient {
         enveloped(response).await
     }
 
-    /// The signed-in user's live devices.
     pub async fn list_devices(&self) -> Result<Vec<DeviceListItem>, ApiError> {
         let response = self.get(DEVICES_PATH).send().await?;
         enveloped(response).await
     }
 
-    /// Revoke one of the signed-in user's devices.
-    ///
-    /// An id that is not device-id shaped never reaches the network, so it
-    /// cannot change the request path.
+    /// An id that isn't device-id shaped never reaches the network, so it can't change the path.
     pub async fn revoke_device(&self, device_id: &str) -> Result<(), ApiError> {
         if !is_valid_device_id(device_id) {
             return Err(ApiError::NotFound(String::new()));

@@ -10,6 +10,7 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -38,6 +39,7 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       pull-requests: write
       contents: write

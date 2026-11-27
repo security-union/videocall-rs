@@ -20,7 +20,7 @@ jobs:
   parity:
     name: C++ NetEq vs Rust neteq
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
     steps:

@@ -70,8 +70,6 @@ impl WebTransportClient {
             ClientBuilder::new().with_system_roots()?
         };
 
-        // The relay only accepts `/lobby?token=<JWT>`; identity and room come
-        // from the token claims.
         let token = signer.mint(&self.config.user_id, &self.config.meeting_id)?;
         let mut connection_url = Url::parse(&format!(
             "{}/lobby",

@@ -56,12 +56,8 @@ pub async fn upsert_host(
         .await
 }
 
-/// Admit the meeting creator when they join through the CLI.
-///
-/// Unlike [`upsert_host`], this never grants host: a new row gets
-/// `is_host = FALSE`, and an existing row (e.g. the creator's browser row)
-/// keeps its `is_host` and `display_name`. The waiting room is bypassed, as
-/// it is for the creator in the browser.
+/// Admit the meeting creator joining through the CLI. Unlike [`upsert_host`], never grants
+/// host: an existing row keeps its `is_host` and `display_name`.
 pub async fn upsert_creator_via_cli(
     pool: &DbPool,
     meeting_id: i32,
@@ -92,10 +88,7 @@ pub async fn upsert_creator_via_cli(
 /// Atomically join a meeting as an attendee, respecting the current
 /// `waiting_room_enabled` setting.
 ///
-/// `keep_stored_name`: when true (CLI callers) a display name already on
-/// the row is never replaced, so the same account's browser session keeps
-/// its name; `display_name` only fills an empty one. When false (browser)
-/// the requested name replaces the stored one, as before.
+/// `keep_stored_name` (CLI): keep a stored display name, only fill an empty one.
 ///
 /// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where
 /// `auto_admitted` is `true` when the participant was immediately admitted

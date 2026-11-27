@@ -32,11 +32,61 @@ use videocall_nokhwa::utils::FrameFormat;
 /// by the CLI will not work.
 ///
 /// You can watch the video at https://videocall.rs/meeting/{meeting_id}
+///
+/// Log in once with `videocall-cli auth login` (or `auth login --remote` on a
+/// machine without a browser). The CLI joins as the account that approved it.
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {
     #[clap(subcommand)]
     pub mode: Mode,
+}
+
+/// Which meeting-api server to use. Device keys are stored per server.
+#[derive(Args, Debug, Clone)]
+pub struct ApiArgs {
+    /// meeting-api origin, e.g. https://api.videocall.rs.
+    #[arg(long = "api-url", env = "VIDEOCALL_API_URL", default_value = crate::auth::DEFAULT_API_URL)]
+    pub api_url: Url,
+}
+
+#[derive(Args, Debug)]
+pub struct Auth {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Create a key for this machine and approve it in a browser.
+    ///
+    /// Check that the fingerprint shown in the browser matches the one
+    /// printed here before approving. Replaces (and revokes) this machine's
+    /// earlier key for the same server.
+    Login(LoginArgs),
+    /// Revoke this machine's key on the server and delete it locally. The
+    /// local key is deleted even if the server can't be reached.
+    Logout(ApiArgs),
+    /// Show this machine's device and check it with the server. Exits 1
+    /// unless the device is valid.
+    Status(ApiArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LoginArgs {
+    /// Approve from another device: open the printed URL in any browser and
+    /// paste the code it shows back here. Automatic over SSH or without a
+    /// desktop session.
+    #[arg(long = "remote")]
+    pub remote: bool,
+
+    /// Device name shown on the approval page and the devices list.
+    /// Default: "videocall-cli on <hostname>".
+    #[arg(long = "name")]
+    pub name: Option<String>,
+
+    #[command(flatten)]
+    pub api: ApiArgs,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +121,9 @@ pub enum Mode {
     /// https://videocall.rs. The CLI can only join a call, not create one.
     Stream(Stream),
 
+    /// Log in, log out, or check this machine's device key.
+    Auth(Auth),
+
     /// Information mode to list cameras, formats, and resolutions.
     Info(Info),
 }
@@ -86,8 +139,8 @@ pub struct Stream {
     )]
     pub url: Url,
 
-    #[clap(long = "user-id")]
-    pub user_id: String,
+    #[command(flatten)]
+    pub api: ApiArgs,
 
     /// Meeting (call) ID to join.
     ///

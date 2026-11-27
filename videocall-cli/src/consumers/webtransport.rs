@@ -18,6 +18,7 @@
 
 use anyhow::Error;
 use protobuf::Message;
+use secrecy::ExposeSecret;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     sync::mpsc::{self, Sender},
@@ -30,19 +31,25 @@ use videocall_types::protos::{
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
+use crate::auth::Credentials;
 use crate::cli_args::Stream;
+use crate::room;
 
 use super::camera_synk::CameraSynk;
 
 pub struct WebTransportClient {
     options: Stream,
+    creds: Credentials,
+    user_id: String,
     sender: Option<Sender<Vec<u8>>>,
 }
 
 impl WebTransportClient {
-    pub fn new(options: Stream) -> Self {
+    pub fn new(options: Stream, creds: Credentials, user_id: String) -> Self {
         Self {
             options,
+            creds,
+            user_id,
             sender: None,
         }
     }
@@ -54,7 +61,7 @@ impl WebTransportClient {
         };
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            user_id: self.user_id.as_bytes().to_vec(),
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -82,7 +89,7 @@ impl WebTransportClient {
 
     async fn start_heartbeat(&self, session: web_transport_quinn::Session, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
-        let email = options.user_id.clone();
+        let email = self.user_id.clone();
         // Advertise audio as enabled only when we are actually capturing a mic
         // (`--audio-device` was provided). Otherwise peers would see the CLI as
         // unmuted while it sends no audio — and vice-versa, a streamed mic would
@@ -124,16 +131,32 @@ impl WebTransportClient {
     }
 }
 
-async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_quinn::Session> {
+pub fn lobby_url(relay: &url::Url, room_token: &str) -> url::Url {
+    let mut url = relay.clone();
+    url.set_path("/lobby");
+    url.set_query(None);
+    url.query_pairs_mut().append_pair("token", room_token);
+    url
+}
+
+async fn connect_to_server(
+    options: &Stream,
+    creds: &Credentials,
+) -> anyhow::Result<web_transport_quinn::Session> {
     loop {
         info!("Attempting to connect to {}", options.url);
 
-        // Construct WebTransport URL
-        let mut url = options.url.clone();
-        url.set_path(&format!(
-            "/lobby/{}/{}",
-            options.user_id, options.meeting_id
-        ));
+        // A fresh room token for every attempt: they expire after 300 s.
+        let token = match room::room_token(creds, &options.meeting_id).await {
+            Ok(token) => token,
+            Err(e) if room::is_transient(&e) => {
+                tracing::error!("Couldn't get a room token: {e}. Retrying in 5 seconds...");
+                time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let url = lobby_url(&options.url, token.expose_secret());
 
         // Create WebTransport client using 0.7.3 API (same pattern as bot)
         let client = if options.insecure_skip_verify {
@@ -161,7 +184,7 @@ async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_qui
 
 impl CameraSynk for WebTransportClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
-        let session = connect_to_server(&self.options).await?;
+        let session = connect_to_server(&self.options, &self.creds).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
 
@@ -187,5 +210,20 @@ impl CameraSynk for WebTransportClient {
 
     async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lobby_url_carries_only_the_token() {
+        let relay = url::Url::parse("https://relay.example:4433/old/path?x=1").unwrap();
+        let url = lobby_url(&relay, "a.b+c");
+        assert_eq!(
+            url.as_str(),
+            "https://relay.example:4433/lobby?token=a.b%2Bc"
+        );
     }
 }

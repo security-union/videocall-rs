@@ -92,18 +92,29 @@ WebTransport uses QUIC's built-in TLS 1.3, between each client and the relay.
 
 Try it, run it, build on it — three ways in, ordered by how far you want to go.
 
-### 01 — TRY: stream a camera in two commands
+### 01 — TRY: stream a camera in three commands
 
-For the roboticist with a Pi on the desk. No browser, no build — just a camera
+For the roboticist with a Pi on the desk. No build. Log in once, then it's a camera
 and a meeting id.
 
 ```
 cargo install videocall-cli
-videocall-cli stream --user-id cam-01 --meeting-id <meeting-id> --video-device-index 0
+videocall-cli auth login
+videocall-cli stream --meeting-id <meeting-id> --video-device-index 0
 ```
 
 Then open `https://app.videocall.rs/meeting/<meeting-id>` in any browser. Same
 meeting id, so the Pi's camera and your browser land in the same call.
+
+Each robot or Pi gets its own key, made on the machine and never copied off it,
+so no password or shared secret goes into your disk image. You approve it once
+from your laptop or phone in the web app. On a headless machine over SSH,
+`videocall-cli auth login --remote` prints a link; open it, approve, and paste the
+code it shows back into the terminal.
+
+Every machine shows up at `https://app.videocall.rs/devices`, and you can cut one
+off without touching the others. A revoked device stops being able to join within
+five minutes. A device can join and stream, but it can't start, end or host a meeting.
 
 ### 02 — RUN: the whole system on your machine
 
@@ -197,9 +208,10 @@ forwards packets to other participants. It drops ICE, STUN/TURN, and SDP
 negotiation entirely.
 
 **How do I try videocall.rs?**
-Two commands with the native CLI: `cargo install videocall-cli`, then
-`videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0`.
-Open `https://app.videocall.rs/meeting/<id>` in a browser with the same meeting
+Three commands with the native CLI: `cargo install videocall-cli`, then
+`videocall-cli auth login` once, then
+`videocall-cli stream --meeting-id <id> --video-device-index 0`.
+Create the meeting in a browser first. Open `https://app.videocall.rs/meeting/<id>` in a browser with the same meeting
 id and the camera and browser share one call. To run the whole stack instead,
 `git clone` the repo and `make dev`.
 

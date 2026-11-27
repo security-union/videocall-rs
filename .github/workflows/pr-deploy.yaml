@@ -23,6 +23,7 @@ jobs:
   check-permissions:
     name: Check permissions
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: |
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/deploy')

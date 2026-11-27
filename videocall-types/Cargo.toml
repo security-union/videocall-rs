@@ -17,8 +17,6 @@ description = "types for the videocall streaming platform"
 
 [features]
 default = []
-## Enable test utilities (feature flag overrides). Use in dev-dependencies.
-testing = []
 
 [dependencies]
 anyhow = { workspace = true }

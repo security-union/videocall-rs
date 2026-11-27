@@ -239,7 +239,7 @@ env:
 |---|---|---|---|
 | `OAUTH_CLIENT_ID` | Yes | — | OAuth client ID. OAuth is disabled if unset. |
 | `OAUTH_SECRET` | No | — | Client secret. Omit for public clients (PKCE only). |
-| `OAUTH_REDIRECT_URL` | Yes | — | Callback URL registered with the provider. |
+| `OAUTH_REDIRECT_URL` | Yes | — | Callback URL registered with the provider. Must be on the same host that serves `/login` (see below). |
 | `OAUTH_ISSUER` | No | — | OIDC issuer URL. Enables discovery + JWT `iss` validation. |
 | `OAUTH_AUTH_URL` | Cond. | — | Authorization endpoint. Required when `OAUTH_ISSUER` not set. |
 | `OAUTH_TOKEN_URL` | Cond. | — | Token endpoint. Required when `OAUTH_ISSUER` not set. |
@@ -248,6 +248,12 @@ env:
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated scopes. |
 | `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |
 | `ALLOWED_REDIRECT_URLS` | No | — | Comma-separated list of additional allowed redirect origins (e.g. `https://app2.example.com`). The origin of `AFTER_LOGIN_URL` is implicitly allowed. |
+
+**Redirect URL host:** `/login` sets a short-lived, host-only `<COOKIE_NAME>-login` cookie (`__Host-<COOKIE_NAME>-login` when `COOKIE_SECURE` is on), and the callback refuses the login without it. So `OAUTH_REDIRECT_URL` has to point at the same host that served `/login`.
+
+**CLI device login** uses the normal browser login, so nothing extra is registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to meeting-api's public origin to turn it on; the approval page is the app at the `AFTER_LOGIN_URL` origin.
+
+The WebSocket and WebTransport relays take no OAuth configuration. For authentication they only need `JWT_SECRET`, the same value meeting-api signs room access tokens with.
 
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top

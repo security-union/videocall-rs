@@ -107,7 +107,7 @@ pub fn App() -> impl IntoView {
           "name": "How do I try videocall.rs?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Two commands with the native CLI: run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0'. Open https://app.videocall.rs/meeting/<id> in a browser with the same meeting id and the camera and browser share one call. To run the whole stack instead, git clone the repository and run 'make dev'."
+            "text": "Three commands with the native CLI: run 'cargo install videocall-cli', log in once with 'videocall-cli auth login', then run 'videocall-cli stream --meeting-id <id> --video-device-index 0'. Create the meeting in a browser first. Open https://app.videocall.rs/meeting/<id> in a browser with the same meeting id and the camera and browser share one call. To run the whole stack instead, git clone the repository and run 'make dev'."
           }
         },
         {
@@ -189,7 +189,7 @@ pub fn App() -> impl IntoView {
           "@type": "HowToStep",
           "position": 1,
           "name": "Install the CLI and start streaming",
-          "text": "Run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0' to publish the camera into a meeting.",
+          "text": "Run 'cargo install videocall-cli', log in once with 'videocall-cli auth login', then run 'videocall-cli stream --meeting-id <id> --video-device-index 0' to publish the camera into a meeting.",
           "url": "https://crates.io/crates/videocall-cli"
         },
         {

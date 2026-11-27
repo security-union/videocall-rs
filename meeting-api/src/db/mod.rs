@@ -32,6 +32,8 @@ compile_error!(
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!("enable exactly one database backend feature: `postgres` or `sqlite`");
 
+pub mod device_codes;
+pub mod devices;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -201,6 +203,11 @@ pub struct OAuthRequestRow {
     pub csrf_state: Option<String>,
     pub return_to: Option<String>,
     pub nonce: Option<String>,
+    /// When the IdP leg started.
+    pub created_at: Option<DateTime<Utc>>,
+    /// SHA-256 (hex) of the pre-login cookie of the browser that started
+    /// this login. `None` only on rows stored before the column existed.
+    pub browser_binding_hash: Option<String>,
 }
 
 // ---- Conversions to API response types -------------------------------------

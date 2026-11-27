@@ -71,9 +71,8 @@ sequenceDiagram
     participant NATS
     participant OtherServers as Other Servers
     
-    Client->>ActixAPI: WebSocket Connect
-    Client->>ActixAPI: Authentication
-    ActixAPI-->>Client: Authentication Response
+    Client->>ActixAPI: WebSocket Connect (/lobby?token=room JWT)
+    ActixAPI-->>Client: Upgrade, or 401/403 if the token is missing or invalid
     ActixAPI->>NATS: Subscribe to room
     NATS->>OtherServers: Message broadcast
     Client->>ActixAPI: Media & Data
@@ -165,7 +164,7 @@ message MediaPacket {
 2. **Packet Wrapping**: The message is wrapped in a `PacketWrapper` with appropriate type 
 3. **Transport Layer**: The packet is sent via WebSocket or WebTransport to the server
 4. **Server Processing**: 
-   - The server extracts the room ID from the connection URL `lobby/{email}/{room}` 
+   - The server takes the room ID and identity from the room access token in the connection URL `/lobby?token=<JWT>`
 
 5. **NATS Subject Formation**:
    - Messages are published to subject: `room.{room_id}.{sender_id}`
@@ -321,7 +320,7 @@ Media is encrypted in transit:
 
 1. **TLS/HTTPS**: WebSocket connections are secured with TLS 1.3
 2. **QUIC Security**: WebTransport inherits QUIC's built-in TLS 1.3 encryption
-3. **Connection Validation**: Strict path and format validation for connection URLs
+3. **Connection Validation**: Both relays accept only `/lobby?token=<JWT>` with a room access token signed by meeting-api; there is no unauthenticated connection path
 
 So every hop between a client and the relay server is TLS 1.3, whichever transport the client ends up on.
 

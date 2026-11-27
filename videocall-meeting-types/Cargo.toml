@@ -13,5 +13,26 @@ keywords = ["videocall", "meeting", "api", "types"]
 categories = ["network-programming"]
 description = "Shared API types for the videocall.rs meeting backend"
 
+[features]
+# Device-token signing and verification (videocall-cli, meeting-api). Off by
+# default so the browser build carries no signing code.
+device-crypto = [
+    "dep:ed25519-dalek", "dep:ed25519", "dep:jsonwebtoken", "dep:getrandom", "dep:secrecy", "dep:subtle",
+]
+# Room access token signing (meeting-api, bot). Off by default for the same reason.
+room-token = ["dep:jsonwebtoken"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "alloc"], optional = true }
+# Only to switch on `zeroize`, which wipes the key in ed25519's PKCS#8
+# scratch buffers; ed25519-dalek's own `zeroize` feature doesn't forward it.
+ed25519 = { version = "2.2", default-features = false, features = ["zeroize"], optional = true }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"], optional = true }
+getrandom = { version = "0.3", optional = true }
+secrecy = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0"

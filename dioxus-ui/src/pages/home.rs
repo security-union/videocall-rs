@@ -179,6 +179,11 @@ pub fn Home() -> Element {
                                     MenuSeparator { role: None::<&str> }
                                     MenuItem {
                                         role: None::<&str>,
+                                        onclick: move |_| { navigator.push(Route::Devices {}); },
+                                        "Devices"
+                                    }
+                                    MenuItem {
+                                        role: None::<&str>,
                                         destructive: true,
                                         onclick: on_logout,
                                         "Sign out"

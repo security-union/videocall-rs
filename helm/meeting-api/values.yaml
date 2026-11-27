@@ -78,6 +78,13 @@ env:
     value: "https://app.videocall.rs"
   - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
+  # --- CLI device login (videocall-cli) ---
+  # DEVICE_TOKEN_AUDIENCE (public origin of THIS service, scheme + host, no
+  # path) is NOT listed here on purpose: the deployment template derives it
+  # from the ingress (https://<ingress.hosts[0].host>, http:// when
+  # ingress.tls is empty), so it survives deployments that replace this whole
+  # `env` list (PR previews do). Add an entry with that name to override it.
+  # Unset disables device login; a non-origin value fails startup.
   # Comma-separated internal URLs for the aggregated /api/v1/versions endpoint.
   # Adjust service names per region/deployment.
   - name: SERVICE_VERSION_URLS

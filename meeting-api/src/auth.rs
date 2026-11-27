@@ -13,17 +13,11 @@
 
 //! Axum extractors that authenticate the caller.
 //!
-//! - [`AuthUser`]: browser session only. The signed HS256 session JWT comes
-//!   from `Cookie: <name>=<JWT>` (set by the OAuth callback as `HttpOnly`) or
-//!   from `Authorization: Bearer <JWT>`. A device JWT (EdDSA header with a
-//!   device-id `kid`) gets 403 `BROWSER_SESSION_REQUIRED`. This is the default for every route.
-//! - [`CliOrBrowserUser`]: additionally accepts a device JWT as bearer,
-//!   verified against the `devices` table. Used only on get meeting, join and
-//!   status.
+//! - [`AuthUser`]: browser session JWT (cookie or bearer); a device JWT gets 403. The default.
+//! - [`CliOrBrowserUser`]: also accepts a device JWT. Only get meeting, join and status.
 //!
-//! The algorithm decides the path and is then pinned by the verifier: HS256
-//! tokens only ever reach the session decoder, EdDSA tokens only ever reach
-//! [`crate::device_auth::verify_device_jwt`].
+//! The algorithm picks the path and the verifier pins it: HS256 only reaches the session
+//! decoder, EdDSA only [`crate::device_auth::verify_device_jwt`].
 
 use axum::{
     extract::FromRequestParts,
@@ -37,17 +31,13 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::token;
 
-/// How the caller authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthVia {
-    /// Browser session JWT (cookie or bearer).
     Browser,
-    /// Device JWT of a live, approved CLI device.
     Cli,
 }
 
-/// Extractor for a browser session (signed HS256 session JWT in the cookie or
-/// the bearer header).
+/// Extractor for a browser session JWT (cookie or bearer).
 ///
 /// Usage in a handler:
 /// ```ignore
@@ -91,10 +81,8 @@ impl FromRequestParts<AppState> for AuthUser {
 
 /// Extractor for routes a CLI device may call (get meeting, join, status).
 ///
-/// A browser session resolves exactly like [`AuthUser`]. A bearer with an
-/// EdDSA header and a device-id `kid` is verified as a device JWT with
-/// `aud = DEVICE_TOKEN_AUDIENCE` and must belong to a live, approved device;
-/// `user_id` and `name` then come from the device row.
+/// A browser session resolves like [`AuthUser`]; a device JWT must belong to a live device,
+/// whose row supplies `user_id` and `name`.
 #[derive(Debug)]
 pub struct CliOrBrowserUser {
     pub user_id: String,
@@ -157,8 +145,7 @@ impl FromRequestParts<AppState> for CliOrBrowserUser {
     }
 }
 
-/// 401 for a rejected device token: the usual `UNAUTHORIZED` body plus
-/// `WWW-Authenticate: Bearer error="invalid_token"`. Never says why.
+/// 401 with `WWW-Authenticate: Bearer error="invalid_token"`; never says why.
 pub(crate) fn device_unauthorized() -> Response {
     let mut response = AppError::unauthorized().into_response();
     response.headers_mut().insert(
@@ -168,7 +155,6 @@ pub(crate) fn device_unauthorized() -> Response {
     response
 }
 
-/// Extract the session JWT from the configured session cookie.
 pub(crate) fn extract_cookie_token(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
     let prefix = format!("{cookie_name}=");
@@ -184,7 +170,6 @@ pub(crate) fn extract_cookie_token(headers: &HeaderMap, cookie_name: &str) -> Op
     None
 }
 
-/// Extract a token from `Authorization: Bearer <token>`.
 pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers
         .get(header::AUTHORIZATION)

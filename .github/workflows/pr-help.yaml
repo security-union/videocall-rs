@@ -17,6 +17,7 @@ jobs:
   help:
     name: Post help message
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'self-hosted' }}
+    timeout-minutes: 5
     if: |
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/help')

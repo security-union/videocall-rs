@@ -16,9 +16,6 @@
  * conditions.
  */
 
-//! Joining a meeting through meeting-api with this machine's device key,
-//! and minting the room token the relay's `/lobby` requires.
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -29,9 +26,7 @@ use crate::auth::{AuthError, Credentials};
 use crate::backoff::{poll_delay, random_fraction, Backoff};
 use crate::exit::{is_transient_network, needs_human};
 
-/// Network trouble or a 5xx/429 from meeting-api: worth trying again. A
-/// response body this build can't decode is not: retrying it forever would
-/// look healthy to systemd while never joining.
+/// Network trouble or a 5xx/429 from meeting-api; not a body this build can't decode.
 pub fn is_transient(error: &AuthError) -> bool {
     match error {
         AuthError::Api(ApiError::Network(e)) => is_transient_network(e),
@@ -40,9 +35,7 @@ pub fn is_transient(error: &AuthError) -> bool {
     }
 }
 
-/// A plain-English error for a meeting-api failure about `meeting_id`.
-/// "Not found" and "ended" need a human: a restart can't create the
-/// meeting or start it again.
+/// "Not found" and "ended" need a human: a restart can't create or restart the meeting.
 pub fn meeting_error(error: AuthError, meeting_id: &str) -> anyhow::Error {
     match error {
         AuthError::Api(ApiError::NotFound(_)) => needs_human(format!(
@@ -56,15 +49,12 @@ pub fn meeting_error(error: AuthError, meeting_id: &str) -> anyhow::Error {
     }
 }
 
-/// Backoff for meeting-api while it is failing: the first retry waits
-/// 6 to 12 s (above the ~3 s healthy poll), growing to 15 to 30 s.
+/// While meeting-api is failing: 6 to 12 s, growing to 15 to 30 s.
 fn api_backoff() -> Backoff {
     Backoff::new(Duration::from_secs(12), Duration::from_secs(30))
 }
 
-/// Run `call` until it succeeds or fails for good. Transient errors are
-/// logged and retried with [`api_backoff`], so a Pi that boots before its
-/// network is up, or a meeting-api restart, doesn't end the run.
+/// Retry transient errors, so a Pi that boots before its network is up doesn't exit.
 async fn retry<T, Fut>(call: impl FnMut() -> Fut) -> Result<T, AuthError>
 where
     Fut: Future<Output = Result<T, AuthError>>,
@@ -91,8 +81,7 @@ where
     }
 }
 
-/// Every ~3 s (2.5 to 3.5 s, jittered so many CLIs don't poll in step),
-/// run `call` until `done` returns a result.
+/// Every 2.5 to 3.5 s (jittered so many CLIs don't poll in step).
 async fn poll<T, Fut>(
     meeting_id: &str,
     mut call: impl FnMut() -> Fut,
@@ -112,8 +101,7 @@ where
     }
 }
 
-/// Join `meeting_id` and wait until the meeting is running and the host has
-/// admitted us. Returns the user id meeting-api assigned.
+/// Returns the user id meeting-api assigned.
 pub async fn join(
     creds: &Credentials,
     meeting_id: &str,
@@ -121,8 +109,7 @@ pub async fn join(
 ) -> anyhow::Result<String> {
     let id = meeting_id.to_string();
     let name = display_name.map(str::to_string);
-    // Without a terminal this is likely one of many machines that systemd
-    // restarted at the same moment: spread their joins over 5 s.
+    // Likely one of a fleet systemd restarted at once: spread the joins over 5 s.
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         tokio::time::sleep(Duration::from_secs(5).mul_f64(random_fraction())).await;
     }
@@ -200,23 +187,19 @@ fn not_admitted(meeting_id: &str, status: &str) -> anyhow::Error {
     }
 }
 
-/// Why no room token could be minted.
 #[derive(Debug, thiserror::Error)]
 pub enum RoomTokenError {
     #[error(transparent)]
     Api(#[from] AuthError),
-    /// meeting-api answered, but we are not admitted any more.
     #[error("{0}")]
     NotAdmitted(String),
 }
 
 impl RoomTokenError {
-    /// Worth another attempt: only meeting-api or network trouble.
     pub fn is_transient(&self) -> bool {
         matches!(self, RoomTokenError::Api(e) if is_transient(e))
     }
 
-    /// The error to exit with.
     pub fn into_exit(self, meeting_id: &str) -> anyhow::Error {
         match self {
             RoomTokenError::Api(e) => meeting_error(e, meeting_id),
@@ -225,10 +208,7 @@ impl RoomTokenError {
     }
 }
 
-/// A room token for one relay connection attempt. Never reuse one: CLI room
-/// tokens expire after 300 s. Not being admitted any more (removed by the
-/// host, sent back to the waiting room) is final: the run ends and a
-/// restart asks to join again.
+/// Never reuse one: CLI room tokens expire after 300 s. Not admitted any more is final.
 pub async fn room_token(
     creds: &Credentials,
     meeting_id: &str,
@@ -271,8 +251,7 @@ mod tests {
         assert!(!RoomTokenError::NotAdmitted("x".into()).is_transient());
     }
 
-    /// Real reqwest errors: a failed connect is transient; a 200 whose body
-    /// isn't JSON, and a request that can't be built, are not.
+    /// A failed connect is transient; an unparseable 200 and an unbuildable request are not.
     #[tokio::test]
     async fn network_errors_are_transient_only_if_a_retry_can_help() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

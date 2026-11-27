@@ -151,9 +151,7 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
         )
-        // CLI device login: the browser hop to the app's consent page.
         .route(devices::CLI_AUTHORIZE_PATH, get(cli_login::authorize))
-        // Devices: POST is the CLI's code exchange, GET the browser list.
         .route(
             devices::DEVICES_PATH,
             post(devices_api::register)

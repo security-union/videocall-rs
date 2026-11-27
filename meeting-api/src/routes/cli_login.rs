@@ -11,15 +11,9 @@
  * at your option.
  */
 
-//! `GET /cli/authorize`: where `videocall-cli auth login` sends the browser.
-//!
-//! The CLI only knows the API origin, so this hands the request to the app's
-//! consent page as `{ui origin}/devices/authorize?request=<base64url of the
-//! raw query>`. Base64url, because the app's router percent-decodes and
-//! rewrites a plain query, which corrupts values containing `+` or `%`.
-//! Nothing is validated or stored here: the app validates with the shared
-//! helpers and the API validates again on approve. The target origin and
-//! path are fixed, so this is not an open redirect.
+//! `GET /cli/authorize`: hands the CLI's request to the app's consent page as
+//! `?request=<base64url of the raw query>`, since the app's router corrupts `+` and `%`.
+//! Nothing is validated or stored here; the target is fixed, so this is not an open redirect.
 
 use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -32,9 +26,7 @@ use videocall_meeting_types::device::{
 use super::devices_api::{api_error, not_configured};
 use crate::state::AppState;
 
-/// `GET /cli/authorize`: `302` to `{ui origin}/devices/authorize?request=…`.
-/// Needs only the audience and the app origin; signing in is the app's
-/// business, so OAuth is not required.
+/// `GET /cli/authorize`: needs only the audience and the app origin, not OAuth.
 pub async fn authorize(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
     let (Some(_), Some(ui_origin)) = (
         state.device.audience.as_deref(),

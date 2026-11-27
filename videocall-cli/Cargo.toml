@@ -41,17 +41,13 @@ videocall-codecs = { path = "../videocall-codecs", version = "0.1.17" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.10", features = ["input-native", "output-threaded"] }
 # Device-key login (`videocall-cli auth ...`) and meeting join: all HTTP to
 # meeting-api goes through videocall-meeting-client.
-videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2" }
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0", features = ["device-crypto"] }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2", features = ["device-session"] }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 secrecy = "0.10"
-# The constant-time `state` check on the loopback callback.
-subtle = "2.6"
-getrandom = "0.3"
-# Ed25519 device key and device JWTs, pure Rust: no OpenSSL on the Pi build.
-ed25519-dalek = { version = "2.2", features = ["std", "zeroize"] }
 webbrowser = { version = "1", features = ["hardened"] }
+getrandom = "0.3"  # retry jitter
 
 # geteuid() for the key file's ownership check.
 [target.'cfg(unix)'.dependencies]

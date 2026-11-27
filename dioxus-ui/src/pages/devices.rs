@@ -1,39 +1,33 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `/devices`: the signed-in user's approved `videocall-cli` devices, with
-//! a Revoke button per device.
-
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use videocall_meeting_client::ApiError;
 use videocall_meeting_types::device::DeviceListItem;
 use videocall_theme::{
     icons, Alert, AlertActions, AlertMessage, AlertTitle, Button, ButtonVariant, Card, Icon,
-    IconButton, ListFooter, ListGroup, ListRow, ListRowValue, Scrim, Spinner, Toolbar,
+    IconButton, ListFooter, ListGroup, ListRow, ListRowLabel, ListRowValue, Scrim, Spinner,
+    Toolbar,
 };
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::constants::meeting_api_client;
 use crate::routing::Route;
 
-/// Go to the app's login and come back to this URL afterwards, the way the
-/// meeting page does (the router drops unknown query parameters, so the
-/// return URL waits in `sessionStorage`).
+/// The router drops unknown query parameters, so the return URL waits in `sessionStorage`.
 pub fn redirect_to_login() {
     let Some(window) = web_sys::window() else {
         return;
     };
     if let (Ok(href), Ok(Some(storage))) = (window.location().href(), window.session_storage()) {
         if storage.set_item("vc_oauth_return_to", &href).is_err() {
-            // Info, not warn: this runs on /devices/authorize too, and warn
-            // goes to Matomo with the page URL.
+            // Info, not warn: warn goes to Matomo with the page URL.
             log::info!("sessionStorage unavailable; login will return to the app root");
         }
     }
     let _ = window.location().set_href("/login");
 }
 
-/// A centered status card: an error, an empty list, a finished step.
 #[component]
 pub fn Notice(
     title: String,
@@ -52,7 +46,6 @@ pub fn Notice(
     }
 }
 
-/// A spinner with a label.
 #[component]
 pub fn Busy(label: String) -> Element {
     rsx! {
@@ -74,7 +67,6 @@ pub fn BackHome() -> Element {
     }
 }
 
-/// A date in the reader's locale, e.g. "Nov 26, 2026".
 fn format_date(unix_seconds: i64) -> String {
     let date = js_sys::Date::new(&JsValue::from_f64(unix_seconds as f64 * 1000.0));
     let options = js_sys::Object::new();
@@ -98,7 +90,6 @@ enum ListState {
 pub fn DevicesPage() -> Element {
     let navigator = use_navigator();
     let mut state = use_signal(|| ListState::Loading);
-    // Bumped to reload the list.
     let mut generation = use_signal(|| 0u32);
     let mut pending_revoke = use_signal(|| None::<DeviceListItem>);
     let mut revoking = use_signal(|| false);
@@ -181,7 +172,7 @@ pub fn DevicesPage() -> Element {
         },
         ListState::Loaded(devices) => rsx! {
             section { class: "settings-group",
-                ListGroup { list: true, class: "device-list",
+                ListGroup { list: true,
                     for device in devices {
                         DeviceRow {
                             key: "{device.id}",
@@ -198,7 +189,7 @@ pub fn DevicesPage() -> Element {
     };
 
     rsx! {
-        div { class: "surface-grouped settings-page devices-page",
+        div { class: "surface-grouped settings-page",
             div { class: "settings-container",
                 Toolbar { header: true, class: "settings-toolbar",
                     IconButton {
@@ -220,7 +211,6 @@ pub fn DevicesPage() -> Element {
                 Scrim { onclick: move |_| close_dialog(),
                     // Focus starts on Cancel, the safe choice.
                     div {
-                        class: "device-revoke-dialog",
                         onmounted: move |evt: MountedEvent| {
                             focus_marked_button(&evt);
                         },
@@ -261,7 +251,6 @@ pub fn DevicesPage() -> Element {
     }
 }
 
-/// Focus the `[data-autofocus]` button inside a just-mounted element.
 fn focus_marked_button(evt: &MountedEvent) {
     let Some(element) = evt.try_as_web_event() else {
         return;
@@ -280,15 +269,13 @@ fn DeviceRow(device: DeviceListItem, on_revoke: EventHandler<DeviceListItem>) ->
     let expires = format_date(device.expires_at);
     let label = format!("Revoke {}", device.name);
     rsx! {
-        ListRow { list_item: true, class: "device-row", "data-testid": "device-row",
-            div { class: "list-row-label stack gap-1",
-                span { class: "text-headline device-name", "{device.name}" }
-                span { class: "fingerprint text-mono text-footnote", "data-testid": "fingerprint", "{device.fingerprint}" }
-                span { class: "text-footnote text-secondary device-dates",
-                    span { class: "device-date", "Added {created}" }
-                    span { class: "device-date", "Last used {last_used}" }
-                    span { class: "device-date", "Expires {expires}" }
-                }
+        ListRow { list_item: true, "data-testid": "device-row",
+            ListRowLabel { class: "stack gap-1",
+                span { class: "text-headline", "{device.name}" }
+                span { class: "text-mono text-footnote", "data-testid": "fingerprint", "{device.fingerprint}" }
+                span { class: "text-footnote text-secondary", "Added {created}" }
+                span { class: "text-footnote text-secondary", "Last used {last_used}" }
+                span { class: "text-footnote text-secondary", "Expires {expires}" }
             }
             ListRowValue {
                 Button {

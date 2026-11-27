@@ -16,19 +16,12 @@
  * conditions.
  */
 
-//! Which relay hosts count as "local", where `--insecure-skip-verify` is
-//! allowed: `localhost`, loopback, or private-range addresses, where a
-//! development stack runs with a self-signed certificate.
+//! Relay hosts where `--insecure-skip-verify` is allowed (a dev stack with a self-signed cert).
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use url::{Host, Url};
 
-/// True when `url` points at `localhost`, a loopback address, an RFC 1918
-/// private IPv4 address, or an IPv6 unique-local (`fc00::/7`) address.
-///
-/// Everything else is refused, including link-local (`169.254.0.0/16`,
-/// `fe80::/10`) and carrier-grade NAT (`100.64.0.0/10`) addresses, and any
-/// other DNS name: it could resolve anywhere.
+/// Link-local, carrier-grade NAT and any DNS name other than `localhost` are refused.
 pub fn is_local_host(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),

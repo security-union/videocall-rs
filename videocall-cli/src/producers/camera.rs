@@ -209,9 +209,7 @@ impl CameraDaemon {
                     continue;
                 }
                 last_frame_time = Instant::now();
-                // An unplugged camera ends the run (exit 1, so systemd
-                // restarts it) instead of panicking this thread while
-                // heartbeats keep claiming video is on.
+                // Exit 1 instead of panicking this thread while heartbeats claim video is on.
                 let frame = match camera.frame() {
                     Ok(frame) => frame,
                     Err(e) => camera_setup_failed("The camera stopped delivering frames", e),

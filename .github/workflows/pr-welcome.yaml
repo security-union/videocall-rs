@@ -11,6 +11,7 @@ jobs:
   welcome:
     name: Post welcome comment
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'self-hosted' }}
+    timeout-minutes: 5
     steps:
       - name: Check if first-time contributor
         id: check-first-time

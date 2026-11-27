@@ -51,9 +51,7 @@ async fn initialize() {
     }
 }
 
-/// How long exit waits for leftover tasks once `run` returns. A blocking
-/// DNS lookup on a dead network can hold a worker for the resolver's full
-/// timeout (5 s per try); the relay close already had its own 500 ms.
+/// A blocking DNS lookup on a dead network can hold a worker for 5 s per try.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {

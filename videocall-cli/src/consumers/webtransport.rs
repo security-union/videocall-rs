@@ -46,14 +46,12 @@ use crate::room;
 
 use super::camera_synk::CameraSynk;
 
-/// Consecutive failed sends after which the relay connection counts as
-/// lost even if QUIC hasn't reported it closed yet (a few seconds of media).
+/// Failed sends in a row that count as lost even before QUIC reports the session closed.
 const MAX_CONSECUTIVE_SEND_FAILURES: u32 = 100;
 
-/// How long a clean shutdown waits for the close to reach the relay.
 pub const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
-/// Records why the relay connection ended. The first reason wins.
+/// Why the relay connection ended; the first reason wins.
 #[derive(Clone)]
 struct LossSignal {
     reason: Arc<watch::Sender<Option<String>>>,
@@ -82,9 +80,7 @@ impl LossSignal {
         self.reason.borrow().clone()
     }
 
-    /// Count a send result. Failures on a closed session (`close_reason`),
-    /// or too many in a row, mark the connection lost. The first failure of
-    /// a run is logged, then only the count. Returns false if it is lost.
+    /// The first failure of a run is logged, then only the count.
     fn record_send(
         &self,
         close_reason: impl FnOnce() -> Option<String>,
@@ -128,7 +124,6 @@ impl LossSignal {
 pub struct WebTransportClient {
     options: Stream,
     creds: Credentials,
-    /// The account this device acts as, from meeting-api.
     user_id: String,
     sender: Option<Sender<Vec<u8>>>,
     session: Option<web_transport_quinn::Session>,
@@ -136,7 +131,6 @@ pub struct WebTransportClient {
 }
 
 impl WebTransportClient {
-    /// A client for an admitted participant; packets carry `user_id`.
     pub fn new(options: Stream, creds: Credentials, user_id: String) -> Self {
         Self {
             options,
@@ -228,12 +222,7 @@ impl WebTransportClient {
     }
 }
 
-/// Refuse `--insecure-skip-verify` unless the relay is local.
-///
-/// Skipping certificate checks against a public host would hand the room
-/// token to anyone on the path, so it is only allowed for `localhost`,
-/// loopback, and private-range addresses (a dev stack with a self-signed
-/// certificate).
+/// Only for a local relay: skipping verification elsewhere hands the room token to anyone on the path.
 pub fn check_insecure_skip_verify(relay: &Url, insecure_skip_verify: bool) -> anyhow::Result<()> {
     if insecure_skip_verify && !is_local_host(relay) {
         return Err(needs_human(format!(
@@ -245,8 +234,6 @@ pub fn check_insecure_skip_verify(relay: &Url, insecure_skip_verify: bool) -> an
     Ok(())
 }
 
-/// `{relay}/lobby?token=<room token>`. Any path or query on `relay` is
-/// replaced. The result contains the token: never log it.
 pub fn lobby_url(relay: &Url, room_token: &str) -> Url {
     let mut url = relay.clone();
     url.set_path("/lobby");
@@ -256,14 +243,7 @@ pub fn lobby_url(relay: &Url, room_token: &str) -> Url {
     url
 }
 
-/// The HTTP status of a refused WebTransport CONNECT, if that is the error.
-///
-/// web-transport-quinn 0.8.1 keeps its connect error types private, so the
-/// status is read from the `Debug` text. A non-2xx response surfaces as
-/// `HttpError(ProtoError(WrongStatus(Some(401))))`; `ErrorStatus(401)` is the
-/// crate's other path for the same thing. `rejection_status_from_a_real_refusal`
-/// checks this against a real refusal, so a crate bump that changes it fails
-/// the test.
+/// The status of a refused CONNECT, read from `Debug` (the crate's error types are private).
 pub fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
     let web_transport_quinn::ClientError::HttpError(inner) = err else {
         return None;
@@ -284,13 +264,7 @@ fn parse_rejection_status(debug_text: &str) -> Option<u16> {
         })
 }
 
-/// Connect to the relay, minting a fresh room token for every initial
-/// connect attempt. Once a session is established this returns; a later
-/// drop ends the stream (see [`CameraSynk::lost`]) instead of reconnecting.
-///
-/// Transient failures back off exponentially (1 s to 30 s, jittered).
-/// A 401/403/404 from the relay, or a non-retryable meeting-api error (not
-/// logged in, meeting gone, no longer admitted), ends the loop with an error.
+/// A fresh room token per attempt; once connected, a drop ends the run instead of reconnecting.
 async fn connect_to_server(
     options: &Stream,
     creds: &Credentials,
@@ -326,7 +300,16 @@ async fn connect_to_server(
                 info!("WebTransport session established");
                 return Ok(session);
             }
-            Ok(Err(e)) => (rejection_status(&e), e.to_string()),
+            Ok(Err(e)) => match rejection_status(&e) {
+                // A relay without status codes (before #962) refuses a token by dropping it.
+                None if matches!(e, web_transport_quinn::ClientError::HttpError(_)) => (
+                    None,
+                    format!(
+                        "{e} (closed without a status; an older relay does this on a bad token)"
+                    ),
+                ),
+                status => (status, e.to_string()),
+            },
             Err(_) => (
                 None,
                 format!("no answer within {} s", CONNECT_TIMEOUT.as_secs()),
@@ -350,32 +333,23 @@ async fn connect_to_server(
     }
 }
 
-/// How long one WebTransport CONNECT may take. Shorter than QUIC's idle
-/// timeout so a network that drops UDP gets the backoff, not a long hang.
+/// Shorter than QUIC's idle timeout, so a network that drops UDP gets the backoff.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What to do after a failed relay connect attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NextStep {
-    /// Mint a fresh room token and try again right away.
     RetryNow,
-    /// Sleep for the next backoff delay, then try again.
     Backoff,
-    /// Stop with this message.
     Fatal(String),
 }
 
-/// Decides the next step after each failed connect attempt.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectPolicy {
     previous_was_401: bool,
 }
 
 impl ConnectPolicy {
-    /// 401 means "come back with a fresh token": retry once immediately,
-    /// and give up only if the very next attempt gets 401 too; any other
-    /// failure in between starts the count over. 403 and 404 are terminal.
-    /// Anything else (network, QUIC, timeout, 5xx) backs off.
+    /// 401: retry once with a fresh token, fatal only if the next attempt is 401 too. 403/404: fatal.
     pub(crate) fn after_failure(&mut self, status: Option<u16>) -> NextStep {
         let step = next_step(status, self.previous_was_401);
         self.previous_was_401 = step == NextStep::RetryNow;
@@ -404,7 +378,6 @@ impl CameraSynk for WebTransportClient {
         self.sender = Some(tx);
         self.session = Some(session.clone());
 
-        // The relay (or the network) closed the session.
         let (watched, loss) = (session.clone(), self.loss.clone());
         tokio::spawn(async move {
             let reason = watched.closed().await;
@@ -443,17 +416,14 @@ impl CameraSynk for WebTransportClient {
         self.loss.wait().await
     }
 
-    /// Close with code 0 and give the close frame up to [`CLOSE_GRACE`] to
-    /// leave, so the relay drops us now instead of at the QUIC idle timeout.
+    /// Close now so the relay drops us at once, not at the QUIC idle timeout.
     async fn close(&self) {
         let Some(session) = &self.session else {
             return;
         };
         self.loss.mark_lost("closed by this client".to_string());
         session.close(0, b"client shutting down");
-        // `closed()` resolves once the local close is applied; the short
-        // sleep after it lets quinn's connection driver put CONNECTION_CLOSE
-        // on the wire before the runtime shuts down. Bounded either way.
+        // The sleep lets quinn put CONNECTION_CLOSE on the wire before the runtime stops.
         let _ = time::timeout(CLOSE_GRACE, async {
             session.closed().await;
             time::sleep(Duration::from_millis(100)).await;
@@ -573,8 +543,7 @@ mod tests {
         assert_eq!(loss.reason().as_deref(), Some("closed by peer"));
     }
 
-    /// The status comes from the real error a relay's refusal produces, so
-    /// a web-transport-quinn bump that changes its shape fails here.
+    /// Against a real refusal, so a web-transport-quinn bump that changes the error shape fails here.
     #[tokio::test]
     async fn rejection_status_from_a_real_refusal() {
         use web_transport_quinn::quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -583,8 +552,7 @@ mod tests {
         let key =
             PrivateKeyDer::try_from(std::fs::read(format!("{certs}/localhost_key.der")).unwrap())
                 .unwrap();
-        // Our own endpoint, so the test holds each connection open until
-        // the client has read the refusal.
+        // Our own endpoint, so each connection stays open until the client reads the refusal.
         use web_transport_quinn::quinn;
         let mut tls = quinn::rustls::ServerConfig::builder_with_provider(
             web_transport_quinn::crypto::default_provider(),
@@ -601,11 +569,17 @@ mod tests {
         let port = endpoint.local_addr().unwrap().port();
         tokio::spawn(async move {
             let mut open = Vec::new();
-            for status in [401u16, 403, 404] {
+            for status in [Some(401u16), Some(403), Some(404), None] {
                 let conn = endpoint.accept().await.unwrap().await.unwrap();
                 let request = web_transport_quinn::Request::accept(conn.clone())
                     .await
                     .unwrap();
+                let Some(status) = status else {
+                    // What a relay without #962's status codes does: drop it.
+                    drop(request);
+                    conn.close(0u32.into(), b"");
+                    continue;
+                };
                 let status = web_transport_quinn::http::StatusCode::from_u16(status).unwrap();
                 request.close(status).await.unwrap();
                 open.push(conn);
@@ -619,10 +593,15 @@ mod tests {
                 .with_no_certificate_verification()
                 .unwrap()
         };
-        for expected in [401u16, 403, 404] {
+        for expected in [Some(401u16), Some(403), Some(404), None] {
             let url = Url::parse(&format!("https://127.0.0.1:{port}/lobby?token=t")).unwrap();
             let error = client.connect(url).await.unwrap_err();
-            assert_eq!(rejection_status(&error), Some(expected), "{error:?}");
+            assert_eq!(rejection_status(&error), expected, "{error:?}");
         }
+        // No status: back off and retry with a fresh token, never fatal.
+        assert_eq!(
+            ConnectPolicy::default().after_failure(None),
+            NextStep::Backoff
+        );
     }
 }

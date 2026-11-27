@@ -16,43 +16,26 @@
  * conditions.
  */
 
-//! Exit codes, so a supervisor can tell "restart me" from "a human has to
-//! act":
-//!
-//! - `0`: stopped on request (Ctrl-C, SIGTERM, SIGHUP), or the command
-//!   succeeded.
-//! - `1` ([`RESTART`]): lost the relay or the camera, or meeting-api or the
-//!   network kept failing in a way a fresh start can fix.
-//! - `2` ([`NEEDS_HUMAN`]): restarting won't help. Not logged in, device
-//!   revoked, declined or removed by the host, meeting not found or ended,
-//!   the relay refused us (403/404, or 401 twice), a bad argument or a
-//!   refused flag, or a response this build can't parse. clap also exits 2
-//!   for bad arguments.
-//!
-//! systemd: `Restart=on-failure` with `RestartPreventExitStatus=2`.
+//! 0 stopped or succeeded; 1 restart me (lost the relay or camera, transient failures);
+//! 2 needs a human (logged out, revoked, declined, meeting gone, relay refused us, bad flag).
 
 use videocall_meeting_client::ApiError;
 
 use crate::auth::store::StoreError;
 use crate::auth::AuthError;
 
-/// Worth restarting.
 pub const RESTART: u8 = 1;
-/// Needs a human; don't restart.
 pub const NEEDS_HUMAN: u8 = 2;
 
-/// An error that a restart can't fix. Wrap a message in it to exit
-/// [`NEEDS_HUMAN`].
+/// Exit [`NEEDS_HUMAN`] with this message.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct NeedsHuman(pub String);
 
-/// `anyhow::Error` for a [`NeedsHuman`] message.
 pub fn needs_human(message: impl Into<String>) -> anyhow::Error {
     NeedsHuman(message.into()).into()
 }
 
-/// The exit code for a failed run.
 pub fn code(error: &anyhow::Error) -> u8 {
     for cause in error.chain() {
         if cause.is::<NeedsHuman>() {
@@ -71,7 +54,6 @@ pub fn code(error: &anyhow::Error) -> u8 {
     RESTART
 }
 
-/// The exit code for an [`AuthError`].
 pub fn auth_code(error: &AuthError) -> u8 {
     match error {
         AuthError::Api(api) => api_code(api),
@@ -100,9 +82,7 @@ fn api_code(error: &ApiError) -> u8 {
     }
 }
 
-/// A network error a retry can fix: a timeout, a failed connect, or a
-/// failure sending the request. Not a body this build can't decode (version
-/// skew, a captive portal's HTML), nor a request it can't build.
+/// Timeout, failed connect or failed send; not an undecodable body or an unbuildable request.
 pub fn is_transient_network(error: &videocall_meeting_client::reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }

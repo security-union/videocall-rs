@@ -20,7 +20,6 @@ pub enum Route {
     Login {},
     #[route("/devices", DevicesPage)]
     Devices {},
-    /// `request`: the CLI's query, base64url-encoded by the API.
     #[route("/devices/authorize?:request", DeviceAuthorizePage)]
     DeviceAuthorize { request: String },
     #[route("/meeting/:id/settings")]

@@ -16,17 +16,11 @@
  * conditions.
  */
 
-//! Retry timing: exponential backoff for relay connects, and the jittered
-//! interval for waiting-room polling.
-//!
-//! Jitter keeps a room full of CLIs (or a Pi fleet that lost power together)
-//! from hammering the relay and meeting-api in lockstep.
+//! Jittered retry timing, so a fleet that restarted together doesn't retry in lockstep.
 
 use std::time::Duration;
 
-/// Exponential backoff with "equal jitter": the nominal delay doubles from
-/// `initial` up to `max`, and each actual delay is drawn from
-/// `[nominal / 2, nominal]`.
+/// Equal jitter: the nominal delay doubles from `initial` to `max`; each delay is in `[nominal / 2, nominal]`.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     initial: Duration,
@@ -35,7 +29,6 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// Backoff between `initial` and `max`.
     pub fn new(initial: Duration, max: Duration) -> Self {
         Self {
             initial,
@@ -44,23 +37,20 @@ impl Backoff {
         }
     }
 
-    /// Policy for the initial relay connect attempts: 1 s doubling to 30 s.
+    /// Relay connects: 1 s doubling to 30 s.
     pub fn relay() -> Self {
         Self::new(Duration::from_secs(1), Duration::from_secs(30))
     }
 
-    /// Start over from `initial` (after a success).
     pub fn reset(&mut self) {
         self.attempt = 0;
     }
 
-    /// The un-jittered delay for the next attempt.
     pub fn nominal(&self) -> Duration {
         let factor = 1u32 << self.attempt.min(16);
         self.initial.saturating_mul(factor).min(self.max)
     }
 
-    /// The delay to sleep before the next attempt.
     pub fn next_delay(&mut self) -> Duration {
         let nominal = self.nominal();
         self.attempt = self.attempt.saturating_add(1);
@@ -68,18 +58,16 @@ impl Backoff {
     }
 }
 
-/// `nominal / 2 + fraction * nominal / 2`, with `fraction` in `[0, 1)`.
 pub(crate) fn equal_jitter(nominal: Duration, fraction: f64) -> Duration {
     let half = nominal / 2;
     half + half.mul_f64(fraction.clamp(0.0, 1.0))
 }
 
-/// Waiting-room poll interval: about 3 seconds (2.5 to 3.5 s).
 pub fn poll_delay() -> Duration {
     Duration::from_millis(2500) + Duration::from_millis(1000).mul_f64(random_fraction())
 }
 
-/// Uniform in `[0, 1)` from the OS RNG; `0.5` if the RNG is unavailable.
+/// `0.5` if the RNG is unavailable.
 pub(crate) fn random_fraction() -> f64 {
     let mut bytes = [0u8; 4];
     if getrandom::fill(&mut bytes).is_err() {

@@ -272,7 +272,6 @@ pub struct TestCamera {
     pub video_device_index: IndexKind,
 }
 
-/// A value with something other than whitespace in it, trimmed.
 fn non_empty(value: &str) -> Result<String, String> {
     match value.trim() {
         "" => Err("must not be empty".to_string()),

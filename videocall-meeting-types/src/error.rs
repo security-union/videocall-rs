@@ -126,8 +126,6 @@ impl APIError {
         }
     }
 
-    /// A device JWT was presented on a route that requires a browser
-    /// session.
     pub fn browser_session_required() -> Self {
         Self {
             code: "BROWSER_SESSION_REQUIRED".to_string(),

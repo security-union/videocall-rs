@@ -23,6 +23,7 @@ jobs:
   test:
     name: cargo check-backend
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +45,7 @@ jobs:
   meeting-api-sqlite:
     name: meeting-api (sqlite)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DATABASE_URL: sqlite:/tmp/meeting_api_test.sqlite3
     steps:

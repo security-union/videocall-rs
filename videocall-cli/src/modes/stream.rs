@@ -32,16 +32,8 @@ use videocall_cli::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
-/// Install the stop handlers now and return a future that resolves on the
-/// first Ctrl-C, SIGTERM (systemd/docker stop) or SIGHUP (the SSH session
-/// went away). Installing them before any await means a signal during login
-/// or join is caught instead of killing the process.
-///
-/// A requested stop exits 0 wherever it happens (joining, connecting or
-/// streaming). Once connected, the relay session is closed explicitly
-/// (code 0) so the relay drops us right away. The CLI does not call
-/// meeting-api `leave`: its account may also be in the meeting from a
-/// browser, and leaving would mark that participant as gone.
+/// Installed before any await, so a signal during login or join is caught.
+/// No meeting-api `leave`: the same account may also be in the meeting from a browser.
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
@@ -66,14 +58,8 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     }
 }
 
-/// Join the meeting through meeting-api, then stream to the relay.
-///
-/// Exits 0 on Ctrl-C, SIGTERM or SIGHUP, and with an error when the relay
-/// connection or the camera drops: the CLI doesn't reconnect, so a
-/// supervisor (systemd) restarts it and it joins again from scratch. See
-/// [`videocall_cli::exit`] for the codes.
+/// No reconnect: a lost relay or camera exits 1 so a supervisor restarts and rejoins.
 pub async fn stream(opt: Stream) -> anyhow::Result<()> {
-    // One set of handlers for the whole run, installed before anything else.
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
 
@@ -118,9 +104,7 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let user_id = "offline-streaming-test".to_string();
         (user_id, CameraSynks::DeadSynk(DeadSynk::new(opt)))
     } else {
-        // Fail fast on a bad flag before logging in or joining anything.
         check_insecure_skip_verify(&opt.url, opt.insecure_skip_verify)?;
-        // Join as the account that approved this machine's device key.
         let api = ApiOrigin::from_url(&opt.api.api_url)?;
         let creds = Credentials::load(Store::open_default()?, api).await?;
         let join = videocall_cli::room::join(&creds, &opt.meeting_id, opt.display_name.as_deref());

@@ -16,8 +16,6 @@
  * conditions.
  */
 
-//! Loopback browser login (RFC 8252 section 7.3) with PKCE (RFC 7636).
-//!
 //! `state` is checked before anything else, so a request from any other
 //! page on this machine neither uses up the one callback nor ends the login.
 
@@ -33,10 +31,8 @@ use tokio::task::JoinSet;
 use videocall_meeting_client::device_session::ct_eq;
 use videocall_meeting_types::device::RedirectUri;
 
-/// How long the human has to finish in the browser.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Why the loopback login produced no code.
 #[derive(Debug, thiserror::Error)]
 pub enum LoopbackError {
     #[error("login cancelled in the browser. Nothing was saved.")]
@@ -49,16 +45,13 @@ pub enum LoopbackError {
     Io(#[from] std::io::Error),
 }
 
-/// What one request to the listener means.
 #[derive(Debug)]
 enum Outcome {
     /// Not ours (wrong path, or no matching `state`): answer, keep waiting.
     Ignored,
-    /// Ours: ends the login.
     Done(Result<SecretString, LoopbackError>),
 }
 
-/// Judge one request line, e.g. `GET /callback?code=…&state=… HTTP/1.1`.
 fn judge(request_line: &str, expected_state: &str) -> Outcome {
     let Some(query) = request_line
         .strip_prefix("GET /callback?")
@@ -127,7 +120,6 @@ async fn read_request_line(stream: &mut TcpStream) -> Option<String> {
         .flatten()
 }
 
-/// A listener on `127.0.0.1:{ephemeral}` waiting for one callback.
 pub struct LoopbackServer {
     listener: TcpListener,
     port: u16,
@@ -145,7 +137,6 @@ impl LoopbackServer {
         RedirectUri::Loopback { port: self.port }.as_uri()
     }
 
-    /// Serve until our callback arrives or `timeout` passes, then close.
     pub async fn wait_for_code(
         self,
         expected_state: &str,

@@ -11,9 +11,7 @@
  * at your option.
  */
 
-//! Device-JWT verification on the server: the `devices` row lookup and its
-//! state. The token format, length limit and signature checks are shared
-//! with the CLI in
+//! Device JWT verification against the `devices` row; the token checks live in
 //! [`videocall_meeting_types::device::crypto`].
 
 use chrono::{DateTime, Duration, Utc};
@@ -46,7 +44,6 @@ impl std::fmt::Display for DeviceAuthError {
     }
 }
 
-/// Verify a device JWT and return its row, checked against `allowed`.
 pub async fn verify_device_jwt(
     db: &DbPool,
     token: &str,
@@ -70,9 +67,7 @@ pub async fn verify_device_jwt(
     Ok(row)
 }
 
-/// Slide the idle expiry by the row's original idle span
-/// (`idle_expires_at - last_used_at`), at most once an hour. Errors are
-/// logged, not returned.
+/// Slide the idle expiry by the row's original idle span, at most once an hour.
 pub async fn touch_live_device(db: &DbPool, row: &DeviceRow, now: DateTime<Utc>) {
     if now - row.last_used_at < Duration::hours(1) {
         return;
@@ -86,7 +81,6 @@ pub async fn touch_live_device(db: &DbPool, row: &DeviceRow, now: DateTime<Utc>)
     }
 }
 
-/// PKCE verifier: 43..=128 unreserved characters (RFC 7636 4.1).
 pub fn is_valid_code_verifier(verifier: &str) -> bool {
     (43..=128).contains(&verifier.len())
         && verifier

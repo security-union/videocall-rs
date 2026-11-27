@@ -16,14 +16,7 @@
  * conditions.
  */
 
-//! `videocall-cli auth ...`: give this machine an Ed25519 key, have a human
-//! approve it in a browser, and sign every meeting-api request with it.
-//!
-//! Login is authorization code + PKCE against `{api}/cli/authorize`. The code
-//! arrives on a loopback listener or, with `--remote`, is pasted by the
-//! human, and is exchanged with a registration JWS signed by the new key at
-//! `POST /api/v1/devices`. Nothing is saved before that exchange succeeds and
-//! the server's fingerprint matches ours.
+//! Nothing is saved before the code exchange succeeds and the server's fingerprint matches ours.
 
 pub mod loopback;
 pub mod store;
@@ -47,10 +40,8 @@ use crate::cli_args::{AuthCommand, LoginArgs};
 use loopback::{LoopbackError, LoopbackServer, LOGIN_TIMEOUT};
 use store::{Store, StoreError, StoredDevice};
 
-/// Production meeting-api origin.
 pub const DEFAULT_API_URL: &str = "https://api.videocall.rs";
 
-/// Said whenever the CLI can't see what happened in the browser.
 const BROWSER_HINT: &str =
     "Check the browser page for an error, then run `videocall-cli auth login` again.";
 
@@ -63,10 +54,8 @@ pub enum AuthError {
         "this device is no longer authorized (revoked or expired). Run `videocall-cli auth login`."
     )]
     DeviceRevoked,
-    /// Login did not complete; nothing was saved.
     #[error("login failed: {0}")]
     Login(String),
-    /// Bad `--api-url` or `--name`.
     #[error("{0}")]
     Config(String),
     #[error(transparent)]
@@ -113,12 +102,10 @@ impl ApiOrigin {
     }
 }
 
-/// This machine's device, ready to call meeting-api.
 #[derive(Clone)]
 pub struct Credentials(DeviceSession);
 
 impl Credentials {
-    /// A session for a stored device (its key, id and API origin).
     fn new(device: &StoredDevice, ctx: &Ctx) -> Result<Self, KeyError> {
         let (seed, id) = (&device.private_key, device.device_id.clone());
         let session =
@@ -126,7 +113,6 @@ impl Credentials {
         Ok(Self(session?))
     }
 
-    /// This machine's device for `api`.
     pub async fn load(store: Store, api: ApiOrigin) -> Result<Self, AuthError> {
         let ctx = Ctx::new(store);
         let Some((device, _)) = ctx.store.load(api.as_str())? else {
@@ -135,8 +121,7 @@ impl Credentials {
         Ok(Self::new(&device, &ctx)?)
     }
 
-    /// Run a signed meeting-api call (see [`DeviceSession::call`]); a 401
-    /// the clock doesn't explain is [`AuthError::DeviceRevoked`].
+    /// A 401 the clock doesn't explain is [`AuthError::DeviceRevoked`].
     pub async fn call<T, F, Fut>(&self, f: F) -> Result<T, AuthError>
     where
         F: Fn(MeetingApiClient) -> Fut,
@@ -150,15 +135,13 @@ impl Credentials {
     }
 }
 
-/// A browser can be expected: not over SSH, and on Linux/BSD only with a
-/// desktop session.
+/// Not over SSH, and on Linux/BSD only with a desktop session.
 pub(crate) fn browser_expected(env: impl Fn(&str) -> Option<String>, os: &str) -> bool {
     let set = |key: &str| env(key).is_some_and(|v| !v.is_empty());
     !set("SSH_CONNECTION")
         && (matches!(os, "macos" | "windows") || set("DISPLAY") || set("WAYLAND_DISPLAY"))
 }
 
-/// `--name`, or `videocall-cli on <hostname>` reduced to what the server accepts.
 pub(crate) fn device_name(requested: Option<&str>, hostname: &str) -> Result<String, AuthError> {
     if let Some(name) = requested {
         return normalize_device_name(name).ok_or_else(|| {
@@ -188,7 +171,6 @@ fn hostname() -> String {
         .unwrap_or_default()
 }
 
-/// Refuse an authorize URL that isn't on the API origin itself.
 pub(crate) fn check_authorize_url(url: &str, api: &ApiOrigin) -> Result<(), AuthError> {
     match Url::parse(url) {
         Ok(parsed) if parsed.origin().ascii_serialization() == api.as_str() => Ok(()),
@@ -199,7 +181,6 @@ pub(crate) fn check_authorize_url(url: &str, api: &ApiOrigin) -> Result<(), Auth
     }
 }
 
-/// A pasted code: trimmed, 1..=256 visible ASCII characters.
 pub(crate) fn parse_pasted_code(line: &str) -> Result<SecretString, AuthError> {
     let code = line.trim();
     if code.is_empty() || code.len() > 256 || !code.bytes().all(|b| b.is_ascii_graphic()) {
@@ -210,7 +191,6 @@ pub(crate) fn parse_pasted_code(line: &str) -> Result<SecretString, AuthError> {
     Ok(SecretString::from(code.to_string()))
 }
 
-/// A plain-English message for a failed code exchange.
 fn exchange_error(error: ApiError) -> AuthError {
     let message = match &error {
         ApiError::Device { error: code, .. } => match code.as_str() {
@@ -224,22 +204,18 @@ fn exchange_error(error: ApiError) -> AuthError {
     AuthError::Login(message)
 }
 
-/// The process-wide clock; it says so when it starts using the server's time.
 static CLOCK: Clock = Clock::new(|offset| {
     eprintln!("warning: this machine's clock is {offset:+} s off the server's; using the server's time. Fix NTP.");
 });
 
 type ShowUrl = dyn Fn(&str, bool) -> bool + Send + Sync;
 
-/// What the auth commands touch, replaceable in tests.
 pub(crate) struct Ctx {
     pub store: Store,
     pub http: reqwest::Client,
     pub clock: &'static Clock,
-    /// Show the authorize URL (`remote` = don't open a browser); returns
-    /// whether a browser was opened.
+    /// `(url, remote)`; returns whether a browser was opened.
     pub show_url: Arc<ShowUrl>,
-    /// Read the line pasted in `--remote` mode.
     pub read_code: Arc<dyn Fn() -> std::io::Result<String> + Send + Sync>,
 }
 
@@ -264,14 +240,13 @@ impl Ctx {
         }
     }
 
-    /// Revoke a device with its own key; already revoked counts as done.
+    /// Already revoked counts as done.
     async fn revoke(&self, device: &StoredDevice) -> Result<(), AuthError> {
         let session = Credentials::new(device, self)?.0;
         Ok(session.revoke().await?)
     }
 }
 
-/// Run `videocall-cli auth <command>`.
 pub async fn run(command: &AuthCommand) -> anyhow::Result<()> {
     let ctx = Ctx::new(Store::open_default()?);
     match command {
@@ -372,7 +347,6 @@ pub(crate) async fn login_with(
         )));
     }
 
-    // Save the new device, then revoke the one it replaces.
     let previous = ctx.store.load(api.as_str()).unwrap_or_else(|e| {
         eprintln!("warning: couldn't read this machine's previous key ({e}); replacing it.");
         None
@@ -434,7 +408,6 @@ pub(crate) async fn logout(ctx: &Ctx, api: &ApiOrigin) -> Result<(), AuthError> 
     Ok(())
 }
 
-/// `auth status`. Returns whether the device is valid.
 pub(crate) async fn status(ctx: &Ctx, api: &ApiOrigin) -> Result<bool, AuthError> {
     println!("{}", api.as_str());
     let Some((device, location)) = ctx.store.load(api.as_str())? else {

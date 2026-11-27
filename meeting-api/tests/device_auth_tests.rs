@@ -11,10 +11,7 @@
  * at your option.
  */
 
-//! Device JWTs on the meeting endpoints: which credentials get in and what
-//! a CLI device may do. Claim-level token checks are unit tests in
-//! `videocall_meeting_types::device::crypto`; the sign-in flow is in
-//! `device_api_tests.rs`.
+//! Device JWTs on the meeting endpoints; claim-level checks are unit tests in the types crate.
 
 mod test_helpers;
 
@@ -51,7 +48,6 @@ fn room_token_claims(result: &Value) -> RoomAccessTokenClaims {
         .claims
 }
 
-/// Assert 200 and return the envelope's `result`.
 async fn ok(resp: Response) -> Value {
     assert_eq!(resp.status(), StatusCode::OK);
     response_json::<Value>(resp).await["result"].clone()
@@ -63,10 +59,6 @@ fn join_req(req: http::request::Builder, name: Option<&str>) -> Request<Body> {
         .body(Body::from(body.to_string()))
         .unwrap()
 }
-
-// ---------------------------------------------------------------------------
-// Which credentials get in
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -173,11 +165,9 @@ async fn device_token_forbidden_on_browser_only_routes() {
     let room = "dev-auth-forbid";
     let device = insert_device(&pool, &unique_user(), Fixture::Live).await;
     let sibling = insert_device(&pool, &device.user_id, Fixture::Live).await;
-    // The device's own user owns the meeting, so only the credential type
-    // decides the outcome.
+    // The device's user owns the meeting, so only the credential type decides.
     create_meeting(&pool, room, &device.user_id, true).await;
 
-    // A session JWT as bearer still works on a browser-only route.
     let session =
         meeting_api::token::generate_session_token(TEST_JWT_SECRET, &device.user_id, "Bee", 3600)
             .unwrap();
@@ -249,7 +239,6 @@ async fn device_token_forbidden_on_browser_only_routes() {
         let body: Value = response_json(resp).await;
         assert_eq!(body["result"]["code"], "BROWSER_SESSION_REQUIRED");
     }
-    // Nothing changed.
     assert_eq!(
         meeting(&pool, room).await.unwrap().state.as_deref(),
         Some("active")
@@ -262,10 +251,6 @@ async fn device_token_forbidden_on_browser_only_routes() {
     delete_device_data(&pool, &[&device.user_id]).await;
     cleanup_test_data(&pool, room).await;
 }
-
-// ---------------------------------------------------------------------------
-// A CLI device never hosts
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -285,7 +270,6 @@ async fn cli_device_never_hosts() {
         )
     };
 
-    // A join never creates a meeting.
     cleanup_test_data(&pool, room).await;
     let resp = send(&state, join()).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -293,7 +277,6 @@ async fn cli_device_never_hosts() {
     assert_eq!(body["result"]["code"], "MEETING_NOT_FOUND");
     assert!(meeting(&pool, room).await.is_none());
 
-    // The creator's idle meeting is not activated by the creator's device.
     create_meeting(&pool, room, &device.user_id, false).await;
     let before = meeting(&pool, room).await.unwrap().state;
     assert_ne!(before.as_deref(), Some("active"));
@@ -303,7 +286,6 @@ async fn cli_device_never_hosts() {
     assert_eq!(result["is_host"], false);
     assert_eq!(meeting(&pool, room).await.unwrap().state, before);
 
-    // Active: admitted without host rights; the host name is untouched.
     create_meeting(&pool, room, &device.user_id, true).await;
     let host_name_before = meeting(&pool, room).await.unwrap().host_display_name;
     let result = ok(send(&state, join()).await).await;
@@ -332,7 +314,6 @@ async fn cli_device_never_hosts() {
     assert_eq!(result["is_host"], false);
     assert!(!room_token_claims(&result).is_host);
 
-    // Leaving as the creator is refused and does not end the meeting.
     let leave = bearer(
         "POST",
         &format!("/api/v1/meetings/{room}/leave"),
@@ -348,10 +329,6 @@ async fn cli_device_never_hosts() {
     delete_device_data(&pool, &[&device.user_id]).await;
     cleanup_test_data(&pool, room).await;
 }
-
-// ---------------------------------------------------------------------------
-// last_used_at touch
-// ---------------------------------------------------------------------------
 
 async fn usage(pool: &DbPool, id: &str) -> (DateTime<Utc>, DateTime<Utc>) {
     let row = db::devices::find_device(pool, id).await.unwrap().unwrap();
@@ -372,8 +349,7 @@ async fn touch_updates_last_used_at_at_most_once_an_hour() {
             .unwrap()
     };
 
-    // Used two hours ago: the first call slides both columns, keeping the
-    // idle span.
+    // Used two hours ago: the first call slides both columns, keeping the idle span.
     let stale = insert_device(&pool, &unique_user(), Fixture::Stale).await;
     let (used_before, idle_before) = usage(&pool, &stale.id).await;
     ok(send(&state, get(&stale)).await).await;
@@ -386,7 +362,6 @@ async fn touch_updates_last_used_at_at_most_once_an_hour() {
             <= 1
     );
 
-    // Within the hour, nothing is written.
     ok(send(&state, get(&stale)).await).await;
     assert_eq!(usage(&pool, &stale.id).await, (used_after, idle_after));
     let fresh = insert_device(&pool, &unique_user(), Fixture::Live).await;
@@ -397,10 +372,6 @@ async fn touch_updates_last_used_at_at_most_once_an_hour() {
     delete_device_data(&pool, &[&stale.user_id, &fresh.user_id]).await;
     cleanup_test_data(&pool, room).await;
 }
-
-// ---------------------------------------------------------------------------
-// Display names and room-token lifetime for CLI callers
-// ---------------------------------------------------------------------------
 
 async fn open_meeting(state: &AppState, room: &str, waiting_room: bool) {
     let host = unique_user();
@@ -420,8 +391,6 @@ fn lifetime(result: &Value) -> i64 {
     (room_token_claims(result).exp - Utc::now().timestamp() + 5) / 10 * 10
 }
 
-/// Without a display name a CLI shows its account name, never the user id:
-/// from join, from status, and in the waiting-room observer token.
 #[tokio::test]
 #[serial]
 async fn cli_without_display_name_uses_the_account_name() {
@@ -479,9 +448,7 @@ async fn cli_without_display_name_uses_the_account_name() {
     cleanup_test_data(&pool, room).await;
 }
 
-/// The same account in a browser and a CLI: a CLI name fills an empty row
-/// but never renames the browser's; the browser always wins. CLI room tokens
-/// live 300 s, browser ones keep the configured TTL.
+/// CLI room tokens live 300 s, browser ones keep the configured TTL.
 #[tokio::test]
 #[serial]
 async fn cli_name_never_renames_the_browser_session() {

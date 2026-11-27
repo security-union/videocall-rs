@@ -40,7 +40,6 @@ use super::camera_synk::CameraSynk;
 pub struct WebTransportClient {
     options: Stream,
     creds: Credentials,
-    /// The account this device acts as, from meeting-api.
     user_id: String,
     sender: Option<Sender<Vec<u8>>>,
 }
@@ -132,7 +131,6 @@ impl WebTransportClient {
     }
 }
 
-/// `{relay}/lobby?token=<room token>`.
 pub fn lobby_url(relay: &url::Url, room_token: &str) -> url::Url {
     let mut url = relay.clone();
     url.set_path("/lobby");

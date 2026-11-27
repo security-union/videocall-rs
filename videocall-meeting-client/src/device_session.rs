@@ -11,10 +11,8 @@
  * at your option.
  */
 
-//! A device's side of meeting-api (feature `device-session`): the login that
-//! registers a new key, and a session that signs every request with it.
-//! Signing happens in `videocall_meeting_types::device::crypto`; the seed
-//! leaves only through [`DeviceLogin::seed_b64`], for the caller's key store.
+//! A device's side of meeting-api: the login that registers a key, and a signing session.
+//! The seed leaves only through [`DeviceLogin::seed_b64`], for the caller's key store.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -32,12 +30,8 @@ use crate::{ApiError, AuthMode, MeetingApiClient, TokenSource};
 
 pub use videocall_meeting_types::device::crypto::{ct_eq, DeviceKey, KeyError};
 
-/// The clock tokens are signed with: local time plus a learned offset.
-///
-/// A Raspberry Pi has no RTC, so after boot its clock can be minutes off
-/// until NTP catches up, and the server (60 s leeway) would reject every
-/// token. When the server's time differs by more than 30 s, the device signs
-/// with the server's time for the rest of the process. Nothing is persisted.
+/// Local time plus a learned offset. A Raspberry Pi has no RTC, so its clock can be minutes
+/// off after boot; beyond 30 s the device signs with the server's time.
 #[derive(Debug)]
 pub struct Clock {
     offset: AtomicI64,
@@ -53,13 +47,11 @@ impl Clock {
         }
     }
 
-    /// Unix time to sign with.
     pub fn now(&self) -> i64 {
         local_now() + self.offset.load(Ordering::Relaxed)
     }
 
-    /// Adopt the server's time if we are more than 30 s off it. Returns true
-    /// if the offset changed, which makes one retry worthwhile.
+    /// Returns true if the offset changed, which makes one retry worthwhile.
     pub fn adopt_server_time(&self, server_now: i64) -> bool {
         let wanted = server_now - local_now();
         if (wanted - self.offset.load(Ordering::Relaxed)).abs() <= 30 {
@@ -71,14 +63,12 @@ impl Clock {
     }
 }
 
-/// Local Unix time in seconds, uncorrected.
 pub fn local_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// One login in progress: a new key, its PKCE pair and `state`.
 pub struct DeviceLogin {
     key: DeviceKey,
     pkce: Pkce,
@@ -107,12 +97,10 @@ impl DeviceLogin {
         self.key.fingerprint()
     }
 
-    /// The seed, for the caller's key store.
     pub fn seed_b64(&self) -> SecretString {
         self.key.seed_b64()
     }
 
-    /// The browser URL that starts this login (`{base}/cli/authorize?…`).
     pub fn authorize_url(&self, client: &MeetingApiClient) -> Result<String, ApiError> {
         let mut url = reqwest::Url::parse(&client.url(CLI_AUTHORIZE_PATH))
             .map_err(|e| ApiError::Config(format!("bad base URL: {e}")))?;
@@ -128,8 +116,6 @@ impl DeviceLogin {
         Ok(url.into())
     }
 
-    /// Exchange the approved `code` for a device, signing the registration
-    /// at `now`.
     pub async fn exchange(
         &self,
         client: &MeetingApiClient,
@@ -148,7 +134,6 @@ impl DeviceLogin {
     }
 }
 
-/// Mints one device JWT per request for [`AuthMode::Signed`].
 struct DeviceTokens {
     key: DeviceKey,
     device_id: String,
@@ -169,7 +154,6 @@ impl TokenSource for DeviceTokens {
     }
 }
 
-/// A registered device, ready to call meeting-api at `api_origin`.
 #[derive(Clone)]
 pub struct DeviceSession {
     tokens: Arc<DeviceTokens>,
@@ -177,7 +161,6 @@ pub struct DeviceSession {
 }
 
 impl DeviceSession {
-    /// The device `device_id` with the stored `seed`.
     pub fn from_seed(
         http: reqwest::Client,
         api_origin: &str,
@@ -203,10 +186,8 @@ impl DeviceSession {
         MeetingApiClient::with_http(self.http.clone(), &self.tokens.aud, auth)
     }
 
-    /// Run a meeting-api call; every request carries a fresh device JWT.
-    /// On a 401, adopt the server's clock if ours is off and run `f` once
-    /// more. A 401 the clock doesn't explain is
-    /// [`ApiError::NotAuthenticated`]: the device is revoked or expired.
+    /// On a 401, adopt the server's clock if ours is off and retry once; any other 401 is
+    /// [`ApiError::NotAuthenticated`] (revoked or expired).
     pub async fn call<T, F, Fut>(&self, f: F) -> Result<T, ApiError>
     where
         F: Fn(MeetingApiClient) -> Fut,

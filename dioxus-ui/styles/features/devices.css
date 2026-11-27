@@ -7,7 +7,6 @@
  */
 
 @layer features {
-  /* Button labels stay on one line. */
   .devices-page .btn {
     white-space: nowrap;
   }
@@ -30,7 +29,6 @@
     overflow-wrap: anywhere;
   }
 
-  /* Dates wrap between values, never inside one. */
   .device-dates {
     display: flex;
     flex-wrap: wrap;

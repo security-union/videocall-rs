@@ -11,17 +11,9 @@
  * at your option.
  */
 
-//! The two device tokens, signed by videocall-cli and verified by
-//! meeting-api with the same code: the per-request device JWT (`kid` = `sub`
-//! = device id) and the self-signed registration JWS (no `kid`). Both are
-//! `{"typ":"JWT","alg":"EdDSA"}` over JSON claims. The verifiers pin EdDSA
-//! and never read the algorithm from the header, so HS256 session and room
-//! tokens can never pass as device tokens. Also the device key itself, PKCE
-//! and the random values, hashes and comparisons both sides need. Behind the
-//! `device-crypto` feature so the browser build stays free of signing code.
-//!
-//! The seed never goes on argv, in the environment or in logs, and every
-//! in-memory copy is a zeroize-on-drop type; `Debug` shows only the public key.
+//! Device token signing and verification, shared by videocall-cli and meeting-api.
+//! The verifiers pin EdDSA, so HS256 session and room tokens never pass as device tokens.
+//! Every in-memory seed copy is zeroize-on-drop; `Debug` shows only the public key.
 
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -40,7 +32,6 @@ use super::{
     DEVICE_TOKEN_LEEWAY_SECS, DEVICE_TOKEN_MAX_LIFETIME_SECS, DEVICE_TOKEN_TTL_SECS,
 };
 
-/// Key generation, loading or signing failed.
 #[derive(Debug)]
 pub enum KeyError {
     Random(getrandom::Error),
@@ -60,7 +51,6 @@ impl std::fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
-/// `n` bytes from the OS CSPRNG, base64url without padding.
 pub fn random_b64url(n: usize) -> Result<String, KeyError> {
     let mut bytes = Zeroizing::new(vec![0u8; n]);
     getrandom::fill(&mut bytes).map_err(KeyError::Random)?;
@@ -80,14 +70,12 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
-/// A PKCE S256 verifier (sent only in the code exchange) and its challenge.
 pub struct Pkce {
     pub verifier: SecretString,
     pub challenge: String,
 }
 
 impl Pkce {
-    /// A verifier from 32 CSPRNG bytes (43 characters).
     pub fn generate() -> Result<Self, KeyError> {
         let verifier = random_b64url(32)?;
         let challenge = code_challenge_s256(&verifier);
@@ -99,7 +87,6 @@ impl Pkce {
     }
 }
 
-/// An Ed25519 device key.
 pub struct DeviceKey {
     signing: SigningKey,
     encoding: EncodingKey,
@@ -112,14 +99,12 @@ impl std::fmt::Debug for DeviceKey {
 }
 
 impl DeviceKey {
-    /// A new key from the OS CSPRNG.
     pub fn generate() -> Result<Self, KeyError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(KeyError::Random)?;
         Self::from_signing(SigningKey::from_bytes(&seed))
     }
 
-    /// Load from the stored base64url seed.
     pub fn from_seed_b64(seed: &SecretString) -> Result<Self, KeyError> {
         let bytes =
             Zeroizing::new(base64url_decode(seed.expose_secret()).ok_or(KeyError::Corrupt)?);
@@ -145,13 +130,11 @@ impl DeviceKey {
         fingerprint(&self.signing.verifying_key().to_bytes())
     }
 
-    /// A device JWT for one request to `aud`, with a fresh random `jti`.
     pub fn device_token(&self, device_id: &str, aud: &str, now: i64) -> Result<String, KeyError> {
         sign_device_token(&self.encoding, device_id, aud, now, random_b64url(16)?)
             .map_err(|e| KeyError::Sign(e.to_string()))
     }
 
-    /// The registration JWS for `aud`, naming the device `name`.
     pub fn registration_jws(&self, aud: &str, name: &str, now: i64) -> Result<String, KeyError> {
         let claims = RegistrationClaims {
             iss: CLI_ISSUER.to_string(),
@@ -164,7 +147,6 @@ impl DeviceKey {
         self.sign_claims(None, &claims)
     }
 
-    /// Sign arbitrary `claims` with the device header shape.
     #[doc(hidden)] // Public only so meeting-api's tests can forge tokens.
     pub fn sign_claims(
         &self,
@@ -178,15 +160,12 @@ impl DeviceKey {
 /// Longest device token or registration JWS read at all.
 pub const MAX_DEVICE_TOKEN_LEN: usize = 2048;
 
-/// The jsonwebtoken key for `signing`. jsonwebtoken takes PKCS#8 DER; the
-/// intermediate document zeroizes itself on drop.
+/// jsonwebtoken takes PKCS#8 DER; the intermediate document zeroizes itself on drop.
 fn encoding_key(signing: &SigningKey) -> Result<EncodingKey, String> {
     let der = signing.to_pkcs8_der().map_err(|e| e.to_string())?;
     Ok(EncodingKey::from_ed_der(der.as_bytes()))
 }
 
-/// Sign `claims` with the one device header shape: EdDSA, `typ: JWT`, and
-/// `kid` when given.
 fn sign(
     key: &EncodingKey,
     kid: Option<&str>,
@@ -199,7 +178,6 @@ fn sign(
     jsonwebtoken::encode(&header, claims, key)
 }
 
-/// A device JWT for one request to `aud`, valid [`DEVICE_TOKEN_TTL_SECS`].
 fn sign_device_token(
     key: &EncodingKey,
     device_id: &str,
@@ -225,9 +203,7 @@ pub fn validate_public_key(encoded: &str) -> Option<[u8; 32]> {
     (!key.is_weak()).then_some(raw)
 }
 
-/// EdDSA only, issuer `videocall-cli`, the exact audience. `exp` is checked
-/// by [`check_token_times`] against the caller's `now` instead (jsonwebtoken
-/// would read the system clock), so always pair the two.
+/// `exp` is left to [`check_token_times`], which uses the caller's `now`; always pair the two.
 fn validation(expected_aud: &str, require_sub: bool) -> Validation {
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[CLI_ISSUER]);
@@ -243,9 +219,7 @@ fn validation(expected_aud: &str, require_sub: bool) -> Validation {
     validation
 }
 
-/// `exp` and `iat` within the leeway of `now` (Unix seconds), and
-/// `exp - iat` in `1..=DEVICE_TOKEN_MAX_LIFETIME_SECS`. Checked arithmetic,
-/// so extreme claim values cannot wrap around the bounds.
+/// `exp`/`iat` within the leeway of `now`, bounded lifetime; checked arithmetic, so nothing wraps.
 pub fn check_token_times(iat: i64, exp: i64, now: i64) -> Result<(), &'static str> {
     let earliest_exp = now
         .checked_sub(DEVICE_TOKEN_LEEWAY_SECS)
@@ -266,8 +240,7 @@ pub fn check_token_times(iat: i64, exp: i64, now: i64) -> Result<(), &'static st
     }
 }
 
-/// The well-formed `kid` of an unverified EdDSA header. Proves nothing; it
-/// only selects the key [`verify_device_token`] uses. The reason is for logs.
+/// The unverified `kid`; it only selects the key [`verify_device_token`] uses.
 pub fn device_token_kid(token: &str) -> Result<String, &'static str> {
     if token.len() > MAX_DEVICE_TOKEN_LEN {
         return Err("token too long");
@@ -282,8 +255,6 @@ pub fn device_token_kid(token: &str) -> Result<String, &'static str> {
         .ok_or("missing or malformed kid")
 }
 
-/// Verify a device JWT against the stored key of device `kid`: pinned EdDSA
-/// signature and claims, `sub == kid`, time bounds. The reason is for logs.
 pub fn verify_device_token(
     token: &str,
     kid: &str,
@@ -294,8 +265,7 @@ pub fn verify_device_token(
     if token.len() > MAX_DEVICE_TOKEN_LEN {
         return Err("token too long");
     }
-    // Only ever build a DecodingKey from exactly 32 bytes: the EdDSA verifier
-    // slices [..32] and would panic on a shorter key.
+    // The EdDSA verifier slices [..32] and panics on a shorter key.
     let raw = decode_public_key(public_key_b64).ok_or("stored key")?;
     let claims = decode::<DeviceTokenClaims>(
         token,
@@ -316,9 +286,7 @@ struct PublicKeyOnly {
     public_key: String,
 }
 
-/// Verify the self-signed registration JWS: read `public_key` unverified,
-/// validate it, then verify the token with that key. Returns the claims
-/// (name normalized) and the raw key; `None` for any rejection.
+/// Reads `public_key` unverified, validates it, then verifies with it; `None` on any rejection.
 pub fn verify_registration(
     token: &str,
     audience: &str,
@@ -349,9 +317,8 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    // Golden vectors. TEST ONLY: the seed is the public RFC 8032 section 7.1
-    // TEST 1 secret key. Ed25519 is deterministic, so a changed token means
-    // the wire format changed.
+    // Golden vectors. TEST ONLY: the seed is the public RFC 8032 section 7.1 TEST 1 key.
+    // Ed25519 is deterministic, so a changed token means the wire format changed.
     const SEED: &str = "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A";
     const PUBLIC_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const DEVICE_ID: &str = "aB3dE5fG7hI9jK1lM3nO5p";
@@ -406,14 +373,12 @@ mod tests {
         assert!(check_token_times(t, t + 301, t).is_err());
         assert!(check_token_times(t + 60, t + 120, t).is_ok());
         assert!(check_token_times(t + 120, t + 240, t).is_err());
-        // Overflow and non-positive lifetimes.
         assert!(check_token_times(i64::MIN, t + 120, t).is_err());
         assert!(check_token_times(i64::MIN, i64::MAX, t).is_err());
         assert!(check_token_times(t, t - 1, t).is_err());
         assert!(check_token_times(t, t, t).is_err());
         assert!(check_token_times(t, i64::MIN, t).is_err());
         assert!(check_token_times(t, t + 1, t).is_ok());
-        // `exp` is checked against the given `now`, with the leeway.
         assert!(check_token_times(t - 150, t - 50, t).is_ok());
         assert!(check_token_times(t - 200, t - 61, t).is_err());
         assert!(check_token_times(t - 200, t - 100, t).is_err());
@@ -454,7 +419,6 @@ mod tests {
         assert!(validate_public_key(PUBLIC_KEY).is_some());
     }
 
-    /// Everything the device-token verifier checks, short of the stored row.
     #[test]
     fn device_token_rejections() {
         let key = DeviceKey::from_seed_b64(&SecretString::from(SEED.to_string())).unwrap();
@@ -547,7 +511,6 @@ mod tests {
         for (name, token) in cases {
             assert!(verify(&token).is_err(), "{name}");
         }
-        // The stored key must be the signer's, and decode to exactly 32 bytes.
         let token = signed(Some(DEVICE_ID), claims(&|_| {}));
         let wrong_key = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
         assert!(verify_device_token(&token, DEVICE_ID, wrong_key, AUD, now).is_err());

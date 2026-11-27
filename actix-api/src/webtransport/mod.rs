@@ -231,8 +231,7 @@ pub async fn start(
     Ok(())
 }
 
-/// Decide from the CONNECT URL alone whether it may join. The only accepted
-/// form is `/lobby?token=<JWT>`; a refused request is dropped, as before.
+/// Decide from the CONNECT URL alone whether it may join: only `/lobby?token=<JWT>`.
 fn authorize_connect(
     path: &str,
     token: Option<&str>,
@@ -271,7 +270,6 @@ async fn run_webtransport_connection_from_request(
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
 
-    // Identity and room come from the JWT claims; there is no other way in.
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
     let claims = authorize_connect(uri.path(), token.as_deref(), &jwt_secret)?;
     info!(
@@ -397,7 +395,6 @@ mod tests {
         use actix::Actor;
         use std::net::ToSocketAddrs;
 
-        // The server only accepts room tokens; every test signs with this secret.
         std::env::set_var("JWT_SECRET", JWT_SECRET);
 
         // Connect to NATS
@@ -521,13 +518,11 @@ mod tests {
         .expect("WebTransport server not ready after 10 seconds");
     }
 
-    /// Mint a room token for `user` in `room`, signed with the test secret.
     fn token_for(user: &str, room: &str) -> String {
         meeting_api::token::generate_room_token(JWT_SECRET, TOKEN_TTL_SECS, user, room, false, user)
             .expect("generate room token")
     }
 
-    /// Connect as `user` to `meeting` with a freshly minted room token.
     async fn connect_client(
         user: &str,
         meeting: &str,

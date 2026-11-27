@@ -101,8 +101,7 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
 // Room access token
 // ---------------------------------------------------------------------------
 
-/// Sign a room access token for the given participant; see
-/// [`videocall_meeting_types::token::generate_room_token`].
+/// [`videocall_meeting_types::token::generate_room_token`] with meeting-api's error.
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,

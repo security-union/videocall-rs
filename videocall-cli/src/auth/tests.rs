@@ -115,14 +115,12 @@ fn input_checks() {
     assert!(rejected.to_string().contains("Check the browser page"));
 }
 
-// A minimal meeting-api: answers from a handler and stamps a `Date` that is
-// `skew` seconds ahead of ours.
+// A minimal meeting-api whose `Date` is `skew` seconds ahead of ours.
 
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
     path: String,
-    /// `iat` and `kid` of the bearer device JWT, if any.
     iat: Option<i64>,
     kid: Option<String>,
     body: Value,
@@ -217,8 +215,7 @@ async fn mock(
     Mock { api, seen }
 }
 
-/// Like the real server: a device JWT or registration more than 60 s off
-/// the server's clock is rejected.
+/// The server's rule: more than 60 s off its clock is rejected.
 fn fresh(iat: Option<i64>, server_now: i64) -> bool {
     iat.is_some_and(|iat| (iat - server_now).abs() <= 60)
 }
@@ -315,17 +312,12 @@ async fn logout_deletes_locally_even_if_the_server_refuses_or_is_gone() {
     );
 }
 
-// Login.
-
 fn registration_claims(body: &Value) -> Value {
     let jws = body["registration"].as_str().unwrap();
     serde_json::from_slice(&base64url_decode(jws.split('.').nth(1).unwrap()).unwrap()).unwrap()
 }
 
-/// A meeting-api for login whose clock is an hour ahead of ours. The
-/// exchange succeeds for `code` with a fresh registration, returning the
-/// key's fingerprint unless `wrong_fingerprint`; a fresh signed DELETE /me
-/// gets 204.
+/// Login meeting-api, an hour ahead; accepts `code`, optionally with a wrong fingerprint.
 async fn login_server(code: &'static str, wrong_fingerprint: bool) -> Mock {
     mock(3600, move |seen, now| match (seen.method.as_str(), seen.path.as_str()) {
         ("POST", "/api/v1/devices") => {
@@ -360,7 +352,6 @@ fn query(url: &str, key: &str) -> String {
         .into_owned()
 }
 
-/// A "browser" that records the URL and runs `then` on it.
 fn browser(
     then: impl Fn(&str) + Send + Sync + 'static,
 ) -> (
@@ -376,8 +367,6 @@ fn browser(
     })
 }
 
-/// The exchange matches the authorize URL, and the saved key is the one
-/// the URL carried.
 fn check_login(server: &Mock, ctx: &Ctx, url: &str, redirect_uri: &str) {
     assert!(url.starts_with(&format!("{}/cli/authorize?", server.api.as_str())));
     let (_, post) = server.find("POST").expect("exchange sent");

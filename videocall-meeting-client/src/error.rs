@@ -38,18 +38,11 @@ pub enum ApiError {
     #[error("Server error ({status}): {body}")]
     ServerError { status: u16, body: String },
 
-    /// An error from the device endpoints (`POST /api/v1/devices`,
-    /// `GET`/`DELETE /api/v1/devices/me`) in their `{"error",
-    /// "error_description"}` shape, e.g. `invalid_request`, `invalid_grant`,
-    /// `key_already_registered`, `too_many_devices`. A 401 is
-    /// [`ApiError::NotAuthenticated`].
+    /// An error from the device endpoints in their `{"error","error_description"}` shape.
     #[error("device API error ({status}): {error}")]
     Device {
-        /// HTTP status code.
         status: u16,
-        /// Machine-readable error code.
         error: String,
-        /// Static human-readable description from the server.
         error_description: String,
     },
 
@@ -61,7 +54,6 @@ pub enum ApiError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    /// The device key couldn't be generated, loaded or used to sign.
     #[cfg(feature = "device-session")]
     #[error(transparent)]
     Key(#[from] videocall_meeting_types::device::crypto::KeyError),

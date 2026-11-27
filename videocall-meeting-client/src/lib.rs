@@ -47,8 +47,7 @@ pub mod participants;
 pub mod waiting_room;
 
 pub use error::ApiError;
-/// Re-exported so callers of [`MeetingApiClient::with_http`] build the
-/// `reqwest::Client` from the same version this crate uses.
+/// Re-exported so callers build the `reqwest::Client` from the same version.
 pub use reqwest;
 pub use videocall_meeting_types;
 
@@ -56,19 +55,13 @@ use std::sync::Arc;
 
 use reqwest::Client;
 
-/// Mints a fresh `Authorization: Bearer` token for each request.
-///
-/// Used for credentials that must not be reused across requests, such as
-/// `videocall-cli`'s device JWTs (one signed token per request, bound to
-/// the meeting-api origin). Implementations must never log the token.
+/// Mints a fresh bearer token for each request. Implementations must never log the token.
 pub trait TokenSource: Send + Sync {
-    /// A new token for the next request, or `None` if one couldn't be made
-    /// (the request is then sent without credentials and fails with 401).
+    /// `None` sends the request without credentials, so it fails with 401.
     fn token(&self) -> Option<String>;
 }
 
 /// How the client authenticates with the meeting API.
-///
 /// `Debug` never prints the bearer token.
 #[derive(Clone)]
 pub enum AuthMode {
@@ -78,8 +71,7 @@ pub enum AuthMode {
     /// Bearer token mode: attach `Authorization: Bearer <token>` to every
     /// request. Used by mobile apps and integration tests.
     Bearer(String),
-    /// Per-request token mode: ask the [`TokenSource`] for a new token for
-    /// every request. Used by `videocall-cli` device keys.
+    /// Ask the [`TokenSource`] for a new token for every request.
     Signed(Arc<dyn TokenSource>),
 }
 
@@ -115,12 +107,7 @@ impl MeetingApiClient {
         Self::with_http(Client::new(), base_url, auth)
     }
 
-    /// Create a client that reuses an existing [`reqwest::Client`].
-    ///
-    /// `reqwest::Client` is a cheap handle onto a shared connection pool, so
-    /// a long-running native program (e.g. `videocall-cli`) should build one
-    /// and pass it to every `MeetingApiClient` it creates, instead of paying
-    /// a new TCP + TLS handshake per client.
+    /// Create a client on a shared [`reqwest::Client`], reusing its connection pool.
     pub fn with_http(http: Client, base_url: &str, auth: AuthMode) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),

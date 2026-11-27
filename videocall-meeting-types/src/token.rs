@@ -74,8 +74,7 @@ impl RoomAccessTokenClaims {
     pub const ISSUER: &'static str = "videocall-meeting-backend";
 }
 
-/// Sign a room access token for the given participant (HS256 with the
-/// relay's `secret`, valid `ttl_secs`).
+/// Sign a room access token (HS256 with the relay's `secret`).
 #[cfg(feature = "room-token")]
 pub fn generate_room_token(
     secret: &str,

@@ -11,9 +11,7 @@
  * at your option.
  */
 
-//! The device sign-in JSON API: `GET /cli/authorize`, approve, the CLI's
-//! code exchange, and the user's device list and revoke. The CLI side is
-//! played with real Ed25519 keys and PKCE.
+//! The device sign-in JSON API, with the CLI side played by real keys and PKCE.
 
 mod test_helpers;
 
@@ -36,7 +34,6 @@ use videocall_meeting_types::device::{
 const AUD: &str = TEST_DEVICE_AUDIENCE;
 const APPROVE: &str = "/api/v1/devices/authorizations";
 
-/// The CLI side of one login.
 struct Cli {
     key: DeviceKey,
     verifier: String,
@@ -62,7 +59,6 @@ impl Cli {
         Self::new(CLI_REMOTE_REDIRECT_URI)
     }
 
-    /// The approve body the app sends, built from the CLI's query.
     fn approval(&self, confirm: bool) -> Value {
         json!({
             "redirect_uri": self.redirect_uri,
@@ -153,7 +149,6 @@ async fn me(state: &AppState, cli: &Cli, device_id: &str) -> StatusCode {
     send(state, req.body(Body::empty()).unwrap()).await.status()
 }
 
-/// Approve and exchange; returns the new device id.
 async fn sign_in(state: &AppState, user: &str, cli: &Cli) -> String {
     let code = approved_code(state, user, cli).await;
     let resp = exchange(state, &cli.exchange_body(&code)).await;
@@ -210,14 +205,12 @@ async fn authorize_redirects_to_the_app_with_the_query_verbatim() {
         assert_eq!(decode_authorize_request(request).as_deref(), Some(query));
     }
 
-    // Over 2048 bytes: 400, no redirect.
     let long = format!("/cli/authorize?state={}", "a".repeat(2043));
     let resp = send(&state, get(&long)).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(header(&resp, "location").is_none());
 
-    // OAuth is not needed (`build_state` has none); a missing audience or
-    // app origin is a 503.
+    // OAuth is not needed; a missing audience or app origin is a 503.
     let mut no_audience = state.clone();
     no_audience.device.audience = None;
     let mut no_app = state.clone();
@@ -255,7 +248,6 @@ async fn loopback_approve_and_exchange() {
     assert_eq!(base64url_decode(code).unwrap().len(), 32);
     assert_eq!(pairs[1], ("state".to_string(), cli.state.clone()));
 
-    // Only the hash is stored.
     let stored: String =
         sqlx::query_scalar("SELECT code_hash FROM device_auth_codes WHERE user_id = $1")
             .bind(&user)
@@ -346,7 +338,6 @@ async fn approve_rejects_invalid_input_and_writes_nothing() {
     .await;
     assert_eq!(codes_of(&pool, &user).await, 0);
 
-    // No session at all.
     let anonymous = Request::builder()
         .method("POST")
         .uri(APPROVE)
@@ -359,7 +350,6 @@ async fn approve_rejects_invalid_input_and_writes_nothing() {
         StatusCode::UNAUTHORIZED
     );
 
-    // A key already registered to anyone: 409.
     let other = unique_user();
     let registered = Cli::loopback();
     sign_in(&state, &other, &registered).await;
@@ -511,7 +501,6 @@ async fn every_invalid_grant_burns_the_code() {
         assert_cli_error(resp, StatusCode::BAD_REQUEST, "invalid_grant").await;
     }
 
-    // Unknown and reused codes.
     let cli = Cli::loopback();
     let resp = exchange(
         &state,
@@ -542,19 +531,16 @@ async fn too_many_devices_at_approve_and_at_exchange() {
     for _ in 1..MAX_DEVICES_PER_USER {
         insert_device(&pool, &user, Fixture::Live).await;
     }
-    // Revoked and expired devices do not count.
     insert_device(&pool, &user, Fixture::Revoked).await;
     insert_device(&pool, &user, Fixture::IdleExpired).await;
 
-    // One slot left: approve succeeds, then the slot is taken before the
-    // exchange.
+    // One slot left: approve succeeds, then the slot is taken before the exchange.
     let cli = Cli::loopback();
     let code = approved_code(&state, &user, &cli).await;
     insert_device(&pool, &user, Fixture::Live).await;
     let resp = exchange(&state, &cli.exchange_body(&code)).await;
     assert_cli_error(resp, StatusCode::CONFLICT, "too_many_devices").await;
 
-    // At the cap, approve refuses and stores nothing.
     let resp = approve(&state, &user, &Cli::loopback().approval(true)).await;
     assert_error(resp, StatusCode::CONFLICT, "TOO_MANY_DEVICES").await;
     assert_eq!(codes_of(&pool, &user).await, 0);
@@ -595,8 +581,7 @@ async fn device_cap_holds_under_concurrent_inserts() {
         match task.await.unwrap() {
             Ok(db::devices::CappedInsert::Inserted) => inserted += 1,
             Ok(db::devices::CappedInsert::TooManyDevices) => {}
-            // SQLite may report a busy database under contention; such an
-            // insert simply did not happen.
+            // SQLite may report a busy database under contention; that insert just didn't happen.
             Err(e) if cfg!(feature = "postgres") => panic!("unexpected error: {e}"),
             Err(_) => {}
         }
@@ -676,7 +661,6 @@ async fn revoke_own_device_is_immediate_and_others_are_404() {
     assert_eq!(bodies[0]["result"]["code"], "DEVICE_NOT_FOUND");
     assert_eq!(me(&state, &theirs, &their_device).await, StatusCode::OK);
 
-    // Own device: 204, and its very next request is refused.
     assert_eq!(me(&state, &mine, &my_device).await, StatusCode::OK);
     assert_eq!(
         send(&state, delete(&my_device)).await.status(),

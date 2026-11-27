@@ -11,9 +11,7 @@
  * at your option.
  */
 
-//! `videocall-cli` device login and device self-management. A 401 is
-//! [`ApiError::NotAuthenticated`]; errors in the device endpoints'
-//! `{"error","error_description"}` shape are [`ApiError::Device`].
+//! `videocall-cli` device login and self-management.
 
 use videocall_meeting_types::device::{
     DeviceErrorResponse, DeviceStatusResponse, RegisterDeviceRequest, RegisterDeviceResponse,
@@ -26,12 +24,10 @@ use videocall_meeting_types::{APIError, APIResponse};
 
 impl MeetingApiClient {
     fn register_request(&self, request: &RegisterDeviceRequest) -> reqwest::RequestBuilder {
-        // Unauthenticated by design: the code, verifier and registration JWS
-        // are the proof.
+        // Unauthenticated by design: the code, verifier and registration JWS are the proof.
         self.http.post(self.url(DEVICES_PATH)).json(request)
     }
 
-    /// Exchange an authorization code for an approved device.
     pub async fn register_device(
         &self,
         request: &RegisterDeviceRequest,
@@ -40,15 +36,12 @@ impl MeetingApiClient {
         Ok(success(response).await?.json().await?)
     }
 
-    /// The calling device's record.
     pub async fn device_me(&self) -> Result<DeviceStatusResponse, ApiError> {
         let response = self.get(DEVICES_ME_PATH).send().await?;
         Ok(success(response).await?.json().await?)
     }
 
-    /// The server's clock in Unix seconds, from the `Date` header of an
-    /// unauthenticated `GET /version`, so a device with a wrong clock can
-    /// still sign tokens the server accepts.
+    /// The server's clock, from the `Date` header of an unauthenticated `GET /version`.
     #[cfg(feature = "device-session")]
     pub async fn server_time(&self) -> Option<i64> {
         let response = self.http.get(self.url("/version")).send().await.ok()?;
@@ -62,14 +55,12 @@ impl MeetingApiClient {
         i64::try_from(secs).ok()
     }
 
-    /// Revoke the calling device.
     pub async fn delete_device_me(&self) -> Result<(), ApiError> {
         let response = self.delete(DEVICES_ME_PATH).send().await?;
         success(response).await.map(drop)
     }
 }
 
-/// The response if it is a 2xx, else its [`ApiError`].
 pub(crate) async fn success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
@@ -82,10 +73,8 @@ pub(crate) async fn success(response: reqwest::Response) -> Result<reqwest::Resp
     Err(device_error_from_body(status, &text))
 }
 
-/// Any 404 is [`ApiError::NotFound`] whatever the body says (callers treat
-/// it as "already gone"). Otherwise the code comes from either shape the
-/// server uses: `{"success":false,"result":{"code","message"}}` or
-/// `{"error","error_description"}`.
+/// Any 404 is [`ApiError::NotFound`] (callers treat it as already gone); otherwise the code
+/// comes from either the `APIResponse` or the OAuth error shape.
 pub(crate) fn device_error_from_body(status: u16, text: &str) -> ApiError {
     if status == 404 {
         return ApiError::NotFound(text.to_string());

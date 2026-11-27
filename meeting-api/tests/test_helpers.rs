@@ -61,7 +61,6 @@ pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
 pub const TEST_UI_ORIGIN: &str = "http://localhost:3001";
 pub const TEST_DEVICE_AUDIENCE: &str = "http://localhost:8081";
 
-/// Build the test `AppState` backed by the given pool.
 pub fn build_state(pool: DbPool) -> AppState {
     AppState {
         db: pool,
@@ -84,7 +83,6 @@ pub fn build_state(pool: DbPool) -> AppState {
     }
 }
 
-/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
 pub fn build_app(pool: DbPool) -> Router {
     routes::router().with_state(build_state(pool))
 }
@@ -113,7 +111,6 @@ pub async fn response_json<T: DeserializeOwned>(resp: Response) -> T {
     serde_json::from_slice(&bytes).expect("deserialize response body")
 }
 
-/// Send one request through a fresh router.
 pub async fn send(state: &AppState, req: http::Request<Body>) -> Response {
     routes::router()
         .with_state(state.clone())
@@ -129,10 +126,6 @@ pub fn bearer(method: &str, uri: &str, token: &str) -> http::request::Builder {
         .header("Authorization", format!("Bearer {token}"))
 }
 
-// ---------------------------------------------------------------------------
-// CLI devices
-// ---------------------------------------------------------------------------
-
 pub fn unique_user() -> String {
     format!(
         "dev-{}@test.local",
@@ -144,7 +137,6 @@ pub fn new_key() -> DeviceKey {
     DeviceKey::generate().expect("key")
 }
 
-/// Sign `claims` as an EdDSA JWT, the way the CLI does.
 pub fn sign_eddsa<T: Serialize>(key: &DeviceKey, kid: Option<&str>, claims: &T) -> String {
     key.sign_claims(kid, claims).expect("sign")
 }
@@ -160,7 +152,6 @@ pub fn device_claims(sub: &str, aud: &str, iat: i64, exp: i64) -> DeviceTokenCla
     }
 }
 
-/// A valid 120 s device JWT for `device_id`.
 pub fn device_jwt(key: &DeviceKey, device_id: &str) -> String {
     let now = Utc::now().timestamp();
     let claims = device_claims(device_id, TEST_DEVICE_AUDIENCE, now, now + 120);
@@ -188,8 +179,7 @@ pub enum Fixture {
     IdleExpired,
 }
 
-/// Insert a device directly, skipping the sign-in flow. Its user name is
-/// `Name of {user_id}`.
+/// Insert a device directly, skipping the sign-in flow.
 pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> TestDevice {
     let key = new_key();
     let id = crypto::random_b64url(16).unwrap();
@@ -230,7 +220,6 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
     }
 }
 
-/// Outstanding sign-in codes of `user`.
 pub async fn codes_of(pool: &DbPool, user: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM device_auth_codes WHERE user_id = $1")
         .bind(user)
@@ -239,7 +228,6 @@ pub async fn codes_of(pool: &DbPool, user: &str) -> i64 {
         .unwrap()
 }
 
-/// Delete the devices and codes of `users`.
 pub async fn delete_device_data(pool: &DbPool, users: &[&str]) {
     for user in users {
         for table in ["devices", "device_auth_codes"] {

@@ -16,13 +16,8 @@
  * conditions.
  */
 
-//! Where this machine's device key lives: one record per API origin.
-//!
-//! macOS and Windows: the OS keychain (service [`KEYCHAIN_SERVICE`],
-//! account = API origin), falling back to the file if the keychain refuses
-//! the write. Elsewhere: `{config dir}/<origin>.toml`, mode 0600, in a 0700
-//! directory owned by this user, written via temp file + rename, and refused
-//! on read if another user owns it or can access it.
+//! One record per API origin: the OS keychain on macOS/Windows (file fallback), else a
+//! 0600 file in a 0700 directory owned by this user.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -32,10 +27,8 @@ use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Keychain service name for every stored device.
 pub const KEYCHAIN_SERVICE: &str = "videocall-cli";
 
-/// Environment variable that overrides the config directory.
 pub const CONFIG_DIR_ENV: &str = "VIDEOCALL_CONFIG_DIR";
 
 /// A store failure. Messages never contain the key.
@@ -61,7 +54,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
 // Serialize writes the seed in clear: only `Store::save` may serialize this.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredDevice {
-    /// The API origin. Checked on load, so two origins can never share a key.
+    /// Checked on load, so two origins can never share a key.
     pub origin: String,
     pub device_id: String,
     pub fingerprint: String,
@@ -81,7 +74,6 @@ fn secret<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SecretString, D:
     String::deserialize(deserializer).map(SecretString::from)
 }
 
-/// Where a record was found or saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Keychain,
@@ -97,8 +89,6 @@ impl std::fmt::Display for Location {
     }
 }
 
-/// `$VIDEOCALL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/videocall`, else
-/// `%APPDATA%\videocall` on Windows, else `~/.config/videocall`.
 pub(crate) fn config_dir_from(
     env: impl Fn(&str) -> Option<String>,
     home: Option<PathBuf>,
@@ -116,7 +106,6 @@ pub(crate) fn config_dir_from(
         .or_else(|| home.map(|h| h.join(".config").join("videocall")))
 }
 
-/// The device store rooted at one config directory.
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
@@ -124,7 +113,6 @@ pub struct Store {
 }
 
 impl Store {
-    /// The default config directory, with the keychain where there is one.
     pub fn open_default() -> Result<Self, StoreError> {
         #[allow(deprecated)] // `home_dir` is correct on every platform we ship.
         let home = std::env::home_dir();
@@ -133,7 +121,6 @@ impl Store {
         Ok(Self::with_dir(dir, true))
     }
 
-    /// A store in `dir`; `use_keychain` is ignored where there is none.
     pub fn with_dir(dir: PathBuf, use_keychain: bool) -> Self {
         Self {
             dir,
@@ -141,7 +128,6 @@ impl Store {
         }
     }
 
-    /// `<origin>.toml` with everything outside `[A-Za-z0-9.-]` as `_`.
     fn path(&self, origin: &str) -> PathBuf {
         let name: String = origin
             .chars()
@@ -156,9 +142,8 @@ impl Store {
         self.dir.join(format!("{name}.toml"))
     }
 
-    /// The device for `origin` and where it was found, if any. The file
-    /// comes first: it exists only if the keychain refused the last save,
-    /// so any keychain item is older.
+    /// The file comes first: it exists only if the keychain refused the last
+    /// save, so any keychain item is older.
     pub fn load(&self, origin: &str) -> Result<Option<(StoredDevice, Location)>, StoreError> {
         let path = self.path(origin);
         match File::open(&path) {
@@ -190,8 +175,6 @@ impl Store {
         }
     }
 
-    /// Save `device` for its origin, in the keychain if possible, else in
-    /// the file, and remove any copy in the other place.
     pub fn save(&self, device: &StoredDevice) -> Result<Location, StoreError> {
         let origin = device.origin.as_str();
         let text = Zeroizing::new(toml::to_string(device).map_err(|e| {
@@ -214,8 +197,7 @@ impl Store {
         Ok(Location::File(path))
     }
 
-    /// Delete everything stored for `origin`: the file first, then the
-    /// keychain item, so a keychain error never leaves the file behind.
+    /// File first, so a keychain error never leaves the file behind.
     pub fn remove(&self, origin: &str) -> Result<(), StoreError> {
         let file = self.remove_file(origin);
         if self.use_keychain {
@@ -232,8 +214,7 @@ impl Store {
         }
     }
 
-    /// Create the config dir at 0700, or require an existing one to be ours
-    /// and tighten it to 0700.
+    /// Create at 0700, or require an existing one to be ours and tighten it.
     fn ensure_dir(&self) -> Result<(), StoreError> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -293,8 +274,7 @@ fn check_private(file: &File, path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Write a 0600 temp file next to `path`, fsync, rename over `path`, so a
-/// crash leaves the old or the new file, never a torn one.
+/// Temp file, fsync, rename: a crash leaves the old or the new file, never a torn one.
 fn write_private(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);

@@ -16,10 +16,7 @@
  * conditions.
  */
 
-//! The relay only accepts `/lobby?token=<JWT>`. The bot runs against
-//! infrastructure you operate, so it signs its own room tokens with the
-//! relay's `JWT_SECRET` instead of going through meeting-api's login, using
-//! the same signer as meeting-api.
+//! The bot signs its own room tokens with the relay's `JWT_SECRET`, skipping meeting-api login.
 
 use anyhow::{anyhow, Context};
 use videocall_meeting_types::token::generate_room_token;
@@ -42,8 +39,7 @@ impl RoomTokenSigner {
         })
     }
 
-    /// Read from the environment only, never from the YAML config, so the
-    /// secret is not committed next to the client list.
+    /// Environment only, so the secret is never committed next to the client list.
     pub fn from_env() -> anyhow::Result<Self> {
         let secret = std::env::var("JWT_SECRET").map_err(|_| {
             anyhow!(

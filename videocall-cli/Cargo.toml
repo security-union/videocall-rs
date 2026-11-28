@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "5.0.0"
+version = "6.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -43,8 +43,8 @@ videocall-codecs = { path = "../videocall-codecs", version = "0.1.18" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.10", features = ["input-native", "output-threaded"] }
 # Device-key login (`videocall-cli auth ...`) and meeting join: all HTTP to
 # meeting-api goes through videocall-meeting-client.
-videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.2.0", features = ["device-session"] }
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.0" }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.2.1", features = ["device-session"] }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.1" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 secrecy = "0.10"

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v5.0.0...videocall-cli-v6.0.0) - 2026-11-28
+
+### Added
+
+- *(cli)* create, start and list meetings with a device key ([#970](https://github.com/security-union/videocall-rs/pull/970))
+
 ## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v4.1.2...videocall-cli-v5.0.0) - 2026-11-27
 
 ### Added

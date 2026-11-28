@@ -24,8 +24,8 @@ dioxus = { version = "0.7.3", default-features = false, features = ["web", "rout
 wasm-bindgen = { workspace = true }
 videocall-client = { path = "../videocall-client", version = "6.0.1", default-features = false }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.4" }
-videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.2.0" }
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.0" }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.2.1" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.3.1" }
 videocall-types = { path = "../videocall-types", version = "8.0.0" }
 # The design system: stylesheets (linked in index.html) and typed primitives.
 # No features: dioxus-ui brings the web renderer itself.

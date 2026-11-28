@@ -11,7 +11,7 @@ rustlemania-webtransport:
   image:
     repository: securityunion/videocall-media-server
     pullPolicy: IfNotPresent
-    tag: main-8011b395@sha256:e1af8a1063203b62fbcc418c2cfede548cce0e1952d1d62dade9a6b51301626b
+    tag: main-4c21b15d@sha256:aead8b9565528b520c93d6fe3e195f0a348eb816a69084c609e2147630349fcf
 
   env:
     - name: RUST_LOG

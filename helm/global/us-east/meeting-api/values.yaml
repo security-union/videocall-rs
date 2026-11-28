@@ -8,7 +8,7 @@ meeting-api:
   image:
     repository: securityunion/videocall-meeting-api
     pullPolicy: IfNotPresent
-    tag: main-8011b395@sha256:4a57e6f98e5d98ec04407c1aa40340cf134e1c3c54652fad54d479107058f1bb
+    tag: main-4c21b15d@sha256:d283db27e12a5f6aabca625a158551c173ad242c5102120241e1ba47fb626704
 
   env:
     - name: RUST_LOG

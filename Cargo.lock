@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "bot"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8176,7 +8176,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8285,7 +8285,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-meeting-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "httpdate",
  "log",
@@ -8299,7 +8299,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-meeting-types"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ed25519",
  "ed25519-dalek",

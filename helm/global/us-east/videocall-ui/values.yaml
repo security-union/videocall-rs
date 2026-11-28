@@ -6,8 +6,8 @@ videocall-ui:
 
   image:
     repository: securityunion/videocall-dioxus-ui
-    pullPolicy: Always
-    tag: latest
+    pullPolicy: IfNotPresent
+    tag: main-8011b395@sha256:3bc535cf8585b0ac56169ecd02f7e8ed6cc2aabc1a512e2b21ecd24bdf12e5f2
 
   resources:
     limits:

@@ -7,8 +7,8 @@ rustlemania-websocket:
 
   image:
     repository: securityunion/videocall-media-server
-    pullPolicy: Always
-    tag: latest
+    pullPolicy: IfNotPresent
+    tag: main-8011b395@sha256:e1af8a1063203b62fbcc418c2cfede548cce0e1952d1d62dade9a6b51301626b
 
   env:
     - name: RUST_LOG

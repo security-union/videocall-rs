@@ -11,8 +11,8 @@ videocall-website:
   # must be repopulated by a post-merge publish before this deploys.
   image:
     repository: securityunion/video-call-rs-website
-    pullPolicy: Always
-    tag: latest
+    pullPolicy: IfNotPresent
+    tag: main-343ac765@sha256:cb5b8c62e4cafff874d600873046c01aafba03bdcbeeb7532f7dc83cc6c3a37e
 
   resources:
     limits:

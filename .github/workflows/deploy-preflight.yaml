@@ -1,0 +1,101 @@
+name: Deploy preflight
+
+# Renders every release in helm-image-pin.toml and lets the helm-image-pin tool
+# check each pin against git history, the registry and the rendered images.
+#
+# Two callers:
+# - pull requests that touch the charts or the pins (a read-only PR check);
+# - deploy-production.yaml, which calls it as its unprivileged first job and
+#   takes only the deploy plan (plan.json, data) from the artifact. No secret
+#   and no write token ever reaches this job.
+
+on:
+  pull_request:
+    paths:
+      - 'helm/**'
+      - 'helm-image-pin.toml'
+      - 'helm-image-pin/**'
+      - 'Cargo.lock'
+      - '.github/workflows/deploy-preflight.yaml'
+  workflow_call:
+    inputs:
+      upload:
+        description: Upload the deploy plan for a deploy job.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Render and verify pins
+    runs-on: ubuntu-24.04
+    # Budget: setup ~2 min, build <= 10 min (step cap), render + verify
+    # <= 5 min (step cap; registry time is capped at 180 s inside it).
+    timeout-minutes: 18
+    permissions:
+      contents: read
+    env:
+      NAMESPACE: default
+    steps:
+      - name: Choose the output directory
+        run: echo "OUT=$RUNNER_TEMP/preflight" >> "$GITHUB_ENV"
+
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # verify checks each pinned sha is on the first-parent history
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.15.4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+
+      - name: Use the project binary cache (pull only)
+        uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: videocall-rs
+
+      - name: Build helm-image-pin
+        timeout-minutes: 10
+        run: |
+          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p helm-image-pin"
+          echo "HELM_IMAGE_PIN=$PWD/target/release/helm-image-pin" >> "$GITHUB_ENV"
+
+      - name: Render and verify
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT/rendered" "$OUT/plan"
+          code=0
+          "$HELM_IMAGE_PIN" releases --json > "$OUT/plan/plan.json" || code=$?
+          if [ "$code" = 0 ]; then
+            # fd 3, so nothing in the loop body can eat the list from stdin.
+            while IFS=$'\t' read -r name release dir values <&3; do
+              ( cd "$dir" && helm dependency update >/dev/null )
+              helm template "$release" "$dir" -f "$values" -n "$NAMESPACE" > "$OUT/rendered/$name.yaml"
+            done 3< <(jq -r '.releases[] | [.name, .helm_release, .chart_dir, .values_file] | @tsv' "$OUT/plan/plan.json")
+            "$HELM_IMAGE_PIN" --registry-budget-secs 180 verify --rendered-dir "$OUT/rendered" \
+              > "$OUT/verified.tsv" || code=$?
+          fi
+          case "$code" in
+            0) column -t -s $'\t' "$OUT/verified.tsv" ;;
+            3) echo "::error::preflight refused the pins (see the errors above); a person has to look"
+               exit 3 ;;
+            *) echo "::error::preflight could not finish (exit $code, registry or network); re-run the workflow"
+               exit "$code" ;;
+          esac
+
+      - name: Hand the deploy plan to the deploy job
+        if: inputs.upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deploy-plan
+          path: ${{ runner.temp }}/preflight/plan/plan.json
+          if-no-files-found: error
+          retention-days: 1

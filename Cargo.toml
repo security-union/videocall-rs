@@ -18,7 +18,8 @@ members = [
     "videocall-diagnostics",
     "videocall-transport",
     "videocall-rate-control",
-    "matomo-logger"
+    "matomo-logger",
+    "helm-image-pin"
 ]
 
 exclude = [

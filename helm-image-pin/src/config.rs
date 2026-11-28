@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `deploy-pins.toml`: which Helm release runs which image, in deploy order.
+//! `helm-image-pin.toml`: which Helm release runs which image, in deploy order.
 //!
 //! Everything project-specific lives in that file. Paths in it are relative
 //! to its own directory, which must be inside the git checkout. It is checked
@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use toml::{Table, Value};
 
-pub const FILE_NAME: &str = "deploy-pins.toml";
+pub const FILE_NAME: &str = "helm-image-pin.toml";
 
 /// Where a running build reports its commit, and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,7 +370,7 @@ pub(crate) mod tests {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "deploy-pins-test-{}-{}",
+                "helm-image-pin-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
@@ -520,7 +520,7 @@ pointer = "/git_sha"
                 "branch = \"main\"\n".to_string(),
                 "at least one [[release]]",
             ),
-            ("not toml [".to_string(), "deploy-pins.toml"),
+            ("not toml [".to_string(), "helm-image-pin.toml"),
         ];
         for (text, needle) in cases {
             let err = load(&write_config(&dir, &text)).unwrap_err();

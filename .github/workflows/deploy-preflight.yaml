@@ -1,6 +1,6 @@
 name: Deploy preflight
 
-# Renders every release in deploy-pins.toml and lets the deploy-pins tool
+# Renders every release in helm-image-pin.toml and lets the helm-image-pin tool
 # check each pin against git history, the registry and the rendered images.
 #
 # Two callers:
@@ -13,8 +13,8 @@ on:
   pull_request:
     paths:
       - 'helm/**'
-      - 'deploy-pins.toml'
-      - 'deploy-pins/**'
+      - 'helm-image-pin.toml'
+      - 'helm-image-pin/**'
       - 'Cargo.lock'
       - '.github/workflows/deploy-preflight.yaml'
   workflow_call:
@@ -61,11 +61,11 @@ jobs:
         with:
           name: videocall-rs
 
-      - name: Build deploy-pins
+      - name: Build helm-image-pin
         timeout-minutes: 10
         run: |
-          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p deploy-pins"
-          echo "DEPLOY_PINS=$PWD/target/release/deploy-pins" >> "$GITHUB_ENV"
+          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p helm-image-pin"
+          echo "HELM_IMAGE_PIN=$PWD/target/release/helm-image-pin" >> "$GITHUB_ENV"
 
       - name: Render and verify
         timeout-minutes: 5
@@ -73,14 +73,14 @@ jobs:
           set -euo pipefail
           mkdir -p "$OUT/rendered" "$OUT/plan"
           code=0
-          "$DEPLOY_PINS" releases --json > "$OUT/plan/plan.json" || code=$?
+          "$HELM_IMAGE_PIN" releases --json > "$OUT/plan/plan.json" || code=$?
           if [ "$code" = 0 ]; then
             # fd 3, so nothing in the loop body can eat the list from stdin.
             while IFS=$'\t' read -r name release dir values <&3; do
               ( cd "$dir" && helm dependency update >/dev/null )
               helm template "$release" "$dir" -f "$values" -n "$NAMESPACE" > "$OUT/rendered/$name.yaml"
             done 3< <(jq -r '.releases[] | [.name, .helm_release, .chart_dir, .values_file] | @tsv' "$OUT/plan/plan.json")
-            "$DEPLOY_PINS" --registry-budget-secs 180 verify --rendered-dir "$OUT/rendered" \
+            "$HELM_IMAGE_PIN" --registry-budget-secs 180 verify --rendered-dir "$OUT/rendered" \
               > "$OUT/verified.tsv" || code=$?
           fi
           case "$code" in

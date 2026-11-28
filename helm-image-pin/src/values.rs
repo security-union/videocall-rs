@@ -108,7 +108,7 @@ fn scalars_at(path: &str, src: &str, targets: &[Vec<String>]) -> Result<Vec<Vec<
         Error::values(
             path,
             format!(
-                "uses {what}; deploy-pins only edits files where every mapping key is a plain \
+                "uses {what}; helm-image-pin only edits files where every mapping key is a plain \
                  scalar, so the document it reads is the one Helm reads"
             ),
         )

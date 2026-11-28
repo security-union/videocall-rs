@@ -1,5 +1,5 @@
-# deploy-pins config: which Helm release runs which image, in deploy order.
-# Read by the deploy-pins tool (deploy-pins/README.md) in pin-images-pr.yaml,
+# helm-image-pin config: which Helm release runs which image, in deploy order.
+# Read by the helm-image-pin tool (helm-image-pin/README.md) in pin-images-pr.yaml,
 # deploy-preflight.yaml and deploy-production.yaml. Paths are relative to
 # this file.
 

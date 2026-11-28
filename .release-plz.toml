@@ -70,7 +70,7 @@ release = false
 # Production deploy tooling (pins, preflight, version gate). Built and run
 # by CI from the repo; never published or released.
 [[package]]
-name = "deploy-pins"
+name = "helm-image-pin"
 publish = false
 changelog_update = false
 git_release_enable = false

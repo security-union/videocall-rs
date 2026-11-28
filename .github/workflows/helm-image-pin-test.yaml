@@ -1,24 +1,24 @@
-name: deploy-pins
+name: helm-image-pin
 
-# Tests for the deploy-pins tool (deploy-pins/README.md). They need no
+# Tests for the helm-image-pin tool (helm-image-pin/README.md). They need no
 # network: the registry, git and clock are faked.
 
 on:
   pull_request:
     paths:
-      - 'deploy-pins/**'
-      - 'deploy-pins.toml'
+      - 'helm-image-pin/**'
+      - 'helm-image-pin.toml'
       - 'helm/global/us-east/*/values.yaml'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'nix/**'
-      - '.github/workflows/deploy-pins-test.yaml'
+      - '.github/workflows/helm-image-pin-test.yaml'
   push:
     branches: [main]
     paths:
-      - 'deploy-pins/**'
-      - 'deploy-pins.toml'
-      - '.github/workflows/deploy-pins-test.yaml'
+      - 'helm-image-pin/**'
+      - 'helm-image-pin.toml'
+      - '.github/workflows/helm-image-pin-test.yaml'
 
 permissions:
   contents: read
@@ -39,10 +39,10 @@ jobs:
           name: videocall-rs
 
       - name: Format
-        run: nix-shell default.nix -A shells.backend-dev --run "cargo fmt -p deploy-pins --check"
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo fmt -p helm-image-pin --check"
 
       - name: Clippy
-        run: nix-shell default.nix -A shells.backend-dev --run "cargo clippy --locked -p deploy-pins --all-targets -- -D warnings"
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo clippy --locked -p helm-image-pin --all-targets -- -D warnings"
 
       - name: Test
-        run: nix-shell default.nix -A shells.backend-dev --run "cargo test --locked -p deploy-pins"
+        run: nix-shell default.nix -A shells.backend-dev --run "cargo test --locked -p helm-image-pin"

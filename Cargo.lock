@@ -1953,19 +1953,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
-name = "deploy-pins"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "clap",
- "percent-encoding",
- "serde_json",
- "toml 0.8.23",
- "ureq",
- "yaml-rust2",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3593,6 +3580,19 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "helm-image-pin"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "percent-encoding",
+ "serde_json",
+ "toml 0.8.23",
+ "ureq",
+ "yaml-rust2",
+]
 
 [[package]]
 name = "hermit-abi"

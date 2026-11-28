@@ -12,8 +12,8 @@
 //! unless credentials are configured); for `Basic` it needs credentials.
 //! Credentials come only from the environment, never from the config file:
 //!
-//! - `DEPLOY_PINS_REGISTRY_HOST`: the registry they belong to (`ghcr.io`).
-//! - `DEPLOY_PINS_REGISTRY_USER`, `DEPLOY_PINS_REGISTRY_PASSWORD`.
+//! - `HELM_IMAGE_PIN_REGISTRY_HOST`: the registry they belong to (`ghcr.io`).
+//! - `HELM_IMAGE_PIN_REGISTRY_USER`, `HELM_IMAGE_PIN_REGISTRY_PASSWORD`.
 //!
 //! They are never printed, and only sent over https: to that host, or to the
 //! https token realm that host names in its own challenge. The client
@@ -432,7 +432,7 @@ impl UreqTransport {
             .max_redirects(3)
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .http_status_as_error(false)
-            .user_agent(concat!("deploy-pins/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("helm-image-pin/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
         UreqTransport { agent }
@@ -508,13 +508,13 @@ fn normalize_host(host: &str) -> &str {
 }
 
 impl Credentials {
-    /// Read `DEPLOY_PINS_REGISTRY_{HOST,USER,PASSWORD}`. All three or none.
+    /// Read `HELM_IMAGE_PIN_REGISTRY_{HOST,USER,PASSWORD}`. All three or none.
     pub fn from_env() -> Result<Option<Self>> {
         let get = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         match (
-            get("DEPLOY_PINS_REGISTRY_HOST"),
-            get("DEPLOY_PINS_REGISTRY_USER"),
-            get("DEPLOY_PINS_REGISTRY_PASSWORD"),
+            get("HELM_IMAGE_PIN_REGISTRY_HOST"),
+            get("HELM_IMAGE_PIN_REGISTRY_USER"),
+            get("HELM_IMAGE_PIN_REGISTRY_PASSWORD"),
         ) {
             (None, None, None) => Ok(None),
             (Some(host), Some(user), Some(password)) => Ok(Some(Credentials {
@@ -523,7 +523,7 @@ impl Credentials {
                 password,
             })),
             _ => Err(Error::Refused(
-                "set all of DEPLOY_PINS_REGISTRY_HOST, _USER and _PASSWORD, or none".into(),
+                "set all of HELM_IMAGE_PIN_REGISTRY_HOST, _USER and _PASSWORD, or none".into(),
             )),
         }
     }
@@ -595,7 +595,7 @@ impl<T: Transport> OciRegistry<T> {
             "basic" => match creds {
                 Some(c) => Attempt::Ok(c.basic()),
                 None => Attempt::Fail(format!(
-                    "{} asks for credentials; set DEPLOY_PINS_REGISTRY_HOST, _USER and _PASSWORD",
+                    "{} asks for credentials; set HELM_IMAGE_PIN_REGISTRY_HOST, _USER and _PASSWORD",
                     image.host
                 )),
             },
@@ -1217,7 +1217,7 @@ mod tests {
         assert!(parse_tags_page("<html>").is_err());
     }
 
-    /// Opt-in: `cargo test -p deploy-pins -- --ignored live_docker_hub`
+    /// Opt-in: `cargo test -p helm-image-pin -- --ignored live_docker_hub`
     #[test]
     #[ignore = "talks to the real registry"]
     fn live_docker_hub() {
@@ -1233,7 +1233,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "{err}");
     }
 
-    /// Opt-in: `cargo test -p deploy-pins -- --ignored live_ghcr_anonymous`
+    /// Opt-in: `cargo test -p helm-image-pin -- --ignored live_ghcr_anonymous`
     #[test]
     #[ignore = "talks to the real registry"]
     fn live_ghcr_anonymous() {

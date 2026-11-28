@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `deploy-pins`: keeps Helm values pinned to an exact image (tag plus
+//! `helm-image-pin`: keeps Helm values pinned to an exact image (tag plus
 //! digest), verifies the pins before a deploy, and waits for each service to
-//! report the new build. What runs where comes from `deploy-pins.toml`
+//! report the new build. What runs where comes from `helm-image-pin.toml`
 //! ([`config`]); exit codes are in [`error`].
 
 mod config;
@@ -33,7 +33,7 @@ const MAX_SECS: u64 = 86_400;
 /// a deploy, and wait for each service to report the new build.
 #[derive(Debug, Parser)]
 #[command(
-    name = "deploy-pins",
+    name = "helm-image-pin",
     version,
     after_help = "Exit codes: 0 ok, 1 not converged, 2 error (retry), 3 refused (needs a human)."
 )]
@@ -143,7 +143,7 @@ type Rename<'a> = dyn FnMut(&Path, &Path) -> std::io::Result<()> + 'a;
 /// Write `contents` to a new temp file next to `path`, with `path`'s mode.
 fn stage(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.deploy-pins-{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(".{name}.helm-image-pin-{}.tmp", std::process::id()));
     let result = (|| {
         let perms = std::fs::metadata(path)?.permissions();
         let mut file = std::fs::OpenOptions::new()
@@ -195,7 +195,7 @@ fn write_all(root: &Path, files: &[Replace<'_>], rename: &mut Rename<'_>) -> Res
                 file.rel
             ))),
             Ok(Some(current)) if current != file.old => Err(Error::Refused(format!(
-                "{} changed while deploy-pins was running; nothing written",
+                "{} changed while helm-image-pin was running; nothing written",
                 file.rel
             ))),
             Ok(_) => stage(&path, file.new).map_err(Error::io(&path)),
@@ -530,7 +530,7 @@ pointer = "/git_sha"
 "#;
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("deploy-pins").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("helm-image-pin").chain(args.iter().copied()))
     }
 
     #[test]
@@ -544,7 +544,7 @@ pointer = "/git_sha"
                 report_dir: Some("out".into())
             }
         );
-        assert_eq!(cli.config, PathBuf::from("deploy-pins.toml"));
+        assert_eq!(cli.config, PathBuf::from("helm-image-pin.toml"));
         assert_eq!(cli.registry_budget_secs, 240);
         // Global options go before or after the command.
         let cli = parse(&[

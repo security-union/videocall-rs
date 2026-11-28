@@ -5,7 +5,7 @@ name: Pin production images
 # Merging that PR is the deploy: deploy-production.yaml runs on the merge.
 #
 # Two jobs. `plan` has a read-only token and no secrets: it builds the
-# deploy-pins tool (deploy-pins/, configured by deploy-pins.toml), runs it,
+# helm-image-pin tool (helm-image-pin/, configured by helm-image-pin.toml), runs it,
 # and uploads the rewritten values files plus the PR title and body. `pr` has
 # the write token and runs only git, gh and the shell. It treats the artifact
 # as untrusted: plain files only, values files the config names, each
@@ -108,12 +108,12 @@ jobs:
         with:
           name: videocall-rs
 
-      - name: Build deploy-pins
+      - name: Build helm-image-pin
         if: steps.gate.outputs.busy == 'false'
         timeout-minutes: 10
         run: |
-          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p deploy-pins"
-          echo "DEPLOY_PINS=$PWD/target/release/deploy-pins" >> "$GITHUB_ENV"
+          nix-shell default.nix -A shells.backend-dev --run "cargo build --locked --release -p helm-image-pin"
+          echo "HELM_IMAGE_PIN=$PWD/target/release/helm-image-pin" >> "$GITHUB_ENV"
 
       - name: Pin and stage the result
         if: steps.gate.outputs.busy == 'false'
@@ -122,7 +122,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/pin"
           mkdir -p "$out/files"
-          "$DEPLOY_PINS" --registry-budget-secs 180 pin --report-dir "$out/report"
+          "$HELM_IMAGE_PIN" --registry-budget-secs 180 pin --report-dir "$out/report"
           git diff --name-only > "$out/changed.txt"
           while IFS= read -r file; do
             mkdir -p "$out/files/$(dirname "$file")"
@@ -168,7 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           plan="$RUNNER_TEMP/pin"
-          toml=deploy-pins.toml
+          toml=helm-image-pin.toml
           fail() { echo "::error::pin plan: $*"; exit 1; }
 
           # Plain files only: no links, devices or fifos, nothing large.

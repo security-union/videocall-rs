@@ -6,20 +6,20 @@ name: Deploy production
 # the PR that pin-images-pr.yaml opens.
 #
 # Two jobs. `preflight` (deploy-preflight.yaml) has no secrets: it builds the
-# deploy-pins tool, renders every chart, verifies every pin, and uploads one
+# helm-image-pin tool, renders every chart, verifies every pin, and uploads one
 # data file, plan.json. `deploy` gets the cluster credentials and runs only
 # doctl, helm, kubectl, curl and jq from the runner on files from this
 # checkout. It executes nothing built in this run.
 #
 # The plan is checked as data before the cluster is touched: each release's
 # name, Helm release, chart dir, values file, repository and version check
-# must be that release's own lines in this checkout's deploy-pins.toml, in
+# must be that release's own lines in this checkout's helm-image-pin.toml, in
 # order, and its pin must appear in its values file. A forged plan can only
 # pick a different pin string that appears in a release's values file, which
 # changes the sha the gate waits for and the image shown in the summary. It
 # cannot run code, change which releases, charts or values files are deployed
 # or their order, drop or redirect a version check, or make curl fetch a URL
-# that is not that release's own in deploy-pins.toml.
+# that is not that release's own in helm-image-pin.toml.
 #
 # Only the five values files trigger this. A PR that edits a chart (Chart.yaml,
 # templates, the file:// dependency charts) does not roll production with the
@@ -98,11 +98,11 @@ jobs:
 
       # plan.json came from a job that compiled third-party crates. It is
       # data: check its shape and every value, and tie each release to this
-      # checkout's deploy-pins.toml.
+      # checkout's helm-image-pin.toml.
       - name: Check the plan
         run: |
           set -euo pipefail
-          toml=deploy-pins.toml
+          toml=helm-image-pin.toml
           fail() { echo "::error::deploy plan: $*"; exit 1; }
           [ "$(cd "$(dirname "$PLAN")" && find . -mindepth 1 | sort)" = "./plan.json" ] ||
             fail "the artifact must hold plan.json and nothing else"

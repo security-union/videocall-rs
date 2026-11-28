@@ -8181,6 +8181,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cpal",
+ "getrandom 0.3.4",
  "httpdate",
  "image 0.25.9",
  "keyring",

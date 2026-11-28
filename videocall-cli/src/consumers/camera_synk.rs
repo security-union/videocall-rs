@@ -22,4 +22,13 @@ pub trait CameraSynk {
         &self,
         data: Vec<u8>,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Resolves with a reason once the connection is gone for good; never for sinks without one.
+    fn lost(&self) -> impl std::future::Future<Output = String> + Send {
+        std::future::pending()
+    }
+
+    fn close(&self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }

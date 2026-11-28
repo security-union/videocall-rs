@@ -209,7 +209,11 @@ impl CameraDaemon {
                     continue;
                 }
                 last_frame_time = Instant::now();
-                let frame = camera.frame().unwrap();
+                // Exit 1 instead of panicking this thread while heartbeats claim video is on.
+                let frame = match camera.frame() {
+                    Ok(frame) => frame,
+                    Err(e) => camera_setup_failed("The camera stopped delivering frames", e),
+                };
                 if let Err(e) = frame.decode_image_to_buffer::<I420Format>(&mut i420_image_buffer) {
                     consecutive_decode_failures += 1;
                     error!(

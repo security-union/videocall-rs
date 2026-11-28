@@ -48,6 +48,7 @@ toml = "0.8"
 secrecy = "0.10"
 lazy_static = { workspace = true }
 webbrowser = { version = "1", features = ["hardened"] }
+getrandom = "0.3"  # retry jitter
 
 # geteuid() for the key file's ownership check.
 [target.'cfg(unix)'.dependencies]

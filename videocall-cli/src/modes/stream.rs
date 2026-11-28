@@ -16,13 +16,14 @@
  * conditions.
  */
 
+use anyhow::bail;
 use tokio::sync::mpsc::channel;
 use videocall_cli::auth::store::Store;
 use videocall_cli::auth::{ApiOrigin, Credentials};
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
 use videocall_cli::consumers::dead_synk::DeadSynk;
-use videocall_cli::consumers::webtransport::WebTransportClient;
+use videocall_cli::consumers::webtransport::{check_insecure_skip_verify, WebTransportClient};
 use videocall_cli::consumers::CameraSynks;
 use videocall_cli::producers::{
     camera::{CameraConfig, CameraDaemon},
@@ -31,7 +32,37 @@ use videocall_cli::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
+/// Installed before any await, so a signal during login or join is caught.
+/// No meeting-api `leave`: the same account may also be in the meeting from a browser.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+            }
+        })
+    }
+    #[cfg(windows)]
+    {
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+        })
+    }
+}
+
+/// No reconnect: a lost relay or camera exits 1 so a supervisor restarts and rejoins.
 pub async fn stream(opt: Stream) -> anyhow::Result<()> {
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
+
     // The CLI can only JOIN an existing call. The meeting must be created first
     // by a user from a browser at https://videocall.rs — the API no longer lets
     // the CLI create a call, so if nobody created it in the browser this stream
@@ -54,7 +85,7 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
 
     println!(
         "User requested resolution {}x{} and format {}",
-        width, height, &format
+        width, height, format
     );
     let framerate = opt.fps;
     // validate framerate
@@ -73,13 +104,33 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
         let user_id = "offline-streaming-test".to_string();
         (user_id, CameraSynks::DeadSynk(DeadSynk::new(opt)))
     } else {
+        check_insecure_skip_verify(&opt.url, opt.insecure_skip_verify)?;
         let api = ApiOrigin::from_url(&opt.api.api_url)?;
         let creds = Credentials::load(Store::open_default()?, api).await?;
-        let user_id = videocall_cli::room::join(&creds, &opt.meeting_id).await?;
+        let join = videocall_cli::room::join(&creds, &opt.meeting_id, opt.display_name.as_deref());
+        let user_id = tokio::select! {
+            user_id = join => user_id?,
+            () = &mut shutdown => {
+                println!("Stopped before joining meeting '{}'.", opt.meeting_id);
+                return Ok(());
+            }
+        };
         let client = WebTransportClient::new(opt, creds, user_id.clone());
         (user_id, CameraSynks::CameraSynk(Box::new(client)))
     };
-    client.connect().await?;
+    let stopped = tokio::select! {
+        result = client.connect() => {
+            result?;
+            false
+        }
+        () = &mut shutdown => true,
+    };
+    if stopped {
+        // The session may have come up just before the signal.
+        client.close().await;
+        println!("Stopped.");
+        return Ok(());
+    }
     let camera_config = CameraConfig {
         width,
         height,
@@ -111,13 +162,25 @@ pub async fn stream(opt: Stream) -> anyhow::Result<()> {
             .expect("failed to start microphone");
     }
 
-    while let Some(data) = wt_rx.recv().await {
+    loop {
+        let data = tokio::select! {
+            data = wt_rx.recv() => data,
+            () = &mut shutdown => {
+                client.close().await;
+                println!("Stopped.");
+                return Ok(());
+            }
+            reason = client.lost() => {
+                bail!("lost the relay connection ({reason}); exiting");
+            }
+        };
+        let Some(data) = data else {
+            client.close().await;
+            bail!("the camera and microphone stopped sending; exiting");
+        };
         tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
-            tracing::error!("Failed to send packet: {}", e);
-        } else {
-            tracing::debug!("Packet sent successfully to WebTransport client");
+            tracing::debug!("Packet not sent: {e}");
         }
     }
-    Ok(())
 }

@@ -67,8 +67,9 @@ pub enum AuthCommand {
     /// Revoke this machine's key on the server and delete it locally. The
     /// local key is deleted even if the server can't be reached.
     Logout(ApiArgs),
-    /// Show this machine's device and check it with the server. Exits 1
-    /// unless the device is valid.
+    /// Show this machine's device and check it with the server. Exits 0 if
+    /// it is valid, 2 if you have to log in again (not logged in, revoked,
+    /// expired), 1 if the server couldn't be asked.
     Status(ApiArgs),
 }
 
@@ -151,6 +152,10 @@ pub struct Stream {
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
+    /// Name shown to other participants. Defaults to your account's name.
+    #[clap(long = "display-name", value_parser = non_empty)]
+    pub display_name: Option<String>,
+
     /// Specify which camera to use, either by index number or name.
     ///
     /// Examples:
@@ -222,8 +227,11 @@ pub struct Stream {
     #[clap(long = "debug-offline-streaming-test")]
     pub local_streaming_test: bool,
 
-    /// Skip TLS certificate verification for QUIC connections.
-    /// Warning: This makes connections insecure and should only be used for testing.
+    /// Skip TLS certificate verification for the relay (QUIC) connection.
+    ///
+    /// Only allowed when --url is localhost, a loopback address, or a
+    /// private-range IP (a local dev stack); refused otherwise. Never applies
+    /// to the meeting-api connection.
     #[clap(long = "insecure-skip-verify")]
     pub insecure_skip_verify: bool,
 }
@@ -262,4 +270,11 @@ pub struct Info {
 pub struct TestCamera {
     #[clap(long = "video-device-index")]
     pub video_device_index: IndexKind,
+}
+
+fn non_empty(value: &str) -> Result<String, String> {
+    match value.trim() {
+        "" => Err("must not be empty".to_string()),
+        trimmed => Ok(trimmed.to_string()),
+    }
 }

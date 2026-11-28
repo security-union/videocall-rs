@@ -16,15 +16,21 @@
  * conditions.
  */
 
-use anyhow::Error;
+use anyhow::{bail, Error};
 use protobuf::Message;
 use secrecy::ExposeSecret;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        watch,
+    },
     time::{self, Duration},
 };
 use tracing::info;
+use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket},
@@ -32,16 +38,96 @@ use videocall_types::protos::{
 };
 
 use crate::auth::Credentials;
+use crate::backoff::Backoff;
 use crate::cli_args::Stream;
+use crate::exit::needs_human;
+use crate::net_policy::is_local_host;
 use crate::room;
 
 use super::camera_synk::CameraSynk;
+
+/// Failed sends in a row that count as lost even before QUIC reports the session closed.
+const MAX_CONSECUTIVE_SEND_FAILURES: u32 = 100;
+
+pub const CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Why the relay connection ended; the first reason wins.
+#[derive(Clone)]
+struct LossSignal {
+    reason: Arc<watch::Sender<Option<String>>>,
+    consecutive_failures: Arc<AtomicU32>,
+}
+
+impl LossSignal {
+    fn new() -> Self {
+        Self {
+            reason: Arc::new(watch::Sender::new(None)),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn mark_lost(&self, reason: String) {
+        self.reason.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reason);
+            true
+        });
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.borrow().clone()
+    }
+
+    /// The first failure of a run is logged, then only the count.
+    fn record_send(
+        &self,
+        close_reason: impl FnOnce() -> Option<String>,
+        result: anyhow::Result<()>,
+    ) -> bool {
+        match result {
+            Ok(()) => {
+                let failed = self.consecutive_failures.swap(0, Ordering::Relaxed);
+                if failed > 0 {
+                    info!("Sends to the relay recovered after {failed} failures");
+                }
+            }
+            Err(e) => {
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(closed) = close_reason() {
+                    self.mark_lost(closed);
+                } else if failures >= MAX_CONSECUTIVE_SEND_FAILURES {
+                    self.mark_lost(format!("{failures} sends in a row failed, last: {e}"));
+                } else if failures == 1 {
+                    tracing::warn!("Failed to send to the relay: {e}");
+                }
+            }
+        }
+        self.reason().is_none()
+    }
+
+    async fn wait(&self) -> String {
+        let mut rx = self.reason.subscribe();
+        let reason = match rx.wait_for(Option::is_some).await {
+            Ok(reason) => reason.clone(),
+            // The sender lives in `self`, so this can't happen.
+            Err(_) => None,
+        };
+        match reason {
+            Some(reason) => reason,
+            None => std::future::pending().await,
+        }
+    }
+}
 
 pub struct WebTransportClient {
     options: Stream,
     creds: Credentials,
     user_id: String,
     sender: Option<Sender<Vec<u8>>>,
+    session: Option<web_transport_quinn::Session>,
+    loss: LossSignal,
 }
 
 impl WebTransportClient {
@@ -51,6 +137,8 @@ impl WebTransportClient {
             creds,
             user_id,
             sender: None,
+            session: None,
+            loss: LossSignal::new(),
         }
     }
 
@@ -77,6 +165,9 @@ impl WebTransportClient {
     }
 
     async fn queue_message(&self, message: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(reason) = self.loss.reason() {
+            bail!("relay connection lost: {reason}");
+        }
         if let Some(sender) = &self.sender {
             sender
                 .send(message)
@@ -95,9 +186,10 @@ impl WebTransportClient {
         // unmuted while it sends no audio — and vice-versa, a streamed mic would
         // be shown muted. Video is always on in stream mode.
         let audio_enabled = options.audio_device.is_some();
+        let loss = self.loss.clone();
         tokio::spawn(async move {
             let mut interval = interval;
-            loop {
+            while loss.reason().is_none() {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
@@ -123,62 +215,159 @@ impl WebTransportClient {
                     ..Default::default()
                 };
                 let data = packet.write_to_bytes().unwrap();
-                if let Err(e) = Self::send(&session, data).await {
-                    tracing::error!("Failed to send heartbeat: {}", e);
-                }
+                let result = Self::send(&session, data).await;
+                loss.record_send(|| session.close_reason().map(|r| r.to_string()), result);
             }
         });
     }
 }
 
-pub fn lobby_url(relay: &url::Url, room_token: &str) -> url::Url {
+/// Only for a local relay: skipping verification elsewhere hands the room token to anyone on the path.
+pub fn check_insecure_skip_verify(relay: &Url, insecure_skip_verify: bool) -> anyhow::Result<()> {
+    if insecure_skip_verify && !is_local_host(relay) {
+        return Err(needs_human(format!(
+            "--insecure-skip-verify is only allowed for localhost, loopback, or private-range \
+             relay addresses, not {}. Remove the flag to verify the relay's certificate.",
+            relay.host_str().unwrap_or("<no host>")
+        )));
+    }
+    Ok(())
+}
+
+pub fn lobby_url(relay: &Url, room_token: &str) -> Url {
     let mut url = relay.clone();
     url.set_path("/lobby");
     url.set_query(None);
+    url.set_fragment(None);
     url.query_pairs_mut().append_pair("token", room_token);
     url
 }
 
+/// The status of a refused CONNECT, read from `Debug` (the crate's error types are private).
+pub fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
+    let web_transport_quinn::ClientError::HttpError(inner) = err else {
+        return None;
+    };
+    parse_rejection_status(&format!("{inner:?}"))
+}
+
+fn parse_rejection_status(debug_text: &str) -> Option<u16> {
+    ["WrongStatus(Some(", "ErrorStatus("]
+        .iter()
+        .find_map(|marker| debug_text.split(marker).nth(1))
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+}
+
+/// A fresh room token per attempt; once connected, a drop ends the run instead of reconnecting.
 async fn connect_to_server(
     options: &Stream,
     creds: &Credentials,
 ) -> anyhow::Result<web_transport_quinn::Session> {
-    loop {
-        info!("Attempting to connect to {}", options.url);
+    check_insecure_skip_verify(&options.url, options.insecure_skip_verify)?;
+    let client = if options.insecure_skip_verify {
+        tracing::warn!("Skipping TLS certificate verification for the local relay");
+        // SAFETY: gated above to localhost / loopback / private addresses.
+        unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
+    } else {
+        web_transport_quinn::ClientBuilder::new().with_system_roots()?
+    };
 
+    let mut backoff = Backoff::relay();
+    let mut policy = ConnectPolicy::default();
+    loop {
         // A fresh room token for every attempt: they expire after 300 s.
         let token = match room::room_token(creds, &options.meeting_id).await {
             Ok(token) => token,
-            Err(e) if room::is_transient(&e) => {
-                tracing::error!("Couldn't get a room token: {e}. Retrying in 5 seconds...");
-                time::sleep(Duration::from_secs(5)).await;
+            Err(e) if e.is_transient() => {
+                let delay = backoff.next_delay();
+                tracing::warn!("Couldn't get a room token: {e}. Retrying in {delay:.1?}...");
+                time::sleep(delay).await;
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e.into_exit(&options.meeting_id)),
         };
+
+        info!("Connecting to relay {}", options.url);
         let url = lobby_url(&options.url, token.expose_secret());
-
-        // Create WebTransport client using 0.7.3 API (same pattern as bot)
-        let client = if options.insecure_skip_verify {
-            info!("WARNING: Skipping TLS certificate verification - connection is insecure!");
-            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
-        } else {
-            web_transport_quinn::ClientBuilder::new().with_system_roots()?
-        };
-
-        match client.connect(url).await {
-            Ok(session) => {
-                info!("WebTransport session established successfully");
+        let (status, error) = match time::timeout(CONNECT_TIMEOUT, client.connect(url)).await {
+            Ok(Ok(session)) => {
+                info!("WebTransport session established");
                 return Ok(session);
             }
-            Err(e) => {
+            Ok(Err(e)) => match rejection_status(&e) {
+                // A relay without status codes (before #962) refuses a token by dropping it.
+                None if matches!(e, web_transport_quinn::ClientError::HttpError(_)) => (
+                    None,
+                    format!(
+                        "{e} (closed without a status; an older relay does this on a bad token)"
+                    ),
+                ),
+                status => (status, e.to_string()),
+            },
+            Err(_) => (
+                None,
+                format!("no answer within {} s", CONNECT_TIMEOUT.as_secs()),
+            ),
+        };
+        match policy.after_failure(status) {
+            NextStep::RetryNow => {
+                info!("Relay said the room token expired (401); retrying with a fresh one");
+            }
+            NextStep::Backoff => {
+                let delay = backoff.next_delay();
                 tracing::error!(
-                    "WebTransport connection failed: {}. Retrying in 5 seconds...",
-                    e
+                    "WebTransport connection failed: {error}. Retrying in {delay:.1?}..."
                 );
-                time::sleep(Duration::from_secs(5)).await;
+                time::sleep(delay).await;
+            }
+            NextStep::Fatal(reason) => {
+                return Err(needs_human(format!("{reason} (relay {})", options.url)))
             }
         }
+    }
+}
+
+/// Shorter than QUIC's idle timeout, so a network that drops UDP gets the backoff.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NextStep {
+    RetryNow,
+    Backoff,
+    Fatal(String),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConnectPolicy {
+    previous_was_401: bool,
+}
+
+impl ConnectPolicy {
+    /// 401: retry once with a fresh token, fatal only if the next attempt is 401 too. 403/404: fatal.
+    pub(crate) fn after_failure(&mut self, status: Option<u16>) -> NextStep {
+        let step = next_step(status, self.previous_was_401);
+        self.previous_was_401 = step == NextStep::RetryNow;
+        step
+    }
+}
+
+fn next_step(status: Option<u16>, previous_was_401: bool) -> NextStep {
+    match status {
+        Some(401) if !previous_was_401 => NextStep::RetryNow,
+        Some(401) => NextStep::Fatal(
+            "the relay rejected a freshly minted room token twice (401)".to_string(),
+        ),
+        Some(403) => NextStep::Fatal("the relay rejected the room token (403)".to_string()),
+        Some(404) => {
+            NextStep::Fatal("the relay has no /lobby endpoint (404); check --url".to_string())
+        }
+        _ => NextStep::Backoff,
     }
 }
 
@@ -187,16 +376,24 @@ impl CameraSynk for WebTransportClient {
         let session = connect_to_server(&self.options, &self.creds).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
+        self.session = Some(session.clone());
+
+        let (watched, loss) = (session.clone(), self.loss.clone());
+        tokio::spawn(async move {
+            let reason = watched.closed().await;
+            loss.mark_lost(reason.to_string());
+        });
 
         // Spawn a task to handle sending messages via the WebTransport session
-        let session_clone = session.clone();
+        let (session_clone, loss) = (session.clone(), self.loss.clone());
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let session_clone_inner = session_clone.clone();
+                let loss = loss.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = WebTransportClient::send(&session_clone_inner, message).await {
-                        tracing::error!("Failed to send message: {}", e);
-                    }
+                    let result = WebTransportClient::send(&session_clone_inner, message).await;
+                    let close_reason = || session_clone_inner.close_reason().map(|r| r.to_string());
+                    loss.record_send(close_reason, result);
                 });
             }
         });
@@ -211,19 +408,200 @@ impl CameraSynk for WebTransportClient {
     async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
     }
+
+    async fn lost(&self) -> String {
+        if self.session.is_none() {
+            return std::future::pending().await;
+        }
+        self.loss.wait().await
+    }
+
+    /// Close now so the relay drops us at once, not at the QUIC idle timeout.
+    async fn close(&self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        self.loss.mark_lost("closed by this client".to_string());
+        session.close(0, b"client shutting down");
+        // The sleep lets quinn put CONNECTION_CLOSE on the wire before the runtime stops.
+        let _ = time::timeout(CLOSE_GRACE, async {
+            session.closed().await;
+            time::sleep(Duration::from_millis(100)).await;
+        })
+        .await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn loss_signal_keeps_the_first_reason_and_wakes_waiters() {
+        let loss = LossSignal::new();
+        assert!(loss.reason().is_none());
+        let waiter = tokio::spawn({
+            let loss = loss.clone();
+            async move { loss.wait().await }
+        });
+        loss.mark_lost("relay closed the session".into());
+        loss.mark_lost("later reason".into());
+        assert_eq!(waiter.await.unwrap(), "relay closed the session");
+        assert_eq!(loss.reason().as_deref(), Some("relay closed the session"));
+    }
+
     #[test]
-    fn lobby_url_carries_only_the_token() {
-        let relay = url::Url::parse("https://relay.example:4433/old/path?x=1").unwrap();
-        let url = lobby_url(&relay, "a.b+c");
+    fn lobby_url_construction() {
+        let relay = Url::parse("https://relay.example:4433").unwrap();
+        let url = lobby_url(&relay, "a.b+c/d=");
+        assert_eq!(url.path(), "/lobby");
+        assert_eq!(url.host_str(), Some("relay.example"));
+        assert_eq!(url.port(), Some(4433));
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "token");
+        assert_eq!(pairs[0].1, "a.b+c/d=");
+
+        // Stray path / query on --url is replaced, not appended to.
+        let relay = Url::parse("https://relay.example/lobby/old/path?token=stale#x").unwrap();
+        let url = lobby_url(&relay, "fresh");
+        assert_eq!(url.as_str(), "https://relay.example/lobby?token=fresh");
+    }
+
+    #[test]
+    fn insecure_skip_verify_gating() {
+        let check = |url: &str, flag: bool| {
+            check_insecure_skip_verify(&Url::parse(url).unwrap(), flag).is_ok()
+        };
+        assert!(check(
+            "https://webtransport-us-east.webtransport.video",
+            false
+        ));
+        assert!(!check(
+            "https://webtransport-us-east.webtransport.video",
+            true
+        ));
+        assert!(!check("https://8.8.8.8:4433", true));
+        assert!(check("https://localhost:4433", true));
+        assert!(check("https://127.0.0.1:4433", true));
+        assert!(check("https://192.168.1.50:4433", true));
+        assert!(check("https://[::1]:4433", true));
+    }
+
+    #[test]
+    fn rejection_status_parsing() {
         assert_eq!(
-            url.as_str(),
-            "https://relay.example:4433/lobby?token=a.b%2Bc"
+            parse_rejection_status("ProtoError(WrongStatus(Some(401)))"),
+            Some(401)
+        );
+        assert_eq!(parse_rejection_status("ErrorStatus(403)"), Some(403));
+        assert_eq!(
+            parse_rejection_status("ProtoError(WrongStatus(None))"),
+            None
+        );
+        assert_eq!(parse_rejection_status("UnexpectedEnd"), None);
+    }
+
+    #[test]
+    fn connect_failure_policy() {
+        let mut policy = ConnectPolicy::default();
+        // 401, then a different failure, then 401 again: the streak restarts.
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        assert_eq!(policy.after_failure(Some(503)), NextStep::Backoff);
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        assert_eq!(policy.after_failure(None), NextStep::Backoff);
+        assert_eq!(policy.after_failure(Some(401)), NextStep::RetryNow);
+        // 401 right after 401 is fatal.
+        assert!(matches!(
+            policy.after_failure(Some(401)),
+            NextStep::Fatal(_)
+        ));
+        for status in [403, 404] {
+            let step = ConnectPolicy::default().after_failure(Some(status));
+            assert!(matches!(step, NextStep::Fatal(_)), "{status}");
+        }
+    }
+
+    #[test]
+    fn sends_mark_the_connection_lost() {
+        let failed = || Err(anyhow::anyhow!("stream reset"));
+        // 99 failures in a row are tolerated; a success resets the count.
+        let loss = LossSignal::new();
+        for _ in 1..MAX_CONSECUTIVE_SEND_FAILURES {
+            assert!(loss.record_send(|| None, failed()));
+        }
+        assert!(loss.record_send(|| None, Ok(())));
+        for _ in 1..MAX_CONSECUTIVE_SEND_FAILURES {
+            assert!(loss.record_send(|| None, failed()));
+        }
+        assert!(!loss.record_send(|| None, failed()), "the 100th in a row");
+        assert!(loss.reason().unwrap().contains("100 sends in a row failed"));
+
+        // A failure on a closed session is lost at once, with its reason.
+        let loss = LossSignal::new();
+        assert!(!loss.record_send(|| Some("closed by peer".into()), failed()));
+        assert_eq!(loss.reason().as_deref(), Some("closed by peer"));
+    }
+
+    /// Against a real refusal, so a web-transport-quinn bump that changes the error shape fails here.
+    #[tokio::test]
+    async fn rejection_status_from_a_real_refusal() {
+        use web_transport_quinn::quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/../actix-api/certs");
+        let cert = CertificateDer::from(std::fs::read(format!("{certs}/localhost.der")).unwrap());
+        let key =
+            PrivateKeyDer::try_from(std::fs::read(format!("{certs}/localhost_key.der")).unwrap())
+                .unwrap();
+        // Our own endpoint, so each connection stays open until the client reads the refusal.
+        use web_transport_quinn::quinn;
+        let mut tls = quinn::rustls::ServerConfig::builder_with_provider(
+            web_transport_quinn::crypto::default_provider(),
+        )
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic));
+        let endpoint = quinn::Endpoint::server(config, ([127, 0, 0, 1], 0).into()).unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            for status in [Some(401u16), Some(403), Some(404), None] {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let request = web_transport_quinn::Request::accept(conn.clone())
+                    .await
+                    .unwrap();
+                let Some(status) = status else {
+                    // What a relay without #962's status codes does: drop it.
+                    drop(request);
+                    conn.close(0u32.into(), b"");
+                    continue;
+                };
+                let status = web_transport_quinn::http::StatusCode::from_u16(status).unwrap();
+                request.close(status).await.unwrap();
+                open.push(conn);
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        // SAFETY: test-only client against the local test server above.
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new()
+                .with_no_certificate_verification()
+                .unwrap()
+        };
+        for expected in [Some(401u16), Some(403), Some(404), None] {
+            let url = Url::parse(&format!("https://127.0.0.1:{port}/lobby?token=t")).unwrap();
+            let error = client.connect(url).await.unwrap_err();
+            assert_eq!(rejection_status(&error), expected, "{error:?}");
+        }
+        // No status: back off and retry with a fresh token, never fatal.
+        assert_eq!(
+            ConnectPolicy::default().after_failure(None),
+            NextStep::Backoff
         );
     }
 }

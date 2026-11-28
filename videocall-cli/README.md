@@ -114,6 +114,20 @@ videocall-cli stream \
   --bitrate-kbps 500
 ```
 
+Add `--display-name "Garage cam"` to show a different name than your account's.
+
+Ctrl-C, SIGTERM or SIGHUP closes the relay connection and exits 0. The CLI doesn't reconnect: when the relay connection or the camera drops, it exits 1 and a supervisor starts it again, which joins from scratch. While joining, it keeps retrying meeting-api and the relay through network trouble: relay connects back off from 1 s to 30 s, and each connect attempt gets 15 s.
+
+Exit code 2 means a restart won't help and a human has to act: not logged in or revoked, declined or removed by the host, a meeting that doesn't exist or has ended, a relay that refused the token with 403 or 404 (or 401 twice), or a bad flag. So the systemd unit for a Pi looks like this:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/videocall-cli stream --meeting-id <meeting-id> --video-device-index 0
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+```
+
 ## 🍓 Raspberry Pi or SSH
 
 With no browser on the machine, use `--remote` (automatic over SSH or without a desktop session). Open the printed URL on your laptop or phone, approve, and paste the code it shows back into the terminal:
@@ -123,7 +137,7 @@ videocall-cli auth login --remote --name "Garage Pi"
 
 Each machine has its own key. You can see and revoke them all at [app.videocall.rs/devices](https://app.videocall.rs/devices); `videocall-cli auth logout` revokes this one. Revoking stops new joins within five minutes but doesn't cut a relay session that's already connected.
 
-The private key never leaves the machine. It lives in the OS keychain on macOS and Windows, and on Linux in a 0600 file under `~/.config/videocall/` (`VIDEOCALL_CONFIG_DIR` moves it). A machine expires after 90 days unused or a year after approval; then run `auth login` again.
+The private key never leaves the machine. It lives in the OS keychain on macOS and Windows, and on Linux in a 0600 file under `~/.config/videocall/` (`VIDEOCALL_CONFIG_DIR` moves it). On macOS, if the CLI says it's waiting for the keychain, either a newly built binary needs the dialog on the Mac's screen answered once, or the keychain is locked (typical over SSH): run `security unlock-keychain` and try again. A machine expires after 90 days unused or a year after approval; then run `auth login` again.
 
 ## ⬆️ Upgrading from a version with `--user-id`
 
@@ -161,6 +175,8 @@ RUST_LOG=info cargo run --release -- auth login --api-url http://localhost:8081
 RUST_LOG=info cargo run --release -- stream --api-url http://localhost:8081 \
   --url https://127.0.0.1:4433 --insecure-skip-verify --meeting-id <meeting-id> ...
 ```
+
+`--insecure-skip-verify` only works for a relay on localhost, a loopback address, or a private-range IP. Anywhere else the CLI refuses it, because the room token would go to whoever answers.
 
 ## 📦 Build a `.deb` Package
 

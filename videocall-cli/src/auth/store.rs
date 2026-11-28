@@ -297,15 +297,40 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
 mod keychain {
     use super::{StoreError, KEYCHAIN_SERVICE};
     use keyring::{Entry, Error};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     pub const AVAILABLE: bool = true;
+
+    /// macOS blocks with no error on an unanswered access dialog or a locked keychain: say so after 2 s.
+    fn with_notice<T>(call: impl FnOnce() -> T) -> T {
+        let (done, waiting) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) =
+                waiting.recv_timeout(Duration::from_secs(2))
+            {
+                #[cfg(target_os = "macos")]
+                eprintln!(
+                    "Waiting for the macOS keychain. If a dialog is open on this Mac's screen, \
+                     choose Always Allow.\nIf the keychain is locked (typical over SSH), press \
+                     Ctrl-C, run `security unlock-keychain`, and try again."
+                );
+                #[cfg(target_os = "windows")]
+                eprintln!("Waiting for Windows Credential Manager...");
+            }
+        });
+        let result = call();
+        drop(done);
+        result
+    }
 
     fn entry(origin: &str) -> Result<Entry, StoreError> {
         Entry::new(KEYCHAIN_SERVICE, origin).map_err(|e| StoreError::Keychain(e.to_string()))
     }
 
     pub fn get(origin: &str) -> Result<Option<String>, StoreError> {
-        match entry(origin)?.get_password() {
+        let entry = entry(origin)?;
+        match with_notice(|| entry.get_password()) {
             Ok(v) => Ok(Some(v)),
             Err(Error::NoEntry) => Ok(None),
             Err(e) => Err(StoreError::Keychain(e.to_string())),
@@ -313,13 +338,13 @@ mod keychain {
     }
 
     pub fn set(origin: &str, value: &str) -> Result<(), StoreError> {
-        entry(origin)?
-            .set_password(value)
-            .map_err(|e| StoreError::Keychain(e.to_string()))
+        let entry = entry(origin)?;
+        with_notice(|| entry.set_password(value)).map_err(|e| StoreError::Keychain(e.to_string()))
     }
 
     pub fn delete(origin: &str) -> Result<(), StoreError> {
-        match entry(origin)?.delete_credential() {
+        let entry = entry(origin)?;
+        match with_notice(|| entry.delete_credential()) {
             Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(StoreError::Keychain(e.to_string())),
         }

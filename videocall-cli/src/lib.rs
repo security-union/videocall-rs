@@ -17,10 +17,12 @@
  */
 
 pub mod auth;
+pub mod backoff;
 pub mod cli_args;
 pub(crate) mod constants;
 pub mod consumers;
-
+pub mod exit;
+pub mod net_policy;
 pub mod producers;
 pub mod room;
 pub mod video_encoder;

@@ -43,7 +43,10 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
                 .on_connection_lost
                 .emit(JsValue::from_str("WebSocket error")),
         });
-        debug!("WebSocket connecting to {}", &options.websocket_url);
+        debug!(
+            "WebSocket connecting to {}",
+            crate::utils::redact_url_for_logging(&options.websocket_url)
+        );
         let task = WebSocketService::connect(
             &options.websocket_url,
             options.on_inbound_media,
@@ -55,5 +58,13 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
 
     fn send_bytes(&self, bytes: Vec<u8>) -> bool {
         self.send_binary(bytes)
+    }
+
+    fn send_bytes_control(&self, bytes: Vec<u8>) -> bool {
+        self.send_binary_with_priority(bytes, true)
+    }
+
+    fn send_bytes_datagram_control(&self, bytes: Vec<u8>) {
+        self.send_binary_with_priority(bytes, true);
     }
 }

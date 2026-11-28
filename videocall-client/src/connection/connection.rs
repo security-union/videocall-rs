@@ -252,7 +252,10 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        log::debug!("Dropping Connection to {}", self.url);
+        log::debug!(
+            "Dropping Connection to {}",
+            crate::utils::redact_url_for_logging(&self.url)
+        );
         self.stop_heartbeat();
     }
 }

@@ -106,6 +106,7 @@ features = [
     "ReadableStreamDefaultReader",
     "ReadableStreamReadResult",
     "ConstrainDomStringParameters",
+    "ConstrainLongRange",
     "Response",
     "VideoEncoder",
     "VideoEncoderInit",

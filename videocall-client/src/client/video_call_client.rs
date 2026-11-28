@@ -204,7 +204,11 @@ impl PartialEq for VideoCallClient {
 fn creates_peer(packet_type: Option<PacketType>) -> bool {
     !matches!(
         packet_type,
-        Some(PacketType::DIAGNOSTICS) | Some(PacketType::CONGESTION)
+        Some(PacketType::DIAGNOSTICS)
+            | Some(PacketType::CONGESTION)
+            // SESSION_ASSIGNED names our own session; creating a peer for it
+            // spins up decoders that only ever see our own stream.
+            | Some(PacketType::SESSION_ASSIGNED)
     )
 }
 
@@ -1284,10 +1288,13 @@ impl Inner {
             String::from_utf8_lossy(&response.user_id),
             response.session_id
         );
-        // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
+        // Skip creating peers for system messages (meeting info, meeting started/ended),
+        // for session_id 0 (reserved; MEETING packets and unassigned packets use 0), and
+        // for packets stamped with our own session id — a server echo of our own
+        // stream must not produce a self-peer with live decoders.
         let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
             || response.session_id == 0
+            || Some(response.session_id) == self.own_session_id
             || !creates_peer(response.packet_type.enum_value().ok())
         {
             PeerStatus::NoChange
@@ -1730,6 +1737,7 @@ mod tests {
     fn diagnostics_and_congestion_never_create_a_peer() {
         assert!(!creates_peer(Some(PacketType::DIAGNOSTICS)));
         assert!(!creates_peer(Some(PacketType::CONGESTION)));
+        assert!(!creates_peer(Some(PacketType::SESSION_ASSIGNED)));
         assert!(creates_peer(Some(PacketType::MEDIA)));
         assert!(creates_peer(Some(PacketType::AES_KEY)));
     }

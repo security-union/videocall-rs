@@ -43,7 +43,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
-use crate::utils::monotonic_now_ms;
+use crate::utils::{monotonic_now_ms, redact_url_for_logging};
 
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
@@ -340,10 +340,16 @@ impl ConnectionManager {
                             connected: false,
                         },
                     );
-                    debug!("Created WebSocket connection {conn_id}: {url}");
+                    debug!(
+                        "Created WebSocket connection {conn_id}: {}",
+                        redact_url_for_logging(url)
+                    );
                 }
                 Err(e) => {
-                    error!("Failed to create WebSocket connection to {url}: {e}");
+                    error!(
+                        "Failed to create WebSocket connection to {}: {e}",
+                        redact_url_for_logging(url)
+                    );
                 }
             }
         }
@@ -376,10 +382,16 @@ impl ConnectionManager {
                             connected: false,
                         },
                     );
-                    debug!("Created WebTransport connection {conn_id}: {url}");
+                    debug!(
+                        "Created WebTransport connection {conn_id}: {}",
+                        redact_url_for_logging(url)
+                    );
                 }
                 Err(e) => {
-                    error!("Failed to create WebTransport connection to {url}: {e}");
+                    error!(
+                        "Failed to create WebTransport connection to {}: {e}",
+                        redact_url_for_logging(url)
+                    );
                 }
             }
         }
@@ -510,6 +522,10 @@ impl ConnectionManager {
 
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
+
+            // The URL carries the JWT as a query parameter; only the redacted
+            // form may reach UI state or logs.
+            let server_url = redact_url_for_logging(&server_url);
 
             // If the user explicitly called disconnect(), do not attempt reconnection.
             if *intentionally_disconnected.borrow() {
@@ -676,7 +692,7 @@ impl ConnectionManager {
                 info!(
                     "Elected connection {}: {} (avg RTT: {}ms)",
                     connection_id,
-                    measurement.url,
+                    redact_url_for_logging(&measurement.url),
                     measurement.average_rtt.unwrap_or(0.0)
                 );
 
@@ -1309,7 +1325,10 @@ impl ConnectionManager {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         metrics.push(metric!("active_server_rtt", avg_rtt));
-                        metrics.push(metric!("active_server_url", measurement.url.as_str()));
+                        metrics.push(metric!(
+                            "active_server_url",
+                            redact_url_for_logging(&measurement.url)
+                        ));
                         metrics.push(metric!(
                             "active_server_type",
                             if measurement.is_webtransport {
@@ -1380,7 +1399,7 @@ impl ConnectionManager {
             };
 
             let server_metrics = vec![
-                metric!("server_url", measurement.url.as_str()),
+                metric!("server_url", redact_url_for_logging(&measurement.url)),
                 metric!(
                     "server_type",
                     if measurement.is_webtransport {
@@ -1445,7 +1464,7 @@ impl ConnectionManager {
             ElectionState::Elected { connection_id, .. } => {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     ConnectionState::Connected {
-                        server_url: measurement.url.clone(),
+                        server_url: redact_url_for_logging(&measurement.url),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
                     }
@@ -1463,7 +1482,7 @@ impl ConnectionManager {
                     .borrow()
                     .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
-                    .map(|m| m.url.clone()),
+                    .map(|m| redact_url_for_logging(&m.url)),
             },
         };
 

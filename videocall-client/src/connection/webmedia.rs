@@ -23,9 +23,18 @@
 //
 use log::error;
 use protobuf::Message;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
+
+/// Control/feedback packets (diagnostics, heartbeats, key exchange, meeting
+/// events) are small and periodic. On a congested WebSocket they get a larger
+/// send-buffer budget than MEDIA payloads, so adaptive-quality feedback and
+/// session control are not starved by bulk video (#859).
+fn is_control_packet(packet: &PacketWrapper) -> bool {
+    packet.packet_type.enum_value_or_default() != PacketType::MEDIA
+}
 
 #[derive(Clone)]
 pub struct ConnectOptions {
@@ -54,12 +63,26 @@ pub(super) trait WebMedia<TASK> {
         self.send_bytes(bytes);
     }
 
+    /// Like [`WebMedia::send_bytes`] but marks the payload as control traffic,
+    /// which gets a higher send-buffer budget on transports that distinguish
+    /// priority (WebSocket). Defaults to the plain send path.
+    fn send_bytes_control(&self, bytes: Vec<u8>) -> bool {
+        self.send_bytes(bytes)
+    }
+
+    /// Datagram variant of [`WebMedia::send_bytes_control`].
+    fn send_bytes_datagram_control(&self, bytes: Vec<u8>) {
+        self.send_bytes_datagram(bytes);
+    }
+
     /// Returns whether the packet was handed to the transport.
     fn send_packet(&self, packet: PacketWrapper) -> bool {
+        let control = is_control_packet(&packet);
         match packet
             .write_to_bytes()
             .map_err(|w| JsValue::from(format!("{w:?}")))
         {
+            Ok(bytes) if control => self.send_bytes_control(bytes),
             Ok(bytes) => self.send_bytes(bytes),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
@@ -72,10 +95,12 @@ pub(super) trait WebMedia<TASK> {
     /// Send a packet via datagram if the transport supports it, otherwise
     /// fall back to reliable stream.
     fn send_packet_datagram(&self, packet: PacketWrapper) {
+        let control = is_control_packet(&packet);
         match packet
             .write_to_bytes()
             .map_err(|w| JsValue::from(format!("{w:?}")))
         {
+            Ok(bytes) if control => self.send_bytes_datagram_control(bytes),
             Ok(bytes) => self.send_bytes_datagram(bytes),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();

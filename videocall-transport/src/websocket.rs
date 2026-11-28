@@ -16,6 +16,12 @@ use videocall_types::Callback;
 /// 1 MB matches the congestion-drop behavior used on the WebTransport path.
 const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
 
+/// Send-buffer budget for priority (control) packets: diagnostics, heartbeats,
+/// key exchange and meeting control. They are ~hundreds of bytes and periodic,
+/// so letting them through a congested buffer costs almost nothing, while
+/// dropping them freezes the adaptive-quality feedback loop entirely (#859).
+const MAX_BUFFERED_AMOUNT_PRIORITY: u32 = MAX_BUFFERED_AMOUNT * 4;
+
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
 use wasm_bindgen::JsCast;
@@ -296,16 +302,29 @@ impl WebSocketTask {
     /// Returns whether the data was handed to the browser's socket; `false`
     /// when it was dropped here (inactive socket, full buffer, send error).
     pub fn send_binary(&self, data: Vec<u8>) -> bool {
+        self.send_binary_with_priority(data, false)
+    }
+
+    /// `high_priority` packets get [`MAX_BUFFERED_AMOUNT_PRIORITY`] instead of
+    /// [`MAX_BUFFERED_AMOUNT`]: media frames may fill the 1 MB buffer on a
+    /// congested link, and that must not starve the small control packets
+    /// (diagnostics feed the adaptive-quality control loop).
+    pub fn send_binary_with_priority(&self, data: Vec<u8>, high_priority: bool) -> bool {
         if !self.is_active() {
             return false;
         }
         let buffered = self.ws.buffered_amount();
-        if buffered > MAX_BUFFERED_AMOUNT {
+        let threshold = if high_priority {
+            MAX_BUFFERED_AMOUNT_PRIORITY
+        } else {
+            MAX_BUFFERED_AMOUNT
+        };
+        if buffered > threshold {
             warn!(
                 "WebSocket backpressure: dropping {} byte packet (buffered: {} bytes, threshold: {} bytes)",
                 data.len(),
                 buffered,
-                MAX_BUFFERED_AMOUNT,
+                threshold,
             );
             return false;
         }

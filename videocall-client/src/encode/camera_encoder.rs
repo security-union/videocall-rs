@@ -34,7 +34,9 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::CodecState;
 use web_sys::ConstrainDomStringParameters;
+use web_sys::ConstrainLongRange;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
@@ -646,18 +648,35 @@ impl CameraEncoder {
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
 
+            // Ask for the current quality tier's resolution up front so the
+            // camera opens near the size the encoder wants. Opening at the
+            // device default (usually 1080p) forces an immediate reconfigure
+            // of the encoder. `ideal` rather than `exact`: a camera without
+            // the mode still opens at its closest supported one.
+            let tier_cap = {
+                let stats = camera_rate.borrow().stats(monotonic_now_ms());
+                FrameSize::new(stats.tier_width, stats.tier_height)
+            };
+            if !tier_cap.is_empty() {
+                let width = ConstrainLongRange::new();
+                width.set_ideal(tier_cap.width as i32);
+                media_info.set_width_constrain_long_range(&width);
+                let height = ConstrainLongRange::new();
+                height.set_ideal(tier_cap.height as i32);
+                media_info.set_height_constrain_long_range(&height);
+            }
+
             // Force exact deviceId match (avoids partial/ideal matching surprises).
             if device_id.is_empty() {
                 log::warn!("Camera device_id is empty, using default constraint");
-                constraints.set_video(&JsValue::TRUE);
             } else {
                 let exact = ConstrainDomStringParameters::new();
                 exact.set_exact_str(&device_id);
 
                 log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
                 media_info.set_device_id_constrain_dom_string_parameters(&exact);
-                constraints.set_video(&media_info.into());
             }
+            constraints.set_video(&media_info.into());
 
             constraints.set_audio(&Boolean::from(false));
 
@@ -875,7 +894,12 @@ impl CameraEncoder {
                 // over with a keyframe. Only if that keeps failing is the
                 // camera reported as failed, once: the UI turns the camera
                 // off on that report.
-                if encoder_failed.replace(false) {
+                //
+                // `state()` is checked as well as the error callback: some
+                // browsers close the encoder without firing it, and calling
+                // encode() on a closed codec errors once per frame with no
+                // recovery.
+                if encoder_failed.replace(false) || video_encoder.state() == CodecState::Closed {
                     let mut health = encoder_health.borrow_mut();
                     let failures = health.failures() + 1;
                     if health.on_failure() == Recovery::GiveUp {
@@ -983,8 +1007,12 @@ impl CameraEncoder {
             capture.clear_if(&session);
             media_track.stop();
             log::info!("CameraEncoder: stopped");
-            if let Err(e) = video_encoder.close() {
-                error!("Error closing video encoder: {e:?}");
+            // close() on an already-closed codec errors; skip it to keep a
+            // clean shutdown log after a GiveUp.
+            if video_encoder.state() != CodecState::Closed {
+                if let Err(e) = video_encoder.close() {
+                    error!("Error closing video encoder: {e:?}");
+                }
             }
         });
     }

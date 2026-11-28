@@ -66,9 +66,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut opt = Opt::parse();
 
-    // Auth commands need no camera, so they skip the permission prompt.
-    if let Mode::Auth(auth) = &opt.mode {
-        return videocall_cli::auth::run(&auth.command).await;
+    // Auth and meeting commands need no camera, so they skip the permission prompt.
+    match &opt.mode {
+        Mode::Auth(auth) => return videocall_cli::auth::run(&auth.command).await,
+        Mode::Meeting(command) => return videocall_cli::meeting::run(command).await,
+        _ => {}
     }
 
     // if os is mac os we need to ask for permission for camera and microphone
@@ -98,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Info(i) => {
             get_info(i).await?;
         }
-        Mode::Auth(_) => {}
+        Mode::Auth(_) | Mode::Meeting(_) => {}
     };
 
     Ok(())

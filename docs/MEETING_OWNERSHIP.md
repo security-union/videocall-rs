@@ -135,7 +135,7 @@ The system uses two separate JWTs with different purposes and delivery mechanism
 | **Session JWT** | Authenticates user to the Meeting Backend | `Set-Cookie` (HttpOnly, Secure, SameSite=Lax) or `Authorization: Bearer` | Configurable (default: long-lived) | Yes (cookie) |
 | **Room Access JWT** | Authorizes room join on the Media Server | JSON response body | Configurable TTL (short) | N/A |
 
-`videocall-cli` uses a third kind, a **device JWT** signed by a per-machine key the user approved in the web app. It works only on get meeting, join and status, and never yields a host token. See [CLI Device Authentication](MEETING_API.md#cli-device-authentication).
+`videocall-cli` uses a third kind, a **device JWT** signed by a per-machine key the user approved in the web app. It works only on create meeting, list meetings, get meeting, join and status, and never yields a host token. See [CLI Device Authentication](MEETING_API.md#cli-device-authentication).
 
 ### Session JWT Claims
 

@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use test_helpers::*;
 use videocall_meeting_types::device::{crypto, decode_public_key};
-use videocall_meeting_types::RoomAccessTokenClaims;
 
 async fn create_meeting(pool: &DbPool, room: &str, creator: &str, active: bool) {
     cleanup_test_data(pool, room).await;
@@ -35,17 +34,6 @@ async fn create_meeting(pool: &DbPool, room: &str, creator: &str, active: bool) 
     if active {
         db_meetings::activate(pool, row.id).await.expect("activate");
     }
-}
-
-async fn meeting(pool: &DbPool, room: &str) -> Option<db::MeetingRow> {
-    db_meetings::get_by_room_id(pool, room).await.unwrap()
-}
-
-fn room_token_claims(result: &Value) -> RoomAccessTokenClaims {
-    let token = result["room_token"].as_str().expect("room token");
-    jsonwebtoken::dangerous::insecure_decode::<RoomAccessTokenClaims>(token)
-        .expect("decode room token")
-        .claims
 }
 
 async fn ok(resp: Response) -> Value {
@@ -193,12 +181,6 @@ async fn device_token_forbidden_on_browser_only_routes() {
     let cases: Vec<(&str, String, Option<&str>)> = vec![
         ("GET", "/profile".into(), None),
         ("GET", "/session".into(), None),
-        ("GET", "/api/v1/meetings".into(), None),
-        (
-            "POST",
-            "/api/v1/meetings".into(),
-            Some(r#"{"meeting_id":"dev-auth-new"}"#),
-        ),
         (
             "PATCH",
             format!("/api/v1/meetings/{room}"),
@@ -243,7 +225,6 @@ async fn device_token_forbidden_on_browser_only_routes() {
         meeting(&pool, room).await.unwrap().state.as_deref(),
         Some("active")
     );
-    assert!(meeting(&pool, "dev-auth-new").await.is_none());
     let live = db::devices::count_live_devices(&pool, &device.user_id, Utc::now()).await;
     assert_eq!(live.unwrap(), 2);
     assert_eq!(codes_of(&pool, &device.user_id).await, 0);
@@ -277,15 +258,7 @@ async fn cli_device_never_hosts() {
     assert_eq!(body["result"]["code"], "MEETING_NOT_FOUND");
     assert!(meeting(&pool, room).await.is_none());
 
-    create_meeting(&pool, room, &device.user_id, false).await;
-    let before = meeting(&pool, room).await.unwrap().state;
-    assert_ne!(before.as_deref(), Some("active"));
-    let result = ok(send(&state, join()).await).await;
-    assert_eq!(result["status"], "waiting_for_meeting");
-    assert!(result["room_token"].is_null());
-    assert_eq!(result["is_host"], false);
-    assert_eq!(meeting(&pool, room).await.unwrap().state, before);
-
+    // Starting an idle meeting from the CLI is in device_create_meeting_tests.rs.
     create_meeting(&pool, room, &device.user_id, true).await;
     let host_name_before = meeting(&pool, room).await.unwrap().host_display_name;
     let result = ok(send(&state, join()).await).await;

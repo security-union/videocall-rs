@@ -30,6 +30,8 @@ web-transport-quinn = { workspace = true }
 tokio = { version = "1.32.0", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+# Already built for tracing-subscriber; `meeting list` formats created_at with it.
+time = { version = "0.3", default-features = false, features = ["formatting"] }
 url = "2.4.1"
 thiserror = "1.0.51"
 cpal = "0.15.2"

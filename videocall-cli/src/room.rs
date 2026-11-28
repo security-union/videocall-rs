@@ -38,8 +38,8 @@ pub fn is_transient(error: &AuthError) -> bool {
 fn meeting_error(error: AuthError, meeting_id: &str) -> anyhow::Error {
     match error {
         AuthError::Api(ApiError::NotFound(_)) => anyhow::anyhow!(
-            "meeting '{meeting_id}' doesn't exist or you are not in it. Create it in a browser \
-             first; the CLI can only join existing meetings."
+            "meeting '{meeting_id}' doesn't exist or you are not in it. Create it with \
+             `videocall-cli meeting create --meeting-id {meeting_id}`, or in a browser."
         ),
         AuthError::Api(ApiError::MeetingNotActive) => {
             anyhow::anyhow!("meeting '{meeting_id}' has ended")

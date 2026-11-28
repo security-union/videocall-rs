@@ -124,3 +124,48 @@ async fn test_ad_hoc_join_token_is_valid_jwt() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+/// Auto-create validates the id like the create route does; existing rows join as before.
+#[tokio::test]
+#[serial]
+async fn test_ad_hoc_join_validates_new_ids_only() {
+    let pool = get_test_pool().await;
+    let state = build_state(pool.clone());
+    let legacy = "adhoc.legacy";
+    cleanup_test_data(&pool, legacy).await;
+    meeting_api::db::meetings::create(
+        &pool,
+        legacy,
+        "old@example.com",
+        None,
+        &serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+
+    // (path segment, stored id, expected status)
+    for (segment, room, expected) in [
+        ("adhoc%1besc", "adhoc\u{1b}esc", StatusCode::BAD_REQUEST),
+        ("adhoc%20space", "adhoc space", StatusCode::BAD_REQUEST),
+        ("adhoc.dot", "adhoc.dot", StatusCode::BAD_REQUEST),
+        ("adhoc-valid", "adhoc-valid", StatusCode::OK),
+        (legacy, legacy, StatusCode::OK),
+    ] {
+        if room != legacy {
+            cleanup_test_data(&pool, room).await;
+        }
+        let uri = format!("/api/v1/meetings/{segment}/join");
+        let req = request_with_cookie("POST", &uri, "pioneer@example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = send(&state, req).await;
+        assert_eq!(resp.status(), expected, "{segment}");
+        let body: serde_json::Value = response_json(resp).await;
+        if expected == StatusCode::BAD_REQUEST {
+            assert_eq!(body["result"]["code"], "INVALID_MEETING_ID", "{segment}");
+            assert!(meeting(&pool, room).await.is_none(), "{segment}");
+        }
+        cleanup_test_data(&pool, room).await;
+    }
+}

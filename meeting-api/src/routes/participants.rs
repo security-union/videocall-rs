@@ -36,22 +36,26 @@ use crate::token::{generate_observer_token, generate_room_token};
 /// Hosts are auto-admitted and receive a room_token immediately.
 /// Attendees enter the waiting room.
 ///
-/// CLI credentials never host and never create or activate a meeting; a creator joining
-/// their own active meeting is admitted without the waiting room.
+/// CLI credentials never host and never create a meeting. A creator on the CLI starts
+/// their own idle meeting and joins it, or their active one, without the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    CliOrBrowserUser { user_id, name, via }: CliOrBrowserUser,
+    CliOrBrowserUser {
+        user_id, name, via, ..
+    }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
     let fallback_name = fallback_display_name(via, &user_id, &name);
 
-    let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+    let mut meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
         None if via == AuthVia::Cli => return Err(AppError::meeting_not_found(&meeting_id)),
         None => {
-            // Auto-create meeting with this user as host.
+            // Auto-create meeting with this user as host. Only new ids are validated, so
+            // rows stored before this check can still be joined.
+            super::meetings::validate_meeting_id(&meeting_id)?;
             let attendees = serde_json::Value::Array(vec![]);
             db_meetings::create(&state.db, &meeting_id, &user_id, None, &attendees).await?
         }
@@ -59,9 +63,18 @@ pub async fn join_meeting(
 
     let is_creator = meeting.creator_id.as_deref() == Some(user_id.as_str());
     let is_host = is_creator && via == AuthVia::Browser;
-    let meeting_active = meeting.state.as_deref() == Some("active");
+    let creator_via_cli = is_creator && via == AuthVia::Cli;
+    if creator_via_cli
+        && meeting.state.as_deref() == Some("idle")
+        && db_meetings::activate_if_idle(&state.db, meeting.id).await?
+    {
+        nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
+        meeting.state = Some("active".to_string());
+    }
+    // No re-read if activation lost a race: the meeting stays "idle" here, so the CLI gets
+    // `waiting_for_meeting` and no room token, then polls get-meeting for the real state.
 
-    if is_creator && via == AuthVia::Cli && meeting_active {
+    if creator_via_cli && meeting.state.as_deref() == Some("active") {
         // Creator on the CLI: admitted without the waiting room, never host.
         let row =
             db_participants::upsert_creator_via_cli(&state.db, meeting.id, &user_id, display_name)
@@ -198,7 +211,9 @@ pub async fn join_meeting(
 /// CLI credentials always get a room token with `is_host = false`.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    CliOrBrowserUser { user_id, name, via }: CliOrBrowserUser,
+    CliOrBrowserUser {
+        user_id, name, via, ..
+    }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)

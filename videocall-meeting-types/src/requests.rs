@@ -76,8 +76,13 @@ pub struct ListMeetingsQuery {
     pub offset: i64,
 }
 
+/// `limit` when a list request leaves it out.
+pub const DEFAULT_LIST_LIMIT: i64 = 20;
+/// The largest `limit` the server honours; it clamps to `1..=MAX_LIST_LIMIT`.
+pub const MAX_LIST_LIMIT: i64 = 100;
+
 fn default_limit() -> i64 {
-    20
+    DEFAULT_LIST_LIMIT
 }
 
 impl Default for ListMeetingsQuery {

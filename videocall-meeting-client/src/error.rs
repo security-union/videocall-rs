@@ -14,6 +14,7 @@
 //! Error types for the meeting API client.
 
 use thiserror::Error;
+use videocall_meeting_types::{APIError, APIResponse};
 
 /// Errors returned by [`MeetingApiClient`](crate::MeetingApiClient) methods.
 #[derive(Debug, Error)]
@@ -57,4 +58,36 @@ pub enum ApiError {
     #[cfg(feature = "device-session")]
     #[error(transparent)]
     Key(#[from] videocall_meeting_types::device::crypto::KeyError),
+}
+
+impl ApiError {
+    /// The meeting-api `APIError` in the response body, if it has the usual JSON shape.
+    pub fn api_error(&self) -> Option<APIError> {
+        let body = match self {
+            Self::Forbidden(body) | Self::NotFound(body) | Self::ServerError { body, .. } => body,
+            _ => return None,
+        };
+        let parsed: APIResponse<APIError> = serde_json::from_str(body).ok()?;
+        Some(parsed.result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_reads_the_code() {
+        let body = r#"{"success":false,"result":{"code":"MEETING_EXISTS","message":"m"}}"#;
+        let taken = ApiError::ServerError {
+            status: 409,
+            body: body.into(),
+        };
+        assert_eq!(taken.api_error().unwrap().code, "MEETING_EXISTS");
+        let html = ApiError::ServerError {
+            status: 502,
+            body: "<html>".into(),
+        };
+        assert!(html.api_error().is_none());
+    }
 }

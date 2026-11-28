@@ -64,6 +64,17 @@ impl AppError {
         Self::new(StatusCode::CONFLICT, APIError::meeting_exists(meeting_id))
     }
 
+    pub fn device_option_not_allowed(field: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            APIError::device_option_not_allowed(field),
+        )
+    }
+
+    pub fn too_many_open_meetings(max: i64) -> Self {
+        Self::new(StatusCode::CONFLICT, APIError::too_many_open_meetings(max))
+    }
+
     pub fn meeting_not_found(meeting_id: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,

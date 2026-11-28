@@ -69,6 +69,17 @@ pub async fn create_with_options(
         .await
 }
 
+/// Count meetings owned by `creator_id` that are not ended and not deleted.
+pub async fn count_open_by_owner(pool: &DbPool, creator_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM meetings \
+         WHERE creator_id = $1 AND deleted_at IS NULL AND state <> 'ended'",
+    )
+    .bind(creator_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Get a non-deleted meeting by room_id.
 pub async fn get_by_room_id(
     pool: &DbPool,
@@ -153,6 +164,16 @@ pub async fn activate(pool: &DbPool, meeting_id: i32) -> Result<(), sqlx::Error>
         format!("UPDATE meetings SET state = 'active', updated_at = {SQL_NOW} WHERE id = $1");
     sqlx::query(&query).bind(meeting_id).execute(pool).await?;
     Ok(())
+}
+
+/// Activate a meeting only if it is still idle; returns whether this call activated it.
+pub async fn activate_if_idle(pool: &DbPool, meeting_id: i32) -> Result<bool, sqlx::Error> {
+    let query = format!(
+        "UPDATE meetings SET state = 'active', updated_at = {SQL_NOW} \
+         WHERE id = $1 AND deleted_at IS NULL AND state = 'idle'"
+    );
+    let done = sqlx::query(&query).bind(meeting_id).execute(pool).await?;
+    Ok(done.rows_affected() == 1)
 }
 
 /// End a meeting (set state to 'ended', set ended_at).

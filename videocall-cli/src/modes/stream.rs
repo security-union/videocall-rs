@@ -32,14 +32,11 @@ use videocall_cli::producers::{
 };
 
 pub async fn stream(opt: Stream) -> anyhow::Result<()> {
-    // The CLI can only JOIN an existing call. The meeting must be created first
-    // by a user from a browser at https://videocall.rs — the API no longer lets
-    // the CLI create a call, so if nobody created it in the browser this stream
-    // will not be visible to anyone.
+    // Joining never creates the meeting; a missing one is a 404 from meeting-api.
     println!(
-        "NOTE: joining meeting '{}'. The call must already exist — a user has to \
-         create it first from a browser at https://videocall.rs. The CLI can only \
-         join an existing call, it cannot create one.",
+        "Joining meeting '{}'. It must already exist: create it with \
+         `videocall-cli meeting create` or in a browser. Joining your own idle \
+         meeting starts it.",
         opt.meeting_id
     );
 

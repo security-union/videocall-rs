@@ -78,6 +78,27 @@ impl APIError {
         }
     }
 
+    /// A CLI device set a create option only a browser may set.
+    pub fn device_option_not_allowed(field: &str) -> Self {
+        Self {
+            code: "DEVICE_OPTION_NOT_ALLOWED".to_string(),
+            message: format!("A CLI device can't set {field}; create this meeting in a browser."),
+            engineering_error: None,
+        }
+    }
+
+    /// A CLI device's user already has `max` meetings that haven't ended.
+    pub fn too_many_open_meetings(max: i64) -> Self {
+        Self {
+            code: "TOO_MANY_OPEN_MEETINGS".to_string(),
+            message: format!(
+                "You have {max} meetings that haven't ended. End or delete one in a browser, \
+                 then try again."
+            ),
+            engineering_error: None,
+        }
+    }
+
     pub fn meeting_not_found(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_NOT_FOUND".to_string(),

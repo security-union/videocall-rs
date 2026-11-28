@@ -20,6 +20,7 @@ pub mod auth;
 pub mod cli_args;
 pub(crate) mod constants;
 pub mod consumers;
+pub mod meeting;
 
 pub mod producers;
 pub mod room;

@@ -21,22 +21,25 @@ use axum::{
 };
 use rand::Rng;
 use videocall_meeting_types::{
-    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
+    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest, MAX_LIST_LIMIT},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
         MeetingInfoResponse, MeetingSummary,
     },
 };
 
-use crate::auth::{AuthUser, CliOrBrowserUser};
+use crate::auth::{AuthUser, AuthVia, CliOrBrowserUser};
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::state::AppState;
 
 const MAX_ATTENDEES: usize = 100;
+/// Most open (not ended, not deleted) meetings a user may have when a CLI device creates
+/// one. An abuse limit, not an invariant: concurrent creates can let a few extra through.
+pub const CLI_MAX_OPEN_MEETINGS: i64 = 25;
 const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
 
-fn validate_meeting_id(meeting_id: &str) -> Result<(), AppError> {
+pub(crate) fn validate_meeting_id(meeting_id: &str) -> Result<(), AppError> {
     if meeting_id.is_empty() {
         return Err(AppError::invalid_meeting_id("cannot be empty"));
     }
@@ -64,9 +67,17 @@ fn generate_meeting_id() -> String {
 }
 
 /// POST /api/v1/meetings
+///
+/// A CLI device may not set a password, attendees or turn the waiting room off, and is
+/// capped at [`CLI_MAX_OPEN_MEETINGS`].
 pub async fn create_meeting(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    CliOrBrowserUser {
+        user_id,
+        via,
+        device_id,
+        ..
+    }: CliOrBrowserUser,
     Json(body): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<APIResponse<CreateMeetingResponse>>), AppError> {
     let meeting_id = match &body.meeting_id {
@@ -76,6 +87,30 @@ pub async fn create_meeting(
         }
         None => generate_meeting_id(),
     };
+
+    if via == AuthVia::Cli {
+        let refused = if body.password.is_some() {
+            Some("password")
+        } else if !body.attendees.is_empty() {
+            Some("attendees")
+        } else if body.waiting_room_enabled == Some(false) {
+            Some("waiting_room_enabled = false")
+        } else {
+            None
+        };
+        if let Some(field) = refused {
+            return Err(AppError::device_option_not_allowed(field));
+        }
+        if db_meetings::count_open_by_owner(&state.db, &user_id).await? >= CLI_MAX_OPEN_MEETINGS {
+            tracing::info!(
+                ?device_id,
+                user_id,
+                meeting_id,
+                "device create refused: cap"
+            );
+            return Err(AppError::too_many_open_meetings(CLI_MAX_OPEN_MEETINGS));
+        }
+    }
 
     if body.attendees.len() > MAX_ATTENDEES {
         return Err(AppError::too_many_attendees(
@@ -116,6 +151,9 @@ pub async fn create_meeting(
         }
         other => AppError::from(other),
     })?;
+    if via == AuthVia::Cli {
+        tracing::info!(?device_id, user_id, meeting_id, "device created a meeting");
+    }
 
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
@@ -133,10 +171,10 @@ pub async fn create_meeting(
 /// GET /api/v1/meetings
 pub async fn list_meetings(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    CliOrBrowserUser { user_id, .. }: CliOrBrowserUser,
     Query(params): Query<ListMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListMeetingsResponse>>, AppError> {
-    let limit = params.limit.clamp(1, 100);
+    let limit = params.limit.clamp(1, MAX_LIST_LIMIT);
     let offset = params.offset.max(0);
 
     let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;

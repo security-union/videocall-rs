@@ -21,15 +21,15 @@ use std::str::FromStr;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use thiserror::Error;
 use url::Url;
+use videocall_meeting_types::requests::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
 use videocall_nokhwa::utils::FrameFormat;
 
 /// Video Call CLI
 ///
 /// This cli connects to the videocall.rs and streams audio and video to the specified meeting.
 ///
-/// NOTE: the meeting must be created first from a browser at https://videocall.rs.
-/// The CLI can only JOIN an existing call — it cannot create one. A call created
-/// by the CLI will not work.
+/// Create a meeting with `videocall-cli meeting create` or in a browser at
+/// https://videocall.rs. Streaming to your own idle meeting starts it.
 ///
 /// You can watch the video at https://videocall.rs/meeting/{meeting_id}
 ///
@@ -70,6 +70,39 @@ pub enum AuthCommand {
     /// Show this machine's device and check it with the server. Exits 1
     /// unless the device is valid.
     Status(ApiArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MeetingCommand {
+    /// Create a meeting owned by this machine's account, waiting room on.
+    Create(CreateMeetingArgs),
+    /// List the meetings this machine's account owns, newest first.
+    List(ListMeetingsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ListMeetingsArgs {
+    /// How many meetings to show (1 to 100).
+    #[arg(long = "limit", default_value_t = DEFAULT_LIST_LIMIT,
+          value_parser = clap::value_parser!(i64).range(1..=MAX_LIST_LIMIT))]
+    pub limit: i64,
+
+    /// How many of the newest meetings to skip.
+    #[arg(long = "offset", default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    pub offset: i64,
+
+    #[command(flatten)]
+    pub api: ApiArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct CreateMeetingArgs {
+    /// Meeting id to use. Default: the server generates one.
+    #[arg(long = "meeting-id")]
+    pub meeting_id: Option<String>,
+
+    #[command(flatten)]
+    pub api: ApiArgs,
 }
 
 #[derive(Args, Debug)]
@@ -115,14 +148,18 @@ impl FromStr for IndexKind {
 
 #[derive(Subcommand, Debug)]
 pub enum Mode {
-    /// Stream audio and video to an EXISTING meeting.
+    /// Stream audio and video to a meeting.
     ///
-    /// The meeting must be created first by a user in a browser at
-    /// https://videocall.rs. The CLI can only join a call, not create one.
+    /// The meeting must exist: create it with `videocall-cli meeting create` or
+    /// in a browser. Streaming to your own idle meeting starts it.
     Stream(Stream),
 
     /// Log in, log out, or check this machine's device key.
     Auth(Auth),
+
+    /// Create or list meetings.
+    #[command(subcommand)]
+    Meeting(MeetingCommand),
 
     /// Information mode to list cameras, formats, and resolutions.
     Info(Info),
@@ -144,10 +181,8 @@ pub struct Stream {
 
     /// Meeting (call) ID to join.
     ///
-    /// IMPORTANT: the call must already exist — create it first from a browser
-    /// at https://videocall.rs. The CLI can no longer create a call itself (the
-    /// API changed); if the call's creator is the CLI, it will not work — a
-    /// browser user has to create it.
+    /// The meeting must already exist: create it with `videocall-cli meeting
+    /// create` or in a browser. Joining your own idle meeting starts it.
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 

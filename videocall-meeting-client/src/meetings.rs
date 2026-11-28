@@ -24,7 +24,7 @@ use crate::error::ApiError;
 use crate::{parse_api_response, MeetingApiClient};
 
 impl MeetingApiClient {
-    /// Create a new meeting. The authenticated user becomes the host.
+    /// Create a new meeting. The authenticated user owns it; a device session never hosts.
     ///
     /// Calls `POST /api/v1/meetings`.
     pub async fn create_meeting(

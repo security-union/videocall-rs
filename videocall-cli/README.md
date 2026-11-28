@@ -101,7 +101,11 @@ NV12:
 videocall-cli auth login
 ```
 
-5. Pick a meeting that already exists in [app.videocall.rs](https://app.videocall.rs). The CLI joins as your account but can't create or start meetings, and the host may have to admit it from the waiting room.
+5. Create a meeting, or pick one that already exists in [app.videocall.rs](https://app.videocall.rs):
+```sh
+videocall-cli meeting create --meeting-id <meeting-id>
+```
+Leave out `--meeting-id` and the server picks one. The waiting room is always on. Streaming to your own meeting that hasn't started starts it; an ended one stays ended. The CLI never hosts, so admitting people and ending the meeting happen in a browser. `videocall-cli meeting list` shows the meetings your account owns.
 
 6. Start streaming:
 ```sh

@@ -14,7 +14,8 @@
 //! Axum extractors that authenticate the caller.
 //!
 //! - [`AuthUser`]: browser session JWT (cookie or bearer); a device JWT gets 403. The default.
-//! - [`CliOrBrowserUser`]: also accepts a device JWT. Only get meeting, join and status.
+//! - [`CliOrBrowserUser`]: also accepts a device JWT. Only create, list, get meeting, join
+//!   and status.
 //!
 //! The algorithm picks the path and the verifier pins it: HS256 only reaches the session
 //! decoder, EdDSA only [`crate::device_auth::verify_device_jwt`].
@@ -79,7 +80,7 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// Extractor for routes a CLI device may call (get meeting, join, status).
+/// Extractor for routes a CLI device may call (create, list, get meeting, join, status).
 ///
 /// A browser session resolves like [`AuthUser`]; a device JWT must belong to a live device,
 /// whose row supplies `user_id` and `name`.
@@ -88,6 +89,8 @@ pub struct CliOrBrowserUser {
     pub user_id: String,
     pub name: String,
     pub via: AuthVia,
+    /// The device's id when `via` is [`AuthVia::Cli`], for logs.
+    pub device_id: Option<String>,
 }
 
 impl FromRequestParts<AppState> for CliOrBrowserUser {
@@ -111,6 +114,7 @@ impl FromRequestParts<AppState> for CliOrBrowserUser {
                 user_id: user.user_id,
                 name: user.name,
                 via: AuthVia::Browser,
+                device_id: None,
             });
         };
 
@@ -134,6 +138,7 @@ impl FromRequestParts<AppState> for CliOrBrowserUser {
                     user_id: row.user_id,
                     name: row.user_name,
                     via: AuthVia::Cli,
+                    device_id: Some(row.id),
                 })
             }
             Err(DeviceAuthError::Db(e)) => Err(AppError::from(e).into_response()),

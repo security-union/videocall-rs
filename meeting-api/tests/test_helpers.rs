@@ -29,6 +29,7 @@ use serde::Serialize;
 use tower::ServiceExt;
 use videocall_meeting_types::device::crypto::{self, DeviceKey};
 use videocall_meeting_types::device::{DeviceTokenClaims, CLI_ISSUER};
+use videocall_meeting_types::RoomAccessTokenClaims;
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -225,6 +226,19 @@ pub async fn insert_device(pool: &DbPool, user_id: &str, fixture: Fixture) -> Te
         key,
         user_id: user_id.to_string(),
     }
+}
+
+/// The non-deleted meeting with this room id.
+pub async fn meeting(pool: &DbPool, room: &str) -> Option<db::MeetingRow> {
+    db::meetings::get_by_room_id(pool, room).await.unwrap()
+}
+
+/// The claims of the `room_token` in a join or status result (signature not checked).
+pub fn room_token_claims(result: &serde_json::Value) -> RoomAccessTokenClaims {
+    let token = result["room_token"].as_str().expect("room token");
+    jsonwebtoken::dangerous::insecure_decode::<RoomAccessTokenClaims>(token)
+        .expect("decode room token")
+        .claims
 }
 
 pub async fn codes_of(pool: &DbPool, user: &str) -> i64 {

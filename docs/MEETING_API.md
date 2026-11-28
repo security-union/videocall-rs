@@ -60,7 +60,7 @@ Pass the session JWT in the `Authorization` header:
 
 The session JWT is obtained after a successful OAuth login via `GET /login`. The OAuth callback issues the token, and all subsequent API calls must include it in the `Authorization: Bearer` header.
 
-`videocall-cli` authenticates with a **device JWT** instead (see [CLI Device Authentication](#cli-device-authentication)), sent as `Authorization: Bearer <device_jwt>`. It is accepted only on Get Meeting Info, Join Meeting and Get My Status. Every other meeting endpoint returns **403** `BROWSER_SESSION_REQUIRED` for a device JWT.
+`videocall-cli` authenticates with a **device JWT** instead (see [CLI Device Authentication](#cli-device-authentication)), sent as `Authorization: Bearer <device_jwt>`. It is accepted only on List Meetings, Create Meeting, Get Meeting Info, Join Meeting and Get My Status. Every other meeting endpoint returns **403** `BROWSER_SESSION_REQUIRED` for a device JWT.
 
 > **Browser note**: The web UI (`dioxus-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
@@ -183,6 +183,8 @@ The UI's `apiBaseUrl` should point to `http://localhost:8081` for local developm
 
 Lists all meetings **owned by the authenticated user** (excludes deleted meetings, includes ended meetings).
 
+A CLI device JWT gets the same response as its user's browser session.
+
 ```
 GET /api/v1/meetings
 ```
@@ -227,8 +229,7 @@ GET /api/v1/meetings
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | Invalid or missing session |
-| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
+| 401 | `UNAUTHORIZED` | Invalid or missing session or device JWT |
 
 **Error example (401):**
 ```json
@@ -246,6 +247,12 @@ GET /api/v1/meetings
 ### Create Meeting
 
 Creates a new meeting. The authenticated user becomes the host. The meeting starts in `idle` state.
+
+A CLI device JWT may call this too. The device's user owns the meeting but never hosts it.
+
+- Setting a `password` (even an empty one), a non-empty `attendees` list or `waiting_room_enabled: false` gets 400 `DEVICE_OPTION_NOT_ALLOWED`.
+- A user with 25 meetings that are not ended and not deleted gets 409 `TOO_MANY_OPEN_MEETINGS`. Browser creates don't check this.
+- A meeting started from the CLI stays `active`, and counts toward the 25, until the owner ends it from a browser.
 
 ```
 POST /api/v1/meetings
@@ -287,11 +294,12 @@ POST /api/v1/meetings
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | Invalid or missing session |
-| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
+| 401 | `UNAUTHORIZED` | Invalid or missing session or device JWT |
 | 400 | `INVALID_MEETING_ID` | Invalid ID format |
 | 400 | `TOO_MANY_ATTENDEES` | More than 100 attendees |
+| 400 | `DEVICE_OPTION_NOT_ALLOWED` | CLI device set `password`, `attendees` or `waiting_room_enabled: false` |
 | 409 | `MEETING_EXISTS` | Meeting ID already taken |
+| 409 | `TOO_MANY_OPEN_MEETINGS` | CLI device, and the user already has 25 meetings that haven't ended |
 
 **Error example (409):**
 ```json
@@ -390,7 +398,7 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **First user to join** becomes the host; the meeting is created and activated
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
-- **CLI devices** never host: a missing meeting returns 404 instead of being created, an idle meeting is never activated, and the `room_token` always has `is_host: false` and lasts at most 300 seconds. The creator joining their own active meeting from the CLI skips the waiting room.
+- **CLI devices** never host: a missing meeting returns 404 instead of being created, and the `room_token` always has `is_host: false` and lasts at most 300 seconds. The creator joining their own idle meeting from the CLI activates it and skips the waiting room. An ended meeting is never reactivated from the CLI.
 
 ```
 POST /api/v1/meetings/{meeting_id}/join
@@ -465,6 +473,7 @@ The `room_token` is only present when `status` is `"admitted"`. Attendees receiv
 
 | Status | Code | Description |
 |--------|------|-------------|
+| 400 | `INVALID_MEETING_ID` | Browser join would create a meeting whose id isn't letters, digits, `-` and `_` (at most 255). Existing meetings join whatever their id. |
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 
 > **Note:** If the meeting doesn't exist, it is created automatically with the joining user as the host.
